@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+venvs/
+.pytest_cache/
+
+# Account/session state must never enter Git (including under copied backups).
+auth.json
+token.json
+cookies.txt
+candidate-facts.json
+*.log
+*.pid
+*.before-*
+*.tmp
