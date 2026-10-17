@@ -19,7 +19,7 @@
 
    ```sh
    pkg install -y git
-   git clone https://github.com/Chest3rf1eld/termux-auto-hh-applicant-tool.git
+   git clone https://github.com/nikchester/termux-auto-hh-applicant-tool.git
    cd termux-auto-hh-applicant-tool
    sh termux/bootstrap.sh
    ```
