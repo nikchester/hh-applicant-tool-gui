@@ -28,3 +28,5 @@ jobs:
         run: |
           python termux/check_hh.py
           python termux/check_chatmock.py
+          python windows/check_windows.py
+          python windows/check_send.py

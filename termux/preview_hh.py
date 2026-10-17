@@ -71,7 +71,7 @@ def run(argv):
         and args.salary == 80000 and args.only_with_salary
     ):
         raise SystemExit("Unsafe preview arguments; refusing to run")
-    config = tomllib.loads((expected / "config.toml").read_text())
+    config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
     if config["openai"]["default"]["base_url"] != "http://127.0.0.1:8000/v1":
         raise SystemExit("Only the local model gateway is allowed")
     if config.get("general", {}).get("cover_letter_resume_id") != args.resume_id:
