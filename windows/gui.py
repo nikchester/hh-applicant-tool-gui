@@ -20,16 +20,18 @@ COUNT_TITLES = {
     "chats": "чатов", "inspected": "просмотрено", "drafts": "черновиков", "skipped": "пропущено",
     "failures": "ошибок",
 }
-# Windows 11 light palette: neutral page, white cards, one accent colour.
-PAGE, CARD, BORDER, CONTROL_BORDER = "#f3f3f3", "#ffffff", "#e5e5e5", "#d1d1d1"
-TEXT, MUTED, DISABLED = "#1a1a1a", "#5f5f5f", "#a0a0a0"
-ACCENT, ACCENT_HOVER, ACCENT_PRESSED = "#005fb8", "#1a6fc0", "#004c93"
-# InfoBar severities: (background, text, Segoe Fluent Icons glyph, fallback glyph).
+# Windows 11 dark palette: dark page, raised cards, one accent colour.
+PAGE, CARD, BORDER, CONTROL_BORDER = "#202020", "#2b2b2b", "#3a3a3a", "#4a4a4a"
+CONTROL, CONTROL_HOVER, CONTROL_PRESSED, FIELD = "#373737", "#3f3f3f", "#323232", "#1f1f1f"
+TEXT, MUTED, DISABLED = "#ffffff", "#c5c5c5", "#787878"
+ACCENT, ACCENT_HOVER, ACCENT_PRESSED, ON_ACCENT = "#60cdff", "#5ab9e6", "#4fa3cc", "#000000"
+SUCCESS, WARNING, CRITICAL = "#6ccb5f", "#fce100", "#ff99a4"
+# InfoBar severities: (background, icon colour, Segoe Fluent Icons glyph, fallback glyph).
 SEVERITY = {
-    "info": ("#ebf3fc", "#003a75", "\ue946", "i"),
-    "success": ("#dff6dd", "#0b5a0b", "\ue930", "✓"),
-    "warning": ("#fff4ce", "#5c3d00", "\ue7ba", "!"),
-    "error": ("#fde7e9", "#8a1c1c", "\uea39", "×"),
+    "info": ("#2b3640", ACCENT, "\ue946", "i"),
+    "success": ("#393d1b", SUCCESS, "\ue930", "✓"),
+    "warning": ("#433519", WARNING, "\ue7ba", "!"),
+    "error": ("#442726", CRITICAL, "\uea39", "×"),
 }
 REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
 UNKNOWN_RESULT = " Результат последней отправки неизвестен. Проверь отклики на hh.ru, прежде чем запускать снова."
@@ -68,6 +70,21 @@ def enable_dpi_awareness():
     try:
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, ImportError, OSError):
+        pass
+
+
+def dark_title_bar(window):
+    """Ask Windows 10 20H1+/11 to draw a dark title bar; older systems keep the default."""
+    try:
+        import ctypes
+        window.update_idletasks()
+        handle = ctypes.windll.user32.GetParent(window.winfo_id())
+        value = ctypes.c_int(1)
+        for attribute in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE, then the pre-20H1 id.
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(handle, attribute, ctypes.byref(value),
+                                                         ctypes.sizeof(value)) == 0:
+                break
     except (AttributeError, ImportError, OSError):
         pass
 
@@ -143,6 +160,7 @@ class Application:
         root.minsize(920, 620)
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.setup_style()
+        dark_title_bar(root)
 
         outer = ttk.Frame(root, padding=(20, 14, 20, 16), style="Page.TFrame")
         outer.pack(fill="both", expand=True)
@@ -194,8 +212,13 @@ class Application:
         self.root.configure(background=PAGE)
         style.configure(".", background=CARD, foreground=TEXT, font=(body, 10), bordercolor=BORDER,
                         lightcolor=CARD, darkcolor=CARD, troughcolor=BORDER, focuscolor=ACCENT,
-                        selectbackground=ACCENT, selectforeground="white", fieldbackground=CARD,
+                        selectbackground=ACCENT, selectforeground=ON_ACCENT, fieldbackground=FIELD,
                         insertcolor=TEXT)
+        # Classic Tk parts (combobox drop-down list) read the option database.
+        for option, value in (("*TCombobox*Listbox.background", CONTROL), ("*TCombobox*Listbox.foreground", TEXT),
+                              ("*TCombobox*Listbox.selectBackground", ACCENT),
+                              ("*TCombobox*Listbox.selectForeground", ON_ACCENT)):
+            self.root.option_add(option, value)
         style.map(".", foreground=[("disabled", DISABLED)])
         style.configure("Page.TFrame", background=PAGE)
         style.configure("Card.TFrame", background=CARD, relief="solid", borderwidth=1, bordercolor=BORDER)
@@ -204,48 +227,58 @@ class Application:
         style.configure("PageHint.TLabel", background=PAGE, foreground=MUTED, font=(body, 9))
         style.configure("Heading.TLabel", font=heavy(14))
         style.configure("Subheading.TLabel", font=heavy(10))
-        for name, colour in (("StepDone", "#0f7b0f"), ("StepCurrent", ACCENT), ("StepLocked", MUTED)):
+        for name, colour in (("StepDone", SUCCESS), ("StepCurrent", ACCENT), ("StepLocked", MUTED)):
             style.configure(name + ".TLabel", foreground=colour, font=heavy(10))
         style.configure("Hint.TLabel", foreground=MUTED, font=(body, 9))
-        style.configure("Done.TLabel", foreground="#0f7b0f", font=(body, 9))
-        style.configure("Locked.TLabel", foreground="#8a8a8a", font=(body, 9))
-        style.configure("Error.TLabel", foreground="#c42b1c", font=(body, 9))
-        style.configure("Warn.TLabel", foreground="#9d5d00", font=(body, 9))
-        style.configure("TButton", background=CARD, foreground=TEXT, bordercolor=CONTROL_BORDER,
-                        lightcolor=CARD, darkcolor=CARD, padding=(12, 5), relief="solid", borderwidth=1)
-        style.map("TButton", background=[("disabled", "#f5f5f5"), ("pressed", "#f0f0f0"), ("active", "#f6f6f6")],
-                  bordercolor=[("disabled", BORDER), ("focus", ACCENT)],
-                  lightcolor=[("pressed", "#f0f0f0"), ("active", "#f6f6f6")],
-                  darkcolor=[("pressed", "#f0f0f0"), ("active", "#f6f6f6")])
-        style.configure("Accent.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+        style.configure("Done.TLabel", foreground=SUCCESS, font=(body, 9))
+        style.configure("Locked.TLabel", foreground=DISABLED, font=(body, 9))
+        style.configure("Error.TLabel", foreground=CRITICAL, font=(body, 9))
+        style.configure("Warn.TLabel", foreground=WARNING, font=(body, 9))
+        style.configure("TButton", background=CONTROL, foreground=TEXT, bordercolor=CONTROL_BORDER,
+                        lightcolor=CONTROL, darkcolor=CONTROL, padding=(12, 5), relief="solid", borderwidth=1)
+        button_states = [("disabled", CARD), ("pressed", CONTROL_PRESSED), ("active", CONTROL_HOVER)]
+        style.map("TButton", background=button_states, lightcolor=button_states, darkcolor=button_states,
+                  bordercolor=[("disabled", BORDER), ("focus", ACCENT)])
+        style.configure("Accent.TButton", background=ACCENT, foreground=ON_ACCENT, bordercolor=ACCENT,
                         lightcolor=ACCENT, darkcolor=ACCENT, font=heavy(10), padding=(14, 6))
-        accent_states = [("disabled", "#bfbfbf"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
+        accent_states = [("disabled", "#434343"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
         style.map("Accent.TButton", background=accent_states, lightcolor=accent_states, darkcolor=accent_states,
-                  bordercolor=accent_states, foreground=[("disabled", "#f5f5f5")])
+                  bordercolor=accent_states, foreground=[("disabled", DISABLED)])
+        # SelectorBar (Windows 11): selected item is bright and semibold with an accent line under it.
+        style.configure("Selector.TButton", background=CARD, foreground=MUTED, bordercolor=CARD,
+                        lightcolor=CARD, darkcolor=CARD, padding=(12, 6), relief="flat", font=(body, 10))
+        style.map("Selector.TButton", foreground=[("active", TEXT)], background=[("active", CARD)],
+                  lightcolor=[("active", CARD)], darkcolor=[("active", CARD)], bordercolor=[("focus", CARD)])
+        style.configure("SelectorOn.TButton", background=CARD, foreground=TEXT, bordercolor=CARD,
+                        lightcolor=CARD, darkcolor=CARD, padding=(12, 6), relief="flat", font=heavy(10))
+        style.map("SelectorOn.TButton", background=[("active", CARD)], lightcolor=[("active", CARD)],
+                  darkcolor=[("active", CARD)], bordercolor=[("focus", CARD)])
+        style.configure("IndicatorOn.TFrame", background=ACCENT)
+        style.configure("IndicatorOff.TFrame", background=CARD)
+        style.layout("Bare.TNotebook.Tab", [])
+        style.configure("Bare.TNotebook", background=CARD, borderwidth=0, tabmargins=0)
         style.configure("Expander.TButton", anchor="w", padding=(14, 9))
         for widget in ("TEntry", "TCombobox", "TSpinbox"):
-            style.configure(widget, fieldbackground=CARD, bordercolor=CONTROL_BORDER, lightcolor=CARD,
-                            darkcolor=CARD, padding=5, arrowcolor=MUTED, background=CARD)
+            style.configure(widget, fieldbackground=FIELD, bordercolor=CONTROL_BORDER, lightcolor=FIELD,
+                            darkcolor=FIELD, padding=5, arrowcolor=MUTED, background=CONTROL, foreground=TEXT)
             style.map(widget, bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)],
-                      fieldbackground=[("disabled", "#f5f5f5"), ("readonly", CARD)],
-                      selectbackground=[("readonly !focus", CARD)], selectforeground=[("readonly !focus", TEXT)])
-        style.configure("TCheckbutton", indicatorbackground=CARD, indicatorforeground="white")
+                      fieldbackground=[("disabled", CARD), ("readonly", FIELD)],
+                      background=[("active", CONTROL_HOVER)],
+                      selectbackground=[("readonly !focus", FIELD)], selectforeground=[("readonly !focus", TEXT)])
+        style.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT)
         style.map("TCheckbutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
-        style.configure("TNotebook", background=CARD, bordercolor=BORDER, tabmargins=(0, 0, 0, 0))
-        style.configure("TNotebook.Tab", background=PAGE, bordercolor=BORDER, padding=(14, 6))
-        style.map("TNotebook.Tab", background=[("selected", CARD)], lightcolor=[("selected", CARD)])
         style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=BORDER,
                         bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
         # Thin neutral scrollbars, as in Windows 11 lists.
-        style.configure("Vertical.TScrollbar", background="#cfcfcf", troughcolor=CARD, bordercolor=CARD,
-                        arrowcolor=MUTED, lightcolor="#cfcfcf", darkcolor="#cfcfcf", arrowsize=11, gripcount=0)
-        style.map("Vertical.TScrollbar", background=[("active", "#a8a8a8")])
+        style.configure("Vertical.TScrollbar", background="#5a5a5a", troughcolor=CARD, bordercolor=CARD,
+                        arrowcolor=MUTED, lightcolor="#5a5a5a", darkcolor="#5a5a5a", arrowsize=11, gripcount=0)
+        style.map("Vertical.TScrollbar", background=[("active", "#7a7a7a")])
         style.configure("Page.Vertical.TScrollbar", troughcolor=PAGE, bordercolor=PAGE)
-        for level, (background, foreground, _glyph, _fallback) in SEVERITY.items():
+        for level, (background, icon, _glyph, _fallback) in SEVERITY.items():
             style.configure(f"{level}.Info.TFrame", background=background, relief="solid", borderwidth=1,
                             bordercolor=background)
-            style.configure(f"{level}.Info.TLabel", background=background, foreground=foreground, font=(body, 10))
-            style.configure(f"{level}.InfoIcon.TLabel", background=background, foreground=foreground,
+            style.configure(f"{level}.Info.TLabel", background=background, foreground=TEXT, font=(body, 10))
+            style.configure(f"{level}.InfoIcon.TLabel", background=background, foreground=icon,
                             font=(self.icon_font, 12) if self.icon_font else (body, 11, "bold"))
 
     def build_infobar(self, parent):
@@ -266,7 +299,7 @@ class Application:
         infobar = getattr(self, "infobar", None)
         if infobar is None:
             return
-        _background, _foreground, glyph, fallback = SEVERITY[level]
+        _background, _icon, glyph, fallback = SEVERITY[level]
         infobar.configure(style=f"{level}.Info.TFrame")
         self.infobar_icon.configure(style=f"{level}.InfoIcon.TLabel", text=glyph if self.icon_font else fallback)
         self.infobar_message.configure(style=f"{level}.Info.TLabel")
@@ -420,8 +453,8 @@ class Application:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
         text = self.tk.Text(frame, height=height, wrap="word", font=self.text_font, relief="flat",
-                            borderwidth=0, padx=12, pady=10, background="#fafafa" if readonly else CARD,
-                            foreground=TEXT, highlightthickness=1, highlightbackground=BORDER,
+                            borderwidth=0, padx=12, pady=10, background=FIELD if readonly else CONTROL,
+                            foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=BORDER,
                             highlightcolor=ACCENT, insertbackground=TEXT,
                             state="disabled" if readonly else "normal")
         bar = self.ttk.Scrollbar(frame, orient="vertical", command=text.yview)
@@ -440,7 +473,7 @@ class Application:
         self.heading = ttk.Label(top, text="С чего начать", style="Heading.TLabel")
         self.heading.grid(row=0, column=0, sticky="w")
         self.counter = ttk.Label(top, style="Hint.TLabel")
-        self.counter.grid(row=0, column=1, sticky="w", padx=12)
+        self.counter.grid(row=1, column=0, columnspan=2, sticky="w")
         self.progress = ttk.Progressbar(top, mode="indeterminate", length=120,
                                         style="Accent.Horizontal.TProgressbar")
         self.progress.grid(row=0, column=2, padx=(0, 8))
@@ -480,13 +513,31 @@ class Application:
         self.preview_box.grid(row=0, column=1, sticky="ew")
         self.preview_box.bind("<<ComboboxSelected>>", self.select_preview)
 
-        self.tabs = ttk.Notebook(work)
-        self.tabs.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        panel = ttk.Frame(work)
+        panel.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        panel.columnconfigure(0, weight=1)
+        panel.rowconfigure(1, weight=1)
+        selector = ttk.Frame(panel)
+        selector.grid(row=0, column=0, sticky="w", pady=(0, 6))
+        self.tabs = ttk.Notebook(panel, style="Bare.TNotebook")
+        self.tabs.grid(row=1, column=0, sticky="nsew")
         frame, self.context = self.text_box(self.tabs, 5)
         self.tabs.add(frame, text="Вакансия или вопрос")
         frame, self.log = self.text_box(self.tabs, 5)
         self.log.configure(font=("Consolas", 9))
         self.tabs.add(frame, text="Журнал")
+        self.selector_items = []
+        for index, title in enumerate(("Вакансия или вопрос", "Журнал")):
+            item = ttk.Frame(selector)
+            item.grid(row=0, column=index, padx=(0, 4))
+            button = ttk.Button(item, text=title, style="Selector.TButton", cursor="hand2",
+                                command=lambda number=index: self.show_tab(number))
+            button.pack()
+            line = ttk.Frame(item, height=3, style="IndicatorOff.TFrame")
+            line.pack(fill="x", padx=12)
+            self.selector_items.append((button, line))
+        self.tabs.bind("<<NotebookTabChanged>>", lambda _e: self.update_selector())
+        self.update_selector()
         self.letter_label = ttk.Label(work, text="Сопроводительное письмо")
         self.letter_label.grid(row=2, column=0, sticky="w")
         frame, self.letter = self.text_box(work, 7)
@@ -514,8 +565,8 @@ class Application:
         ttk.Label(self.chat_frame, text="Или напиши ответ сам:").grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
-                                   relief="flat", borderwidth=0, padx=10, pady=8, background=CARD,
-                                   foreground=TEXT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
+                                   relief="flat", borderwidth=0, padx=10, pady=8, background=CONTROL,
+                                   foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
                                    highlightcolor=ACCENT, insertbackground=TEXT)
         self.manual.grid(row=3, column=0, sticky="ew")
         self.manual_button = ttk.Button(self.chat_frame, text="Взять мой текст", command=self.manual_edit)
@@ -646,6 +697,15 @@ class Application:
         tabs = getattr(self, "tabs", None)
         if tabs is not None:
             tabs.select(index)
+            self.update_selector()
+
+    def update_selector(self):
+        """Selected item: bright semibold text and an accent line; others are dimmed."""
+        current = self.tabs.index("current")
+        for number, (button, line) in enumerate(getattr(self, "selector_items", ())):
+            selected = number == current
+            button.configure(style="SelectorOn.TButton" if selected else "Selector.TButton")
+            line.configure(style="IndicatorOn.TFrame" if selected else "IndicatorOff.TFrame")
 
     def set_busy(self, running):
         for button in self.buttons:
@@ -912,8 +972,9 @@ class Application:
         import webbrowser
         tk, ttk = self.tk, self.ttk
         self.close_device_window()
-        window = self.device_window = tk.Toplevel(self.root)
+        window = self.device_window = tk.Toplevel(self.root, background=CARD)
         window.title("Вход в ChatGPT")
+        dark_title_bar(window)
         window.transient(self.root)
         window.resizable(False, False)
         window.protocol("WM_DELETE_WINDOW", self.stop)

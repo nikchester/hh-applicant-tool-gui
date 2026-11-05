@@ -772,6 +772,12 @@ class StepChecks(unittest.TestCase):
                     self.assertEqual(str(app.action_buttons[action]["state"]), "disabled", action)
                 self.assertIn("Войти в HH", app.status.get())
                 self.assertFalse(app.decision.winfo_manager())  # No disabled send button on first run.
+                app.show_tab(1)  # The selected section must be unambiguous.
+                self.assertEqual([str(button["style"]) for button, _line in app.selector_items],
+                                 ["Selector.TButton", "SelectorOn.TButton"])
+                self.assertEqual([str(line["style"]) for _button, line in app.selector_items],
+                                 ["IndicatorOff.TFrame", "IndicatorOn.TFrame"])
+                app.show_tab(0)
                 app.session = gui_controller.Session("hh_login", {})
                 app.handle_frame(frame(app.session.run, "review", {"kind": "credential",
                     "context": "Email или телефон от аккаунта HH", "text": "", "options": []}))
