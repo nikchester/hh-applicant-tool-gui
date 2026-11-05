@@ -1,0 +1,8 @@
+# Build tools only. Install together with BOTH application requirement files.
+PyInstaller==6.16.0
+pyinstaller-hooks-contrib==2025.9
+packaging==25.0
+altgraph==0.17.4
+pefile==2023.2.7
+pywin32-ctypes==0.2.3
+setuptools==80.9.0

@@ -1,0 +1,7 @@
+{
+  "9749b651ff056b6c970039ed1f5a63765a5178": "DevOps OR \"инженер инфраструктуры\" OR \"инженер по инфраструктуре\"",
+  "27f3daa7ff10eda2e50039ed1f68686c526532": "(\"системный администратор\" AND (Linux OR DevOps)) OR \"Linux administrator\" OR \"инженер Linux\"",
+  "e7582ba1ff10eb7d2d0039ed1f537759493367": "\"инженер мониторинга\" OR \"инженер систем мониторинга\" OR \"специалист по мониторингу\" OR \"Observability Engineer\"",
+  "bf283d89ff10eb7fc80039ed1f757134445075": "\"техническая поддержка\" OR техподдержка OR \"technical support\" OR \"help desk\"",
+  "6032c534ff10f616b30039ed1f32437561744e": "SRE OR \"Site Reliability Engineer\" OR \"инженер надежности\" OR \"инженер по надежности\""
+}

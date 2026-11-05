@@ -1,11 +1,9 @@
 """Construct fixed HH dry-run arguments without PowerShell native quoting."""
 
 import os
-from pathlib import Path
 import sys
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "termux"))
-from preview_hh import run  # noqa: E402
+from preview_hh import run
 
 
 def arguments(config, resume_id, search):
@@ -13,10 +11,11 @@ def arguments(config, resume_id, search):
         raise SystemExit("Resume ID and search text are required")
     return [
         "--config-dir", config, "--profile-id", ".", "--no-handle-captcha",
-        "apply", "--dry-run", "--no-send-email", "--no-ai-filter", "--skip-tests",
+        "apply", "--dry-run", "--no-send-email", "--no-ai-filter", "--no-skip-tests",
         "--per-page", "3", "--total-pages", "1", "--max-responses", "1",
         "--work-format", "REMOTE", "--currency", "RUR", "--salary", "80000",
-        "--only-with-salary", "--search-field", "name",
+        "--no-only-with-salary", "--search-field", "name",
+        "--order-by", "publication_time",
         f"--resume-id={resume_id}", f"--search={search}",
     ]
 

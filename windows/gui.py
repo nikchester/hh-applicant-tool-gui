@@ -1,0 +1,997 @@
+"""Desktop entrypoint of the HH auto-apply GUI. Packagers must route worker modes before Tk."""
+
+import sys
+
+
+APP_TITLE = "Автоотклики HH"
+ACTION_TITLES = {
+    "hh_login": "вход в HH", "chatgpt_login": "вход в ChatGPT", "resumes": "загрузка резюме",
+    "models": "загрузка списка моделей", "preview": "предпросмотр писем", "apply": "отклики с проверкой",
+    "auto": "автоотклики", "chats": "ответы в чатах",
+}
+SUCCESS_TITLES = {
+    "hh_login": "Вход в HH выполнен.", "chatgpt_login": "Вход в ChatGPT выполнен.",
+    "resumes": "Резюме загружены.", "models": "Список моделей загружен.",
+    "preview": "Предпросмотр готов. Письма — в списке «Готовые письма».",
+    "apply": "Отклики завершены.", "auto": "Автоотклики завершены.", "chats": "Ответы в чатах завершены.",
+}
+COUNT_TITLES = {
+    "attempts": "попыток отправки", "http_success": "отправлено", "captcha_rejections": "остановлено капчей",
+    "chats": "чатов", "inspected": "просмотрено", "drafts": "черновиков", "skipped": "пропущено",
+    "failures": "ошибок",
+}
+REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
+UNKNOWN_RESULT = " Результат последней отправки неизвестен. Проверь отклики на hh.ru, прежде чем запускать снова."
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv == ["--worker"]:
+        from gui_runtime import attach_standard_streams
+        attach_standard_streams()
+        from gui_worker import worker_main
+        return worker_main()
+    if argv == ["--gateway-worker"]:
+        from gui_runtime import attach_standard_streams
+        attach_standard_streams()
+        from gui_runtime import gateway_main
+        return gateway_main()
+    if argv:
+        return 2
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    enable_dpi_awareness()
+    root = tk.Tk()
+    try:
+        Application(root, tk, ttk, messagebox)
+    except (OSError, ValueError):
+        messagebox.showerror(APP_TITLE, "Не удалось открыть папку настроек приложения.")
+        root.destroy()
+        return 1
+    root.mainloop()
+    return 0
+
+
+def enable_dpi_awareness():
+    """Render crisp text on scaled Windows displays instead of a blurry bitmap."""
+    try:
+        import ctypes
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except (AttributeError, ImportError, OSError):
+        pass
+
+
+def describe_vacancy(item):
+    """Human-readable vacancy card; raw API JSON is unreadable for a person."""
+    vacancy = item.get("vacancy") if isinstance(item, dict) else None
+    vacancy = vacancy if isinstance(vacancy, dict) else {}
+
+    def name_of(key):
+        value = vacancy.get(key)
+        return value.get("name") if isinstance(value, dict) else None
+
+    def amount(value):
+        return f"{value:,}".replace(",", " ") if isinstance(value, int) else str(value)
+
+    lines = [str(vacancy.get("name") or "Вакансия")]
+    if employer := name_of("employer"):
+        lines.append("Компания: " + str(employer))
+    salary = vacancy.get("salary")
+    if isinstance(salary, dict) and (salary.get("from") or salary.get("to")):
+        parts = [prefix + " " + amount(salary[key]) for prefix, key in (("от", "from"), ("до", "to"))
+                 if salary.get(key)]
+        if salary.get("currency"):
+            parts.append(str(salary["currency"]))
+        lines.append("Зарплата: " + " ".join(parts))
+    if area := name_of("area"):
+        lines.append("Город: " + str(area))
+    if url := vacancy.get("alternate_url"):
+        lines.append("Ссылка: " + str(url))
+    if isinstance(item, dict) and item.get("reason"):
+        lines.append("Причина пропуска: " + str(item["reason"]))
+    return "\n".join(lines)
+
+
+WELCOME = (
+    ("Heading.TLabel", "С чего начать"),
+    ("TLabel", "Приложение ищет вакансии на hh.ru, пишет сопроводительные письма через ChatGPT "
+               "и отправляет отклики. Письмо уходит только после твоего решения."),
+    ("Subheading.TLabel", "Что нужно"),
+    ("TLabel", "• аккаунт на hh.ru и хотя бы одно опубликованное резюме;\n• аккаунт ChatGPT."),
+    ("Subheading.TLabel", "Порядок работы"),
+    ("TLabel", "1. Войди в HH и в ChatGPT.\n"
+               "2. Загрузи резюме и введи поисковый запрос.\n"
+               "3. Выбери модель ChatGPT.\n"
+               "4. Запусти предпросмотр: он показывает письма и ничего не отправляет.\n"
+               "5. Нажми «Откликнуться с проверкой писем» и подтверди каждое письмо."),
+    ("Warn.TLabel", "HH может заблокировать аккаунт за автоматизацию. Капчу вводи только сам."),
+)
+
+
+class Application:
+    def __init__(self, root, tk, ttk, dialogs):
+        import tomllib
+        from gui_profile import initialize, read_searches
+        from gui_steps import chatgpt_signed_in, hh_signed_in
+        self.root, self.tk, self.ttk, self.dialogs = root, tk, ttk, dialogs
+        self.session, self.resumes, self.previews = None, [], []
+        self.recovery_acknowledgement = None
+        self.searches = read_searches()
+        config = tomllib.loads(initialize().read_text(encoding="utf-8"))
+        model = config["openai"]["default"]["model"]
+        self.signed_hh, self.signed_chatgpt = hh_signed_in(), chatgpt_signed_in()
+        self.model = tk.StringVar(value="" if model == "CHOOSE_AFTER_LOGIN" else model)
+        self.search, self.resume = tk.StringVar(), tk.StringVar()
+        self.all_resumes = tk.BooleanVar(value=False)
+        self.limit, self.minimum, self.maximum = tk.StringVar(value="1"), tk.StringVar(value="60"), tk.StringVar(value="180")
+        self.status = tk.StringVar()
+        self.review_kind, self.sending, self.current_resume = None, False, None
+        self.buttons, self.action_buttons = [], {}
+        self.device_window = None
+        root.title(APP_TITLE)
+        root.geometry("1180x820")
+        root.minsize(920, 620)
+        root.protocol("WM_DELETE_WINDOW", self.close)
+        self.setup_style()
+
+        outer = ttk.Frame(root, padding=(14, 10, 14, 12))
+        outer.pack(fill="both", expand=True)
+        header = ttk.Frame(outer)
+        header.pack(fill="x")
+        ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
+        ttk.Label(header, text="Отклики на hh.ru с письмами от ChatGPT", style="Hint.TLabel").pack(
+            side="left", padx=12, pady=(6, 0))
+        status = ttk.Label(outer, textvariable=self.status, style="Status.TLabel", anchor="w", justify="left")
+        status.pack(fill="x", pady=(8, 10))
+        status.bind("<Configure>", lambda event: status.configure(wraplength=max(event.width - 24, 200)))
+
+        body = ttk.Panedwindow(outer, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        sidebar_box, sidebar = self.scrollable(body)
+        main = ttk.Frame(body, padding=(14, 0, 0, 0))
+        body.add(sidebar_box, weight=0)
+        body.add(main, weight=1)
+        self.build_sidebar(sidebar)
+        self.build_main(main)
+        self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
+        self.clear_review()
+        for variable in (self.search, self.limit, self.minimum, self.maximum):
+            variable.trace_add("write", lambda *_a: self.refresh_steps())
+        self.refresh_steps()
+        self.status.set(self.next_hint())
+        root.after(100, self.poll)
+        self.root.after_idle(self.check_recovery)
+
+    # ---- layout -----------------------------------------------------------------
+
+    def setup_style(self):
+        from tkinter import font
+        style = self.ttk.Style(self.root)
+        if "vista" in style.theme_names():
+            style.theme_use("vista")
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
+            font.nametofont(name).configure(family="Segoe UI", size=10)
+        self.text_font = ("Segoe UI", 11)
+        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
+        style.configure("Heading.TLabel", font=("Segoe UI Semibold", 12))
+        style.configure("Subheading.TLabel", font=("Segoe UI Semibold", 10))
+        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10))
+        style.configure("Hint.TLabel", foreground="#6b6b6b", font=("Segoe UI", 9))
+        style.configure("Done.TLabel", foreground="#1f7a3a", font=("Segoe UI", 9))
+        style.configure("Locked.TLabel", foreground="#8a8a8a", font=("Segoe UI", 9))
+        style.configure("Error.TLabel", foreground="#b00020", font=("Segoe UI", 9))
+        style.configure("Warn.TLabel", foreground="#9a5b00", font=("Segoe UI", 9))
+        style.configure("Status.TLabel", background="#e8f0fb", foreground="#1d3b63", padding=(12, 8),
+                        font=("Segoe UI Semibold", 10))
+        style.configure("TButton", padding=(8, 4))
+        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(10, 6))
+
+    def scrollable(self, parent):
+        """Vertical scroll for the sidebar so every step stays reachable on small screens."""
+        tk, ttk = self.tk, self.ttk
+        box = ttk.Frame(parent)
+        canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0)
+        bar = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=bar.set)
+        canvas.pack(side="left", fill="both", expand=True)
+        bar.pack(side="right", fill="y")
+        inner = ttk.Frame(canvas, padding=(0, 0, 10, 0))
+        window = canvas.create_window(0, 0, anchor="nw", window=inner)
+        inner.bind("<Configure>", lambda _e: canvas.configure(
+            scrollregion=canvas.bbox("all"), width=inner.winfo_reqwidth()))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfigure(window, width=e.width))
+
+        def wheel(event):
+            canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        canvas.bind("<Enter>", lambda _e: canvas.bind_all("<MouseWheel>", wheel))
+        canvas.bind("<Leave>", lambda _e: canvas.unbind_all("<MouseWheel>"))
+        return box, inner
+
+    def action_button(self, parent, text, action):
+        button = self.ttk.Button(parent, text=text, command=lambda: self.launch(action))
+        self.buttons.append(button)
+        self.action_buttons[action] = button
+        return button
+
+    def step(self, parent, number, title):
+        frame = self.ttk.LabelFrame(parent, text=f"{number}. {title}", padding=(10, 6, 10, 10))
+        frame.pack(fill="x", pady=(0, 10))
+        frame.columnconfigure(0, weight=1)
+        note = self.ttk.Label(frame, style="Hint.TLabel", wraplength=300, justify="left")
+        note.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.steps.append((frame, f"{number}. {title}", note))
+        return frame
+
+    def hint(self, parent, text, row, style="Hint.TLabel", pady=(4, 0)):
+        label = self.ttk.Label(parent, text=text, style=style, wraplength=300, justify="left")
+        label.grid(row=row, column=0, columnspan=2, sticky="w", pady=pady)
+        return label
+
+    def build_sidebar(self, side):
+        ttk = self.ttk
+        self.steps = []
+        login = self.step(side, 1, "Вход")
+        login.columnconfigure(1, weight=1)
+        self.action_button(login, "Войти в HH", "hh_login").grid(row=1, column=0, sticky="ew", padx=(0, 6))
+        self.hh_state = ttk.Label(login, style="Hint.TLabel")
+        self.hh_state.grid(row=1, column=1, sticky="w")
+        self.action_button(login, "Войти в ChatGPT", "chatgpt_login").grid(
+            row=2, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
+        self.chatgpt_state = ttk.Label(login, style="Hint.TLabel")
+        self.chatgpt_state.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        # Login input lives next to the login buttons, not in the review area.
+        self.credential_frame = ttk.Frame(login)
+        self.credential_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.credential_frame.columnconfigure(0, weight=1)
+        self.credential_label = ttk.Label(self.credential_frame, text="Email или телефон от аккаунта HH",
+                                          style="Subheading.TLabel")
+        self.credential_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.credential = ttk.Entry(self.credential_frame)
+        self.credential.grid(row=1, column=0, sticky="ew")
+        self.credential.bind("<Return>", lambda _e: self.submit_credential())
+        self.submit = ttk.Button(self.credential_frame, text="Продолжить", style="Accent.TButton",
+                                 command=self.submit_credential)
+        self.submit.grid(row=1, column=1, padx=(6, 0))
+
+        resume = self.step(side, 2, "Резюме и поиск")
+        self.action_button(resume, "Загрузить мои резюме", "resumes").grid(row=1, column=0, columnspan=2, sticky="ew")
+        ttk.Label(resume, text="Резюме").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.resume_box = ttk.Combobox(resume, textvariable=self.resume, state="readonly", width=30)
+        self.resume_box.grid(row=3, column=0, columnspan=2, sticky="ew")
+        self.resume_box.bind("<<ComboboxSelected>>", self.select_resume)
+        ttk.Label(resume, text="Поисковый запрос на HH").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.search_entry = ttk.Entry(resume, textvariable=self.search)
+        self.search_entry.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self.search_entry.bind("<FocusOut>", lambda _e: self.remember_search())
+        self.hint(resume, "Например: Python разработчик. Запрос сохраняется сам.", 6, pady=(2, 0))
+        ttk.Checkbutton(resume, text="Откликаться со всех резюме по очереди", variable=self.all_resumes).grid(
+            row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.hint(resume, "Для каждого резюме нужен свой запрос: выбери резюме и введи запрос.", 8, pady=(0, 0))
+
+        model = self.step(side, 3, "Модель ChatGPT")
+        self.action_button(model, "Загрузить список моделей", "models").grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.models = ttk.Combobox(model, textvariable=self.model, state="readonly", width=30)
+        self.models.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.models.bind("<<ComboboxSelected>>", self.select_model)
+        self.hint(model, "Выбранная модель сохраняется сама.", 3)
+
+        run = self.step(side, 4, "Отклики")
+        self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
+        self.hint(run, "Показывает письма и ничего не отправляет. Начни с него.", 2, pady=(2, 8))
+        self.action_button(run, "Откликнуться с проверкой писем", "apply").grid(row=3, column=0, sticky="ew")
+        self.hint(run, "Каждое письмо ты читаешь и подтверждаешь сам.", 4, pady=(2, 8))
+        self.action_button(run, "Ответить в чатах", "chats").grid(row=5, column=0, sticky="ew")
+        self.hint(run, "Ответы работодателям в чатах HH, тоже с проверкой.", 6, pady=(2, 0))
+
+        # Risky mode stays folded away from the main flow.
+        self.auto_toggle = ttk.Button(side, text="▸ Дополнительно: автоотклики без проверки",
+                                      command=self.toggle_auto)
+        self.auto_toggle.pack(fill="x", pady=(0, 6))
+        self.auto_frame = auto = ttk.LabelFrame(side, text="Автоотклики без проверки", padding=(10, 6, 10, 10))
+        auto.columnconfigure(0, weight=1)
+        self.hint(auto, "Письма уходят без твоей проверки. Сначала посмотри предпросмотр.", 0,
+                  "Warn.TLabel", pady=(0, 6))
+        fields = ttk.Frame(auto)
+        fields.grid(row=1, column=0, sticky="ew")
+        ttk.Label(fields, text="Сколько откликов отправить").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Spinbox(fields, textvariable=self.limit, from_=1, to=1000, width=6).grid(
+            row=1, column=0, sticky="w")
+        ttk.Label(fields, text="Пауза между откликами, секунд: от").grid(
+            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+        ttk.Spinbox(fields, textvariable=self.minimum, from_=1, to=86400, increment=10, width=6).grid(
+            row=3, column=0, sticky="w")
+        ttk.Label(fields, text="до").grid(row=3, column=1, padx=6)
+        ttk.Spinbox(fields, textvariable=self.maximum, from_=1, to=86400, increment=10, width=6).grid(
+            row=3, column=2, sticky="w")
+        self.auto_error = ttk.Label(auto, style="Error.TLabel", wraplength=300, justify="left")
+        self.auto_error.grid(row=2, column=0, sticky="w", pady=(4, 0))
+        self.action_button(auto, "Запустить автоотклики…", "auto").grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+    def toggle_auto(self):
+        if self.auto_frame.winfo_ismapped():
+            self.auto_frame.pack_forget()
+            self.auto_toggle.configure(text="▸ Дополнительно: автоотклики без проверки")
+        else:
+            self.auto_frame.pack(fill="x", pady=(0, 10), after=self.auto_toggle)
+            self.auto_toggle.configure(text="▾ Дополнительно: автоотклики без проверки")
+
+    def text_box(self, parent, height, readonly=True):
+        frame = self.ttk.Frame(parent)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(0, weight=1)
+        text = self.tk.Text(frame, height=height, wrap="word", font=self.text_font, relief="solid",
+                            borderwidth=1, padx=8, pady=6, background="#f7f7f7" if readonly else "white",
+                            state="disabled" if readonly else "normal")
+        bar = self.ttk.Scrollbar(frame, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=bar.set)
+        text.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        return frame, text
+
+    def build_main(self, main):
+        ttk = self.ttk
+        main.columnconfigure(0, weight=1)
+        main.rowconfigure(1, weight=1)
+        top = ttk.Frame(main)
+        top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        top.columnconfigure(1, weight=1)
+        self.heading = ttk.Label(top, text="Начало работы", style="Heading.TLabel")
+        self.heading.grid(row=0, column=0, sticky="w")
+        self.counter = ttk.Label(top, style="Hint.TLabel")
+        self.counter.grid(row=0, column=1, sticky="w", padx=12)
+        self.progress = ttk.Progressbar(top, mode="indeterminate", length=120)
+        self.progress.grid(row=0, column=2, padx=(0, 8))
+        self.progress.grid_remove()
+        self.stop_button = ttk.Button(top, text="Остановить", command=self.stop, state="disabled")
+        self.stop_button.grid(row=0, column=3)
+        self.stop_button.grid_remove()
+        self.force_button = ttk.Button(top, text="Прервать сразу…", command=self.force, state="disabled")
+        self.force_button.grid(row=0, column=4, padx=(4, 0))
+        self.force_button.grid_remove()
+        self.view_button = ttk.Button(top, text="Журнал", command=self.toggle_view)
+        self.view_button.grid(row=0, column=5, padx=(8, 0))
+
+        self.welcome = welcome = ttk.Frame(main, padding=(4, 4, 4, 4))
+        welcome.grid(row=1, column=0, sticky="nsew")
+        welcome.columnconfigure(0, weight=1)
+        labels = []
+        for row, (style, text) in enumerate(WELCOME):
+            label = ttk.Label(welcome, text=text, style=style, justify="left")
+            label.grid(row=row, column=0, sticky="w", pady=(12 if style == "Subheading.TLabel" else 4, 0))
+            labels.append(label)
+        welcome.bind("<Configure>", lambda e: [item.configure(wraplength=max(e.width - 16, 300)) for item in labels])
+        # The one primary call to action: a filled button, unlike every other control.
+        self.next_button = self.tk.Button(welcome, command=self.do_next, font=("Segoe UI Semibold", 11),
+                                          bg="#1a5fb4", fg="white", activebackground="#174f96",
+                                          activeforeground="white", disabledforeground="#c9d6ea",
+                                          relief="flat", padx=18, pady=7, cursor="hand2")
+        self.next_button.grid(row=len(WELCOME), column=0, sticky="w", pady=(16, 0))
+
+        self.work = work = ttk.Frame(main)
+        work.grid(row=1, column=0, sticky="nsew")
+        work.columnconfigure(0, weight=1)
+        history = ttk.Frame(work)
+        history.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        history.columnconfigure(1, weight=1)
+        ttk.Label(history, text="Готовые письма:").grid(row=0, column=0, sticky="w", padx=(0, 6))
+        self.preview_box = ttk.Combobox(history, state="disabled")
+        self.preview_box.grid(row=0, column=1, sticky="ew")
+        self.preview_box.bind("<<ComboboxSelected>>", self.select_preview)
+
+        self.tabs = ttk.Notebook(work)
+        self.tabs.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
+        frame, self.context = self.text_box(self.tabs, 5)
+        self.tabs.add(frame, text="Вакансия или вопрос")
+        frame, self.log = self.text_box(self.tabs, 5)
+        self.log.configure(font=("Consolas", 9))
+        self.tabs.add(frame, text="Журнал")
+        self.letter_label = ttk.Label(work, text="Сопроводительное письмо")
+        self.letter_label.grid(row=2, column=0, sticky="w")
+        frame, self.letter = self.text_box(work, 7)
+        frame.grid(row=3, column=0, sticky="nsew", pady=(2, 6))
+
+        self.decision = decision = ttk.Frame(work)
+        decision.grid(row=4, column=0, sticky="ew")
+        self.yes = ttk.Button(decision, text="Отправить письмо", style="Accent.TButton",
+                              command=lambda: self.respond("yes"))
+        self.no = ttk.Button(decision, text="Пропустить", command=lambda: self.respond("no"))
+        self.yes.pack(side="left")
+        self.no.pack(side="left", padx=6)
+        ttk.Label(decision, text="Работодатель получит текст выше без изменений.",
+                  style="Hint.TLabel").pack(side="left", padx=6)
+
+        self.chat_frame = ttk.LabelFrame(work, text="Изменить ответ", padding=(10, 6, 10, 10))
+        self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
+        self.chat_frame.columnconfigure(0, weight=1)
+        ttk.Label(self.chat_frame, text="Попроси ChatGPT переписать ответ (работодатель не увидит просьбу):").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        self.instruction = ttk.Entry(self.chat_frame)
+        self.instruction.grid(row=1, column=0, sticky="ew")
+        self.instruction.bind("<Return>", lambda _e: self.refine())
+        self.edit = ttk.Button(self.chat_frame, text="Переписать", command=self.refine)
+        self.edit.grid(row=1, column=1, sticky="ew", padx=(6, 0))
+        ttk.Label(self.chat_frame, text="Или напиши ответ сам:").grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
+                                   relief="solid", borderwidth=1, padx=8, pady=6)
+        self.manual.grid(row=3, column=0, sticky="ew")
+        self.manual_button = ttk.Button(self.chat_frame, text="Взять мой текст", command=self.manual_edit)
+        self.manual_button.grid(row=3, column=1, sticky="new", padx=(6, 0))
+        self.option = ttk.Combobox(self.chat_frame, state="readonly")
+        self.option.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(self.chat_frame, text="После правки ответ снова придёт на проверку.",
+                  style="Hint.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+
+        work.rowconfigure(1, weight=1, minsize=110)
+        work.rowconfigure(3, weight=2, minsize=130)
+        self.show_welcome()
+
+    # ---- views ------------------------------------------------------------------
+
+    def show_welcome(self):
+        self.work.grid_remove()
+        self.welcome.grid()
+        self.heading.configure(text="Начало работы")
+        self.view_button.configure(text="Журнал")
+
+    def show_work(self, tab=0):
+        welcome = getattr(self, "welcome", None)
+        if welcome is None:
+            return
+        welcome.grid_remove()
+        self.work.grid()
+        self.view_button.configure(text="Как начать")
+        self.show_tab(tab)
+
+    def toggle_view(self):
+        if self.welcome.winfo_ismapped():
+            self.show_work(1)
+            self.heading.configure(text="Журнал")
+        else:
+            self.show_welcome()
+
+    # ---- step guidance ----------------------------------------------------------
+
+    def progress_state(self):
+        from gui_steps import Progress
+        index = self.resume_box.current()
+        return Progress(hh=self.signed_hh, chatgpt=self.signed_chatgpt,
+                        resume=0 <= index < len(self.resumes), search=bool(self.search.get().strip()),
+                        model=self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"})
+
+    def next_hint(self):
+        from gui_steps import next_hint
+        return next_hint(self.progress_state())
+
+    def next_action(self, progress):
+        if not progress.hh:
+            return "hh_login", "Начать: войти в HH"
+        if not progress.chatgpt:
+            return "chatgpt_login", "Войти в ChatGPT"
+        if not progress.resume:
+            return "resumes", "Загрузить мои резюме"
+        if not progress.search:
+            return "search", "Ввести поисковый запрос"
+        if not progress.model:
+            return "models", "Загрузить список моделей"
+        return "preview", "Запустить предпросмотр писем"
+
+    def do_next(self):
+        action, _text = self.next_action(self.progress_state())
+        if action == "search":
+            self.search_entry.focus_set()
+        else:
+            self.launch(action)
+
+    def refresh_steps(self):
+        """Mark each step, lock unready actions and highlight the one next button."""
+        if getattr(self, "steps", None) is None:
+            return
+        from gui_steps import CURRENT, DONE, LOCKED, MARKS, blocker, parse_auto_settings, step_states
+        progress = self.progress_state()
+        states = step_states(progress)
+        locks = (None, blocker("resumes", progress), blocker("models", progress), blocker("preview", progress))
+        for (frame, title, note), state, lock in zip(self.steps, states, locks):
+            frame.configure(text=f"{MARKS[state]}  {title}")
+            if state == DONE:
+                note.configure(text="Готово.", style="Done.TLabel")
+            elif state == LOCKED:
+                note.configure(text=lock or "", style="Locked.TLabel")
+            elif state == CURRENT:
+                note.configure(text="Сделай этот шаг сейчас.", style="Hint.TLabel")
+            else:
+                note.configure(text="", style="Hint.TLabel")
+        self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
+                                style="Done.TLabel" if progress.hh else "Hint.TLabel")
+        self.chatgpt_state.configure(text="✓ вход выполнен" if progress.chatgpt else "вход не выполнен",
+                                     style="Done.TLabel" if progress.chatgpt else "Hint.TLabel")
+        _values, auto_problem = parse_auto_settings(self.limit.get(), self.minimum.get(), self.maximum.get())
+        self.auto_error.configure(text=auto_problem or "")
+        action, text = self.next_action(progress)
+        self.next_button.configure(text=text)
+        idle = self.session is None
+        for name, button in self.action_buttons.items():
+            ready = blocker(name, progress) is None and (name != "auto" or auto_problem is None)
+            button.configure(state="normal" if idle and ready else "disabled",
+                             style="Accent.TButton" if name == action else "TButton")
+        self.next_button.configure(state="normal" if idle else "disabled")
+
+    # ---- state helpers ----------------------------------------------------------
+
+    def replace_text(self, widget, text):
+        widget.configure(state="normal")
+        widget.delete("1.0", "end")
+        widget.insert("1.0", text)
+        widget.configure(state="disabled")
+
+    def append_log(self, text):
+        import time
+        log = getattr(self, "log", None)
+        if log is None:
+            return
+        log.configure(state="normal")
+        log.insert("end", time.strftime("%H:%M:%S  ") + text + "\n")
+        log.see("end")
+        log.configure(state="disabled")
+
+    def show_tab(self, index):
+        tabs = getattr(self, "tabs", None)
+        if tabs is not None:
+            tabs.select(index)
+
+    def set_busy(self, running):
+        for button in self.buttons:
+            button.configure(state="disabled" if running else "normal")
+        self.stop_button.configure(state="normal" if running else "disabled", text="Остановить")
+        if running:
+            self.stop_button.grid()
+        else:
+            self.stop_button.grid_remove()
+        self.force_button.configure(state="disabled")
+        self.force_button.grid_remove()
+        progress = getattr(self, "progress", None)
+        if progress is not None:
+            if running:
+                progress.grid()
+                progress.start(12)
+            else:
+                progress.stop()
+                progress.grid_remove()
+        if not running:
+            self.refresh_steps()
+        elif getattr(self, "next_button", None) is not None:
+            self.next_button.configure(state="disabled")
+
+    def clear_review(self):
+        self.review_kind = None
+        for button in self.review_buttons:
+            button.configure(state="disabled")
+        self.credential.delete(0, "end")
+        self.instruction.delete(0, "end")
+        self.manual.delete("1.0", "end")
+        self.option.configure(values=())
+        self.option.set("")
+        # Show only the controls the current decision needs.
+        for frame in (getattr(self, "credential_frame", None), getattr(self, "chat_frame", None),
+                      getattr(self, "decision", None)):
+            if frame is not None:
+                frame.grid_remove()
+
+    def selected_id(self):
+        index = self.resume_box.current()
+        if not 0 <= index < len(self.resumes):
+            raise ValueError("Сначала загрузи и выбери опубликованное резюме (шаг 2).")
+        return self.resumes[index]["id"]
+
+    def remember_search(self):
+        """Save the typed search for the selected resume without asking."""
+        from gui_profile import read_searches, save_search
+        resume_id, search = self.current_resume, self.search.get()
+        if not resume_id or not search.strip() or len(search) > 4000 or self.searches.get(resume_id) == search:
+            return
+        try:
+            save_search(resume_id, search)
+            self.searches = read_searches()
+        except (OSError, ValueError):
+            self.append_log("Не удалось сохранить поисковый запрос.")
+
+    def select_resume(self, _event=None):
+        self.remember_search()
+        try:
+            self.current_resume = self.selected_id()
+            self.search.set(self.searches.get(self.current_resume, ""))
+        except ValueError:
+            self.current_resume = None
+        self.refresh_steps()
+
+    def select_model(self, _event=None):
+        from gui_profile import set_model
+        try:
+            set_model(self.model.get())
+        except (OSError, ValueError):
+            self.dialogs.showerror("Модель", "Не удалось сохранить модель. Выбери её снова.")
+        self.refresh_steps()
+
+    def select_preview(self, _event=None):
+        if self.session is not None and self.session.state.pending is not None:
+            return  # Never replace the displayed text underneath an approval.
+        index = self.preview_box.current()
+        if 0 <= index < len(self.previews):
+            value = self.previews[index]
+            self.replace_text(self.context, describe_vacancy(value))
+            self.replace_text(self.letter, value["text"])
+
+    def save(self):
+        from gui_profile import save_search, set_model, read_searches
+        try:
+            resume_id = self.selected_id()
+            if not self.search.get().strip():
+                entry = getattr(self, "search_entry", None)
+                if entry is not None:
+                    entry.focus_set()
+                raise ValueError("Введи поисковый запрос на HH в шаге 2, например: Python разработчик.")
+            if len(self.search.get()) > 4000:
+                raise ValueError("Поисковый запрос слишком длинный: максимум 4000 символов.")
+            save_search(resume_id, self.search.get())
+            if self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"}:
+                set_model(self.model.get())
+            self.searches = read_searches()
+            return True
+        except (OSError, ValueError) as error:
+            self.dialogs.showerror("Настройки", str(error))
+            return False
+
+    def check_recovery(self):
+        from gui_recovery import RecoveryMarker, WARNING
+        try:
+            pending = RecoveryMarker().pending()
+            if pending is None:
+                self.recovery_acknowledgement = None
+                return True
+            if pending == getattr(self, "recovery_acknowledgement", None):
+                return True
+            self.status.set("Прошлая отправка завершилась без подтверждения. Проверь отклики на hh.ru перед новой отправкой.")
+            if self.dialogs.askyesno("Проверь прошлую отправку", WARNING):
+                self.recovery_acknowledgement = pending
+                return True
+            return False
+        except OSError:
+            self.dialogs.showerror("Проверка прошлой отправки",
+                                   "Не удалось проверить, чем закончилась прошлая отправка. Новая отправка запрещена.")
+            return False
+
+    # ---- actions ----------------------------------------------------------------
+
+    def launch(self, action):
+        from gui_controller import Session, action_settings
+        from gui_profile import set_model
+        from gui_recovery import MUTATING_ACTIONS
+        if self.session is not None:
+            return
+        try:
+            if action in MUTATING_ACTIONS and not self.check_recovery():
+                return
+            resume, search = "", ""
+            if action in REVIEW_ACTIONS:
+                if self.model.get() == "CHOOSE_AFTER_LOGIN" or not self.model.get():
+                    raise ValueError("Войди в ChatGPT, загрузи список моделей и выбери модель (шаг 3).")
+                set_model(self.model.get())
+            if action in {"preview", "apply", "auto"}:
+                resume, search = self.selected_id(), self.search.get()
+                if not self.save():
+                    return
+            if action in {"apply", "auto"} and self.all_resumes.get():
+                missing = [item.get("title") or item["id"] for item in self.resumes
+                           if not str(self.searches.get(item["id"], "")).strip()]
+                if missing:
+                    raise ValueError("Включён режим «со всех резюме по очереди», но нет запроса для резюме:\n• "
+                                     + "\n• ".join(missing) + "\n\nВыбери каждое резюме в шаге 2 и введи для него "
+                                     "запрос. Или сними этот флажок.")
+            limit, minimum, maximum, consent = 1, 60, 180, False
+            if action == "auto":
+                from auto_send import validate_settings
+                from gui_steps import parse_auto_settings
+                values, problem = parse_auto_settings(self.limit.get(), self.minimum.get(), self.maximum.get())
+                if problem:
+                    raise ValueError(problem)
+                limit, minimum, maximum = values
+                validate_settings(limit, minimum, maximum)
+                consent = self.dialogs.askyesno("Автоотклики без проверки",
+                    f"Отправить до {limit} откликов без проверки каждого письма?\n\n"
+                    f"Пауза между откликами: от {minimum:g} до {maximum:g} секунд.\n"
+                    "Пауза не защищает от блокировки аккаунта на HH.\n\n"
+                    "Если результат отправки неизвестен, проверь отклики на hh.ru. Не запускай повторно вслепую.")
+                if not consent:
+                    return
+            settings = action_settings(action, resume=resume, search=search, all_resumes=self.all_resumes.get(),
+                limit=limit, min_pause=minimum, max_pause=maximum, consent=consent)
+            self.session = Session(action, settings,
+                recovery_acknowledgement=getattr(self, "recovery_acknowledgement", None))
+            self.clear_review()
+            self.previews = []
+            self.preview_box.configure(values=(), state="disabled")
+            self.preview_box.set("")
+            self.replace_text(self.context, "")
+            self.replace_text(self.letter, "")
+            self.prepare_run_view(action, limit)
+            title = ACTION_TITLES.get(action, action)
+            self.status.set("Выполняется: " + title + ". Дождись результата или нажми «Остановить».")
+            self.append_log("Запуск: " + title)
+            self.set_busy(True)
+            self.session.start()
+        except (OSError, ValueError) as error:
+            self.dialogs.showerror("Запуск", str(error))
+
+    def prepare_run_view(self, action, limit):
+        self.run_counts = {"vacancies": 0, "sent": 0, "limit": limit if action == "auto" else None}
+        if getattr(self, "heading", None) is None:
+            return
+        if action in REVIEW_ACTIONS:
+            self.show_work(0)
+            self.heading.configure(text=ACTION_TITLES[action].capitalize())
+            self.letter_label.configure(text="Ответ в чат" if action == "chats" else
+                                        "Сопроводительное письмо (предпросмотр, не отправляется)"
+                                        if action == "preview" else "Сопроводительное письмо")
+        self.update_counter()
+
+    def update_counter(self):
+        counter = getattr(self, "counter", None)
+        counts = getattr(self, "run_counts", None)
+        if counter is None or counts is None:
+            return
+        parts = []
+        if counts["vacancies"]:
+            parts.append(f"вакансий: {counts['vacancies']}")
+        if counts["sent"] or counts["limit"]:
+            parts.append(f"отправок: {counts['sent']}" + (f" из {counts['limit']}" if counts["limit"] else ""))
+        counter.configure(text=" · ".join(parts).capitalize())
+
+    def respond(self, action, text=""):
+        from gui_protocol import ProtocolError
+        if self.session is None:
+            return
+        try:
+            self.session.respond(action, text)
+            self.clear_review()  # Edits consume this review; next one has a fresh ID.
+            self.status.set("Правка принята. Новый вариант придёт на проверку и сам не отправится."
+                            if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг.")
+        except ProtocolError:
+            self.stop()
+
+    def submit_credential(self):
+        if str(self.submit["state"]) == "normal" and self.credential.get().strip():
+            self.respond("submit", self.credential.get())
+
+    def refine(self):
+        if str(self.edit["state"]) == "normal" and self.instruction.get().strip():
+            self.respond("edit", self.instruction.get())
+
+    def manual_edit(self):
+        text = self.option.get() if self.option["values"] else self.manual.get("1.0", "end-1c")
+        if text.strip():
+            self.respond("manual", text)
+
+    def stop(self):
+        if self.session is not None:
+            self.session.cancel()
+            self.clear_review()
+            self.status.set("Останавливаю после текущего шага. Если текст уже отправлялся, проверь hh.ru перед повтором.")
+            stop_button = getattr(self, "stop_button", None)
+            if stop_button is not None:
+                stop_button.configure(state="disabled", text="Останавливаю…")
+                self.force_button.grid()
+                self.force_button.configure(state="normal")
+
+    def force(self):
+        if self.session is not None and self.dialogs.askyesno("Прервать сразу",
+                "Процесс завершится немедленно. Неизвестно, ушла ли последняя отправка. "
+                "Вход может потребоваться заново.\n\nПосле этого проверь отклики на hh.ru. Прервать?"):
+            self.session.force()
+            self.clear_review()
+
+    def close(self):
+        if self.session is not None:
+            if self.dialogs.askyesno("Операция ещё идёт",
+                    "Остановить операцию? Окно не закроется сразу. "
+                    "Дождись остановки и закрой окно снова."):
+                self.stop()
+            return
+        self.root.destroy()
+
+    # ---- ChatGPT device login ---------------------------------------------------
+
+    def show_device_code(self, url, code):
+        import webbrowser
+        tk, ttk = self.tk, self.ttk
+        self.close_device_window()
+        window = self.device_window = tk.Toplevel(self.root)
+        window.title("Вход в ChatGPT")
+        window.transient(self.root)
+        window.resizable(False, False)
+        window.protocol("WM_DELETE_WINDOW", self.stop)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Вход в ChatGPT", style="Heading.TLabel").pack(anchor="w")
+        steps = ("1. Нажми «Открыть страницу входа».\n"
+                 "2. Войди в свой аккаунт ChatGPT.\n"
+                 "3. Введи на странице этот код:")
+        ttk.Label(frame, text=steps, justify="left").pack(anchor="w", pady=(8, 6))
+        ttk.Label(frame, text=code, font=("Consolas", 20, "bold")).pack(anchor="w", pady=(0, 10))
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="w")
+
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append(code)
+            copied.configure(text="Код скопирован.")
+        ttk.Button(buttons, text="Открыть страницу входа", style="Accent.TButton",
+                   command=lambda: webbrowser.open(url)).pack(side="left")
+        ttk.Button(buttons, text="Скопировать код", command=copy).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Отмена", command=self.stop).pack(side="left")
+        copied = ttk.Label(frame, style="Done.TLabel")
+        copied.pack(anchor="w", pady=(6, 0))
+        ttk.Label(frame, text="Адрес страницы: " + url, style="Hint.TLabel").pack(anchor="w")
+        ttk.Label(frame, text="После входа это окно закроется само.", style="Hint.TLabel").pack(anchor="w")
+
+    def close_device_window(self):
+        window = getattr(self, "device_window", None)
+        if window is not None:
+            window.destroy()
+            self.device_window = None
+
+    # ---- worker events ----------------------------------------------------------
+
+    def handle_frame(self, data):
+        from gui_protocol import ProtocolError
+        session = self.session
+        if session is None or data["run"] != session.run or session.cancelled.is_set():
+            return
+        if data["type"] == "review":
+            session.state.accept(data)
+            payload = data["payload"]
+            if (set(payload) != {"kind", "context", "text", "options"}
+                    or payload["kind"] not in {"application", "chat", "credential"}
+                    or not all(isinstance(payload[k], str) for k in ("context", "text"))
+                    or not isinstance(payload["options"], list)
+                    or not all(isinstance(item, str) for item in payload["options"])):
+                raise ProtocolError("Invalid review payload")
+            self.clear_review()
+            self.review_kind = payload["kind"]
+            if self.review_kind == "credential":
+                self.credential_label.configure(text=payload["context"] or "Введи данные для входа")
+                self.credential_frame.grid()
+                self.submit.configure(state="normal")
+                self.credential.focus_set()
+                self.status.set("Шаг 1: введи «" + (payload["context"] or "данные для входа")
+                                + "» под кнопкой «Войти в HH» и нажми «Продолжить».")
+                return
+            self.show_work(0)
+            self.replace_text(self.context, payload["context"])
+            self.replace_text(self.letter, payload["text"])
+            chat = self.review_kind == "chat"
+            self.letter_label.configure(text="Ответ в чат. Его получит работодатель." if chat
+                                        else "Сопроводительное письмо. Его получит работодатель.")
+            self.yes.configure(text="Отправить ответ" if chat else "Отправить письмо")
+            self.decision.grid()
+            self.yes.configure(state="normal")
+            self.no.configure(state="normal")
+            if chat:
+                self.chat_frame.grid()
+                self.edit.configure(state="normal")
+                self.manual_button.configure(state="normal")
+                self.option.configure(values=payload["options"])
+                if payload["options"]:
+                    self.option.grid()
+                    self.option.current(0)
+                else:
+                    self.option.grid_remove()
+            self.status.set("Прочитай текст. Нажми «" + str(self.yes["text"]) + "» или «Пропустить».")
+            return
+        payload = data["payload"]
+        name, value = payload.get("name"), payload.get("data")
+        if name == "resumes":
+            self.resumes = value
+            self.resume_box.configure(values=[item["title"] for item in value])
+            if value:
+                self.resume_box.current(0)
+                self.select_resume()
+            self.append_log(f"Загружено резюме: {len(value)}")
+        elif name == "models":
+            self.models.configure(values=value)
+            if self.model.get() not in value and value:
+                self.models.current(0)
+                self.select_model()
+            self.append_log(f"Загружено моделей: {len(value)}")
+        elif name == "device":
+            self.show_device_code(value["url"], value["code"])
+            self.status.set("Окно «Вход в ChatGPT»: открой страницу входа и введи код.")
+        elif name == "sending":
+            self.sending = value is True
+            if not self.sending and getattr(self, "run_counts", None) is not None:
+                self.run_counts["sent"] += 1
+                self.update_counter()
+            self.status.set("Идёт отправка в HH…" if self.sending else "Отправка завершена. Жду следующий шаг.")
+        elif name in {"letter", "application", "preview_skipped"}:
+            if session.state.pending is not None:
+                raise ProtocolError("Output cannot replace a pending reviewed message")
+            if name == "preview_skipped":
+                value = {**value, "text": "Пропущена: " + value["reason"]}
+            self.replace_text(self.context, describe_vacancy(value))
+            self.replace_text(self.letter, value["text"])
+            if getattr(self, "run_counts", None) is not None:
+                self.run_counts["vacancies"] += 1
+                self.update_counter()
+            if name in {"letter", "preview_skipped"}:
+                self.previews.append(value)
+                self.preview_box.configure(state="readonly", values=[
+                    f"{number}. {item['vacancy'].get('name') or 'Вакансия'}" + (" — пропущена" if "reason" in item else "")
+                    for number, item in enumerate(self.previews, 1)])
+                self.preview_box.current(len(self.previews) - 1)
+        elif name == "diagnostic":
+            self.append_log("Сведения о сбое сети сохранены: " + value)
+
+    def finish_message(self, data, action=None):
+        from gui_steps import FAILURE_HINTS
+        done = data["done"]
+        if data.get("busy"):
+            return ("Не запущено: уже идёт другой запуск HH (окно GUI или автоотклики в PowerShell). "
+                    "Дождись его завершения или останови его.")
+        if data["success"]:
+            message = SUCCESS_TITLES.get(action, "Готово.")
+        elif data["cancelled"] or (done is not None and done.get("cancelled")):
+            message = "Остановлено. Уже отправленные отклики не отменяются."
+        else:
+            message = FAILURE_HINTS.get(action, "Не удалось завершить.") + " Подробности — в журнале."
+        if done is not None and isinstance(done.get("counts"), dict) and any(done["counts"].values()):
+            message += " " + ", ".join(f"{COUNT_TITLES.get(key, key)}: {count}"
+                                       for key, count in done["counts"].items()).capitalize() + "."
+        if data["forced"] or done is None or done.get("unknown") or self.sending:
+            if action in {"apply", "auto", "chats"}:
+                message += UNKNOWN_RESULT
+        return message
+
+    def finish_run(self, session, data):
+        from gui_steps import chatgpt_signed_in, hh_signed_in
+        self.close_device_window()
+        if session.action == "hh_login":
+            self.signed_hh = hh_signed_in()
+        elif session.action == "chatgpt_login":
+            self.signed_chatgpt = chatgpt_signed_in()
+        message = self.finish_message(data, session.action)
+        self.append_log(message)
+        self.sending = False
+        self.session = None
+        self.set_busy(False)
+        if data["success"] and session.action not in REVIEW_ACTIONS:
+            message += " Дальше: " + self.next_hint()
+        self.status.set(message)
+        if not data["success"] and self.work.winfo_ismapped():
+            self.show_tab(1)
+
+    def poll(self):
+        import queue
+        from gui_protocol import ProtocolError
+        if self.session is not None:
+            session = self.session
+            try:
+                for _ in range(100):
+                    name, data = session.events.get_nowait()
+                    if name == "frame":
+                        try:
+                            self.handle_frame(data)
+                        except (ProtocolError, ValueError, TypeError, KeyError):
+                            self.stop()
+                    elif name == "status":
+                        self.status.set(data)
+                        self.append_log(data)
+                    elif name == "finished":
+                        self.clear_review()
+                        self.finish_run(session, data)
+                        break
+            except queue.Empty:
+                pass
+        self.root.after(100, self.poll)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

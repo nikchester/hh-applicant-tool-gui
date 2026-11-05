@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<job id="PocketNodeHH">
+<?job error="true" debug="false" ?>
+<script language="JScript"><![CDATA[
+// WSF keeps Russian text Unicode-safe without relying on the system ANSI codepage.
+var fso = new ActiveXObject("Scripting.FileSystemObject");
+var shell = new ActiveXObject("WScript.Shell");
+var scriptDir = fso.GetParentFolderName(WScript.ScriptFullName);
+var root = fso.GetParentFolderName(scriptDir);
+var pythonw = fso.BuildPath(root, "venvs\\hh\\Scripts\\pythonw.exe");
+var gui = fso.BuildPath(scriptDir, "gui.py");
+
+function fail(message) {
+    shell.Popup(message, 0, "Автоотклики HH", 16);
+    WScript.Quit(1);
+}
+
+function quote(path) {
+    return '"' + path + '"';
+}
+
+if (!fso.FileExists(pythonw)) {
+    fail("Не найден подготовленный Python: venvs\\hh\\Scripts\\pythonw.exe. " +
+         "Нужно заранее подготовленное окружение этой копии проекта. " +
+         "Загрузки и установка не выполняются.");
+}
+if (!fso.FileExists(gui)) {
+    fail("Не найден windows\\gui.py. Проверь целостность папки проекта.");
+}
+
+try {
+    shell.CurrentDirectory = root;
+    shell.Run(quote(pythonw) + " " + quote(gui), 0, false);
+} catch (error) {
+    fail("Не удалось запустить GUI. Проверь доступ к папке проекта и подготовленное окружение.");
+}
+]]></script>
+</job>

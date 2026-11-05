@@ -2,31 +2,97 @@ name: Offline checks
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      build_installer:
+        description: 'Build unsigned development installer artifact (requires preinstalled Inno 6.4.3)'
+        type: boolean
+        required: false
+        default: false
 permissions:
   contents: read
 jobs:
   tests:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: '3.14'
+          python-version: '3.12'
           cache: pip
           cache-dependency-path: |
-            termux/requirements-hh.txt
-            termux/requirements-chatmock.txt
+            windows/requirements-hh.txt
+            windows/requirements-chatmock.txt
       - name: Check tracked files and configuration
-        shell: bash
+        shell: pwsh
         run: |
-          python termux/check_repository.py
-          for file in termux/*.sh; do sh -n "$file"; done
-          python -m compileall -q termux
+          python windows/check_repository.py
+          python -m compileall -q windows
+          Get-ChildItem windows -Filter '*.ps1' | ForEach-Object {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors) { throw "PowerShell syntax errors in $($_.Name): $errors" }
+          }
       - name: Install application dependencies
-        run: python -m pip install -r termux/requirements-hh.txt -r termux/requirements-chatmock.txt
+        run: python -m pip install -r windows/requirements-hh.txt -r windows/requirements-chatmock.txt
       - name: Run offline tests (no account or HH requests)
         run: |
-          python termux/check_hh.py
-          python termux/check_chatmock.py
+          python windows/check_preview.py
+          python windows/check_chatmock.py
           python windows/check_windows.py
           python windows/check_send.py
+          python windows/check_auto_send.py
+          python windows/check_reply_chats.py
+          python windows/check_manual_captcha.py
+          python windows/check_authorize.py
+      - name: Run offline GUI boundary tests
+        run: python windows/check_gui.py
+      - name: Run offline console-free launcher tests (disposable WSH fixtures)
+        run: python -B windows/check_launcher.py
+      - name: Run offline exclusive ChatMock auth tests (synthetic fixtures only)
+        run: python -B windows/check_gui_auth.py
+      - name: Run offline packaging boundary tests
+        run: python windows/check_packaging.py
+      - name: Run fresh-process offline source and guarded gateway smoke
+        run: python -B windows/packaging/check_source_smoke.py
+  installer:
+    if: github.event_name == 'workflow_dispatch' && inputs.build_installer
+    needs: tests
+    runs-on: windows-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Require reviewed preinstalled compiler (no auto download)
+        shell: pwsh
+        run: |
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          if (-not (Test-Path -LiteralPath $iscc)) { throw 'Inno Setup 6.4.3 missing on runner' }
+          & $iscc '/O-' windows/packaging/compiler-version.iss
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Runner compiler differs from reviewed Inno Setup 6.4.3; review/update pin before building'
+          }
+      - name: Prepare isolated build dependencies
+        shell: pwsh
+        run: |
+          python -m venv windows/build/venv
+          windows/build/venv/Scripts/python.exe -m pip install -r windows/requirements-hh.txt -r windows/requirements-chatmock.txt -r windows/packaging/requirements-build.txt
+          if ($LASTEXITCODE) { throw 'Build dependency installation failed' }
+      - name: Build and smoke-check unsigned installer (never execute installer)
+        shell: pwsh
+        run: |
+          ./windows/build-installer.ps1 -Python ./windows/build/venv/Scripts/python.exe -Iscc (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+      - name: Retain development artifact only (not a release)
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: unsigned-windows-x64-installer
+          path: |
+            windows/dist/*/installer/
+          if-no-files-found: error
+          retention-days: 7

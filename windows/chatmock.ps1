@@ -2,17 +2,19 @@ param([Parameter(Mandatory = $true)][ValidateSet('login', 'serve')][string]$Acti
 
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
-$cli = Join-Path $repo 'venvs\chatmock\Scripts\chatmock.exe'
+$python = Join-Path $repo 'venvs\chatmock\Scripts\python.exe'
 $env:CHATGPT_LOCAL_HOME = Join-Path $HOME '.local\state\pocketnode-hh\chatmock'
 $env:CODEX_HOME = $env:CHATGPT_LOCAL_HOME
-if (-not (Test-Path -LiteralPath $cli)) { throw 'Run windows/bootstrap.ps1 first.' }
+if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first.' }
+# Call the entry point directly: pip .exe launchers break when the venv is moved.
+$chatmock = @('-c', "import sys; from chatmock.cli import main; sys.argv[0] = 'chatmock'; main()")
 
 if ($Action -eq 'login') {
     New-Item -ItemType Directory -Force -Path $env:CHATGPT_LOCAL_HOME | Out-Null
     if (Test-Path -LiteralPath (Join-Path $env:CHATGPT_LOCAL_HOME 'auth.json')) {
         throw 'A separate ChatMock login exists; refusing to overwrite it.'
     }
-    & $cli login --headless
+    & $python @chatmock login --headless
 } else {
     $auth = Join-Path $env:CHATGPT_LOCAL_HOME 'auth.json'
     if (-not (Test-Path -LiteralPath $auth)) { throw 'ChatMock login required first.' }
@@ -20,6 +22,6 @@ if ($Action -eq 'login') {
     foreach ($name in @('access_token', 'refresh_token', 'id_token')) {
         if (-not $data.tokens.$name) { throw 'Incomplete ChatMock login.' }
     }
-    & $cli serve --host 127.0.0.1 --port 8000 --reasoning-summary none --reasoning-compat legacy --no-enable-web-search --no-fast-mode
+    & $python @chatmock serve --host 127.0.0.1 --port 8000 --reasoning-summary none --reasoning-compat legacy --no-enable-web-search --no-fast-mode
 }
 if ($LASTEXITCODE -ne 0) { throw "ChatMock exited with code $LASTEXITCODE" }

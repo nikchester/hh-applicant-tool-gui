@@ -17,7 +17,7 @@ def check():
     if bad:
         raise SystemExit("Credential/runtime paths tracked: " + ", ".join(bad))
 
-    config = Path("termux/config.toml")
+    config = Path("windows/config.toml")
     if config not in tracked:
         raise SystemExit("Reviewed runtime config is missing from Git")
     text = config.read_text(encoding="utf-8")

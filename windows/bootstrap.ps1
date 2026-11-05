@@ -20,10 +20,10 @@ if (-not $Check) {
     if (-not (Test-Path -LiteralPath $chatmock)) {
         Invoke-Checked 'py' @('-3.12', '-m', 'venv', (Join-Path $repo 'venvs\chatmock'))
     }
-    Invoke-Checked $hh @('-m', 'pip', 'install', '-r', (Join-Path $repo 'termux\requirements-hh.txt'))
-    Invoke-Checked $chatmock @('-m', 'pip', 'install', '-r', (Join-Path $repo 'termux\requirements-chatmock.txt'))
+    Invoke-Checked $hh @('-m', 'pip', 'install', '-r', (Join-Path $repo 'windows\requirements-hh.txt'))
+    Invoke-Checked $chatmock @('-m', 'pip', 'install', '-r', (Join-Path $repo 'windows\requirements-chatmock.txt'))
     if (-not (Test-Path -LiteralPath $config)) {
-        Copy-Item -LiteralPath (Join-Path $repo 'termux\config.toml') -Destination $config
+        Copy-Item -LiteralPath (Join-Path $repo 'windows\config.toml') -Destination $config
     } else {
         Write-Output 'Existing config.toml preserved; review repository changes manually.'
     }
@@ -32,8 +32,12 @@ if (-not $Check) {
 if (-not (Test-Path -LiteralPath $config)) { throw 'Missing config.toml' }
 Invoke-Checked $hh @('-m', 'pip', 'check')
 Invoke-Checked $chatmock @('-m', 'pip', 'check')
-Invoke-Checked $hh @((Join-Path $repo 'termux\check_hh.py'))
-Invoke-Checked $chatmock @((Join-Path $repo 'termux\check_chatmock.py'))
+Invoke-Checked $hh @((Join-Path $repo 'windows\check_preview.py'))
+Invoke-Checked $chatmock @((Join-Path $repo 'windows\check_chatmock.py'))
 Invoke-Checked $hh @((Join-Path $repo 'windows\check_windows.py'))
 Invoke-Checked $hh @((Join-Path $repo 'windows\check_send.py'))
+Invoke-Checked $hh @((Join-Path $repo 'windows\check_auto_send.py'))
+Invoke-Checked $hh @((Join-Path $repo 'windows\check_reply_chats.py'))
+Invoke-Checked $hh @((Join-Path $repo 'windows\check_manual_captcha.py'))
+Invoke-Checked $hh @((Join-Path $repo 'windows\check_authorize.py'))
 Write-Output 'Offline checks passed. No account login, HH request, or application was started.'

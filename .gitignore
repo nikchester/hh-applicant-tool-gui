@@ -13,3 +13,7 @@ candidate-facts.json
 *.pid
 *.before-*
 *.tmp
+
+# Generated Windows frozen runtimes, installer output and build-only venvs.
+/windows/build/
+/windows/dist/
