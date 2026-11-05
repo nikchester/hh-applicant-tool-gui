@@ -1,7 +1,7 @@
 """Closed source allowlist. Never walk the repository to assemble a release."""
 
 APP_NAME = "PocketNodeHH"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.2.0"
 APP_MODULES = (
     "gui", "gui_chatmock_auth", "gui_controller", "gui_owned_process", "gui_profile", "gui_protocol",
     "gui_recovery", "gui_runtime", "gui_steps", "gui_worker",

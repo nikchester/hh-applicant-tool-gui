@@ -26,8 +26,11 @@ jobs:
       - name: Check tracked files and configuration
         shell: pwsh
         run: |
+          # pwsh only fails a step on the last command; check every native exit code.
           python windows/check_repository.py
+          if ($LASTEXITCODE) { throw 'Repository check failed' }
           python -m compileall -q windows
+          if ($LASTEXITCODE) { throw 'Python compilation failed' }
           Get-ChildItem windows -Filter '*.ps1' | ForEach-Object {
             $tokens = $null
             $errors = $null
@@ -37,15 +40,16 @@ jobs:
       - name: Install application dependencies
         run: python -m pip install -r windows/requirements-hh.txt -r windows/requirements-chatmock.txt
       - name: Run offline tests (no account or HH requests)
+        shell: pwsh
         run: |
-          python windows/check_preview.py
-          python windows/check_chatmock.py
-          python windows/check_windows.py
-          python windows/check_send.py
-          python windows/check_auto_send.py
-          python windows/check_reply_chats.py
-          python windows/check_manual_captcha.py
-          python windows/check_authorize.py
+          # Run every suite, then fail if any failed (pwsh alone checks only the last one).
+          $failed = @()
+          foreach ($check in 'check_preview', 'check_chatmock', 'check_windows', 'check_send',
+                             'check_auto_send', 'check_reply_chats', 'check_manual_captcha', 'check_authorize') {
+            python "windows/$check.py"
+            if ($LASTEXITCODE) { $failed += $check }
+          }
+          if ($failed) { throw "Failed offline suites: $($failed -join ', ')" }
       - name: Run offline GUI boundary tests
         run: python windows/check_gui.py
       - name: Run offline console-free launcher tests (disposable WSH fixtures)

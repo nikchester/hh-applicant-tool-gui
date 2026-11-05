@@ -53,7 +53,9 @@ try {
     Invoke-PythonChecked @('-I', '-c', "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-gateway-smoke'],input='',text=True,encoding='utf-8',capture_output=True,timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)", (Join-Path $app 'PocketNodeHH.exe'))
     if (-not $PortableOnly) {
         New-Item -ItemType Directory -Path $installer | Out-Null
-        $version = '0.1.0'
+        # Single source of the release version: packaging/manifest.py.
+        $version = (& $Python -I -c "import sys; sys.path.insert(0, sys.argv[1]); import manifest; print(manifest.APP_VERSION)" $packaging).Trim()
+        if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Cannot read APP_VERSION from packaging/manifest.py' }
         & $Iscc "/DAppSource=$app" "/DOutputPath=$installer" "/DAppVersion=$version" (Join-Path $packaging 'installer.iss')
         if ($LASTEXITCODE -ne 0) { throw "Inno compilation failed (exit $LASTEXITCODE)" }
         $setup = Join-Path $installer "PocketNodeHH-$version-windows-x64-setup.exe"

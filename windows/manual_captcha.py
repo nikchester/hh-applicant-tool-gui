@@ -3,6 +3,8 @@
 import sys
 from urllib.parse import parse_qs, urlsplit
 
+import requests
+
 from hh_applicant_tool.tool import HHApplicantTool
 
 
@@ -95,12 +97,25 @@ class ManualCaptcha:
         # Resume listing's stdout is a JSON protocol consumed by PowerShell.
         print("HH запросил капчу. Введи текст с картинки в окне «Капча».", file=sys.stderr, flush=True)
         self.active = True
+        # HH 2.3.7 calls session.get(url, params) positionally, which requests'
+        # Session.get(url, **kwargs) rejects. Adapt only this session, only now.
+        session = getattr(tool, "webview_session", None)
+        adapted = isinstance(session, requests.Session)
+        if adapted:
+            original_get = session.__dict__.get("get")
+            session.get = lambda target, params=None, **kwargs: type(session).get(
+                session, target, params=params, **kwargs)
         try:
             accepted = tool.handle_captcha(url)
         except (Exception, KeyboardInterrupt):
             raise SystemExit("Manual HH captcha failed or cancelled; check HH before retrying") from None
         finally:
             self.active = False
+            if adapted:
+                if original_get is None:
+                    del session.get
+                else:
+                    session.get = original_get
         if not accepted:
             raise SystemExit("Captcha was not accepted; check HH before retrying")
 
