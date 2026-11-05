@@ -20,6 +20,17 @@ COUNT_TITLES = {
     "chats": "чатов", "inspected": "просмотрено", "drafts": "черновиков", "skipped": "пропущено",
     "failures": "ошибок",
 }
+# Windows 11 light palette: neutral page, white cards, one accent colour.
+PAGE, CARD, BORDER, CONTROL_BORDER = "#f3f3f3", "#ffffff", "#e5e5e5", "#d1d1d1"
+TEXT, MUTED, DISABLED = "#1a1a1a", "#5f5f5f", "#a0a0a0"
+ACCENT, ACCENT_HOVER, ACCENT_PRESSED = "#005fb8", "#1a6fc0", "#004c93"
+# InfoBar severities: (background, text, Segoe Fluent Icons glyph, fallback glyph).
+SEVERITY = {
+    "info": ("#ebf3fc", "#003a75", "\ue946", "i"),
+    "success": ("#dff6dd", "#0b5a0b", "\ue930", "✓"),
+    "warning": ("#fff4ce", "#5c3d00", "\ue7ba", "!"),
+    "error": ("#fde7e9", "#8a1c1c", "\uea39", "×"),
+}
 REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
 UNKNOWN_RESULT = " Результат последней отправки неизвестен. Проверь отклики на hh.ru, прежде чем запускать снова."
 
@@ -93,7 +104,6 @@ def describe_vacancy(item):
 
 
 WELCOME = (
-    ("Heading.TLabel", "С чего начать"),
     ("TLabel", "Приложение ищет вакансии на hh.ru, пишет сопроводительные письма через ChatGPT "
                "и отправляет отклики. Письмо уходит только после твоего решения."),
     ("Subheading.TLabel", "Что нужно"),
@@ -134,23 +144,23 @@ class Application:
         root.protocol("WM_DELETE_WINDOW", self.close)
         self.setup_style()
 
-        outer = ttk.Frame(root, padding=(14, 10, 14, 12))
+        outer = ttk.Frame(root, padding=(20, 14, 20, 16), style="Page.TFrame")
         outer.pack(fill="both", expand=True)
-        header = ttk.Frame(outer)
+        header = ttk.Frame(outer, style="Page.TFrame")
         header.pack(fill="x")
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="Отклики на hh.ru с письмами от ChatGPT", style="Hint.TLabel").pack(
-            side="left", padx=12, pady=(6, 0))
-        status = ttk.Label(outer, textvariable=self.status, style="Status.TLabel", anchor="w", justify="left")
-        status.pack(fill="x", pady=(8, 10))
-        status.bind("<Configure>", lambda event: status.configure(wraplength=max(event.width - 24, 200)))
+        ttk.Label(header, text="Отклики на hh.ru с письмами от ChatGPT", style="PageHint.TLabel").pack(
+            side="left", padx=12, pady=(8, 0))
+        self.build_infobar(outer)
 
-        body = ttk.Panedwindow(outer, orient="horizontal")
+        body = ttk.Frame(outer, style="Page.TFrame")
         body.pack(fill="both", expand=True)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
         sidebar_box, sidebar = self.scrollable(body)
-        main = ttk.Frame(body, padding=(14, 0, 0, 0))
-        body.add(sidebar_box, weight=0)
-        body.add(main, weight=1)
+        sidebar_box.grid(row=0, column=0, sticky="nsw")
+        main = ttk.Frame(body, style="Card.TFrame", padding=(22, 16, 22, 18))
+        main.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
         self.build_sidebar(sidebar)
         self.build_main(main)
         self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
@@ -158,44 +168,119 @@ class Application:
         for variable in (self.search, self.limit, self.minimum, self.maximum):
             variable.trace_add("write", lambda *_a: self.refresh_steps())
         self.refresh_steps()
-        self.status.set(self.next_hint())
+        self.say(self.next_hint())
         root.after(100, self.poll)
         self.root.after_idle(self.check_recovery)
 
     # ---- layout -----------------------------------------------------------------
 
     def setup_style(self):
+        """Fluent-like light theme on the built-in clam engine: no extra dependency."""
         from tkinter import font
         style = self.ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
+        style.theme_use("clam")
+        families = set(font.families(self.root))
+        variable = "Segoe UI Variable Text" in families
+        body = "Segoe UI Variable Text" if variable else "Segoe UI"
+        strong = ("Segoe UI Variable Display", "bold") if variable else ("Segoe UI Semibold",)
+        self.icon_font = ("Segoe Fluent Icons" if "Segoe Fluent Icons" in families else
+                          "Segoe MDL2 Assets" if "Segoe MDL2 Assets" in families else None)
+
+        def heavy(size):
+            return (strong[0], size) + strong[1:]
         for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont"):
-            font.nametofont(name).configure(family="Segoe UI", size=10)
-        self.text_font = ("Segoe UI", 11)
-        style.configure("Title.TLabel", font=("Segoe UI Semibold", 16))
-        style.configure("Heading.TLabel", font=("Segoe UI Semibold", 12))
-        style.configure("Subheading.TLabel", font=("Segoe UI Semibold", 10))
-        style.configure("TLabelframe.Label", font=("Segoe UI Semibold", 10))
-        style.configure("Hint.TLabel", foreground="#6b6b6b", font=("Segoe UI", 9))
-        style.configure("Done.TLabel", foreground="#1f7a3a", font=("Segoe UI", 9))
-        style.configure("Locked.TLabel", foreground="#8a8a8a", font=("Segoe UI", 9))
-        style.configure("Error.TLabel", foreground="#b00020", font=("Segoe UI", 9))
-        style.configure("Warn.TLabel", foreground="#9a5b00", font=("Segoe UI", 9))
-        style.configure("Status.TLabel", background="#e8f0fb", foreground="#1d3b63", padding=(12, 8),
-                        font=("Segoe UI Semibold", 10))
-        style.configure("TButton", padding=(8, 4))
-        style.configure("Accent.TButton", font=("Segoe UI Semibold", 10), padding=(10, 6))
+            font.nametofont(name).configure(family=body, size=10)
+        self.text_font = (body, 11)
+        self.root.configure(background=PAGE)
+        style.configure(".", background=CARD, foreground=TEXT, font=(body, 10), bordercolor=BORDER,
+                        lightcolor=CARD, darkcolor=CARD, troughcolor=BORDER, focuscolor=ACCENT,
+                        selectbackground=ACCENT, selectforeground="white", fieldbackground=CARD,
+                        insertcolor=TEXT)
+        style.map(".", foreground=[("disabled", DISABLED)])
+        style.configure("Page.TFrame", background=PAGE)
+        style.configure("Card.TFrame", background=CARD, relief="solid", borderwidth=1, bordercolor=BORDER)
+        style.configure("CurrentCard.TFrame", background=CARD, relief="solid", borderwidth=1, bordercolor=ACCENT)
+        style.configure("Title.TLabel", background=PAGE, font=heavy(17))
+        style.configure("PageHint.TLabel", background=PAGE, foreground=MUTED, font=(body, 9))
+        style.configure("Heading.TLabel", font=heavy(14))
+        style.configure("Subheading.TLabel", font=heavy(10))
+        for name, colour in (("StepDone", "#0f7b0f"), ("StepCurrent", ACCENT), ("StepLocked", MUTED)):
+            style.configure(name + ".TLabel", foreground=colour, font=heavy(10))
+        style.configure("Hint.TLabel", foreground=MUTED, font=(body, 9))
+        style.configure("Done.TLabel", foreground="#0f7b0f", font=(body, 9))
+        style.configure("Locked.TLabel", foreground="#8a8a8a", font=(body, 9))
+        style.configure("Error.TLabel", foreground="#c42b1c", font=(body, 9))
+        style.configure("Warn.TLabel", foreground="#9d5d00", font=(body, 9))
+        style.configure("TButton", background=CARD, foreground=TEXT, bordercolor=CONTROL_BORDER,
+                        lightcolor=CARD, darkcolor=CARD, padding=(12, 5), relief="solid", borderwidth=1)
+        style.map("TButton", background=[("disabled", "#f5f5f5"), ("pressed", "#f0f0f0"), ("active", "#f6f6f6")],
+                  bordercolor=[("disabled", BORDER), ("focus", ACCENT)],
+                  lightcolor=[("pressed", "#f0f0f0"), ("active", "#f6f6f6")],
+                  darkcolor=[("pressed", "#f0f0f0"), ("active", "#f6f6f6")])
+        style.configure("Accent.TButton", background=ACCENT, foreground="white", bordercolor=ACCENT,
+                        lightcolor=ACCENT, darkcolor=ACCENT, font=heavy(10), padding=(14, 6))
+        accent_states = [("disabled", "#bfbfbf"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
+        style.map("Accent.TButton", background=accent_states, lightcolor=accent_states, darkcolor=accent_states,
+                  bordercolor=accent_states, foreground=[("disabled", "#f5f5f5")])
+        style.configure("Expander.TButton", anchor="w", padding=(14, 9))
+        for widget in ("TEntry", "TCombobox", "TSpinbox"):
+            style.configure(widget, fieldbackground=CARD, bordercolor=CONTROL_BORDER, lightcolor=CARD,
+                            darkcolor=CARD, padding=5, arrowcolor=MUTED, background=CARD)
+            style.map(widget, bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)],
+                      fieldbackground=[("disabled", "#f5f5f5"), ("readonly", CARD)],
+                      selectbackground=[("readonly !focus", CARD)], selectforeground=[("readonly !focus", TEXT)])
+        style.configure("TCheckbutton", indicatorbackground=CARD, indicatorforeground="white")
+        style.map("TCheckbutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
+        style.configure("TNotebook", background=CARD, bordercolor=BORDER, tabmargins=(0, 0, 0, 0))
+        style.configure("TNotebook.Tab", background=PAGE, bordercolor=BORDER, padding=(14, 6))
+        style.map("TNotebook.Tab", background=[("selected", CARD)], lightcolor=[("selected", CARD)])
+        style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=BORDER,
+                        bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
+        # Thin neutral scrollbars, as in Windows 11 lists.
+        style.configure("Vertical.TScrollbar", background="#cfcfcf", troughcolor=CARD, bordercolor=CARD,
+                        arrowcolor=MUTED, lightcolor="#cfcfcf", darkcolor="#cfcfcf", arrowsize=11, gripcount=0)
+        style.map("Vertical.TScrollbar", background=[("active", "#a8a8a8")])
+        style.configure("Page.Vertical.TScrollbar", troughcolor=PAGE, bordercolor=PAGE)
+        for level, (background, foreground, _glyph, _fallback) in SEVERITY.items():
+            style.configure(f"{level}.Info.TFrame", background=background, relief="solid", borderwidth=1,
+                            bordercolor=background)
+            style.configure(f"{level}.Info.TLabel", background=background, foreground=foreground, font=(body, 10))
+            style.configure(f"{level}.InfoIcon.TLabel", background=background, foreground=foreground,
+                            font=(self.icon_font, 12) if self.icon_font else (body, 11, "bold"))
+
+    def build_infobar(self, parent):
+        """Fluent InfoBar: one status line whose colour and icon state its severity."""
+        ttk = self.ttk
+        self.infobar = ttk.Frame(parent, style="info.Info.TFrame", padding=(14, 9))
+        self.infobar.pack(fill="x", pady=(10, 14))
+        self.infobar_icon = ttk.Label(self.infobar, style="info.InfoIcon.TLabel")
+        self.infobar_icon.pack(side="left", padx=(0, 10))
+        message = ttk.Label(self.infobar, textvariable=self.status, style="info.Info.TLabel",
+                            anchor="w", justify="left")
+        message.pack(side="left", fill="x", expand=True)
+        message.bind("<Configure>", lambda event: message.configure(wraplength=max(event.width - 8, 200)))
+        self.infobar_message = message
+        self.set_severity("info")
+
+    def set_severity(self, level):
+        infobar = getattr(self, "infobar", None)
+        if infobar is None:
+            return
+        _background, _foreground, glyph, fallback = SEVERITY[level]
+        infobar.configure(style=f"{level}.Info.TFrame")
+        self.infobar_icon.configure(style=f"{level}.InfoIcon.TLabel", text=glyph if self.icon_font else fallback)
+        self.infobar_message.configure(style=f"{level}.Info.TLabel")
 
     def scrollable(self, parent):
         """Vertical scroll for the sidebar so every step stays reachable on small screens."""
         tk, ttk = self.tk, self.ttk
-        box = ttk.Frame(parent)
-        canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0)
-        bar = ttk.Scrollbar(box, orient="vertical", command=canvas.yview)
+        box = ttk.Frame(parent, style="Page.TFrame")
+        canvas = tk.Canvas(box, highlightthickness=0, borderwidth=0, background=PAGE)
+        bar = ttk.Scrollbar(box, orient="vertical", command=canvas.yview, style="Page.Vertical.TScrollbar")
         canvas.configure(yscrollcommand=bar.set)
         canvas.pack(side="left", fill="both", expand=True)
         bar.pack(side="right", fill="y")
-        inner = ttk.Frame(canvas, padding=(0, 0, 10, 0))
+        inner = ttk.Frame(canvas, padding=(0, 0, 8, 0), style="Page.TFrame")
         window = canvas.create_window(0, 0, anchor="nw", window=inner)
         inner.bind("<Configure>", lambda _e: canvas.configure(
             scrollregion=canvas.bbox("all"), width=inner.winfo_reqwidth()))
@@ -213,13 +298,23 @@ class Application:
         self.action_buttons[action] = button
         return button
 
+    def card(self, parent, style="Card.TFrame"):
+        """White card on the page background (Windows 11 settings-card pattern)."""
+        card = self.ttk.Frame(parent, style=style, padding=(16, 12, 16, 14))
+        card.columnconfigure(0, weight=1)
+        return card
+
     def step(self, parent, number, title):
-        frame = self.ttk.LabelFrame(parent, text=f"{number}. {title}", padding=(10, 6, 10, 10))
-        frame.pack(fill="x", pady=(0, 10))
+        card = self.card(parent)
+        card.pack(fill="x", pady=(0, 10))
+        header = self.ttk.Label(card, style="StepLocked.TLabel")
+        header.grid(row=0, column=0, sticky="w")
+        frame = self.ttk.Frame(card)
+        frame.grid(row=1, column=0, sticky="ew")
         frame.columnconfigure(0, weight=1)
         note = self.ttk.Label(frame, style="Hint.TLabel", wraplength=300, justify="left")
-        note.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
-        self.steps.append((frame, f"{number}. {title}", note))
+        note.grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 8))
+        self.steps.append((card, header, f"{number}. {title}", note))
         return frame
 
     def hint(self, parent, text, row, style="Hint.TLabel", pady=(4, 0)):
@@ -230,6 +325,12 @@ class Application:
     def build_sidebar(self, side):
         ttk = self.ttk
         self.steps = []
+        summary = ttk.Frame(side, style="Page.TFrame")
+        summary.pack(fill="x", pady=(0, 10))
+        self.setup_label = ttk.Label(summary, style="PageHint.TLabel")
+        self.setup_label.pack(anchor="w")
+        self.setup_bar = ttk.Progressbar(summary, style="Accent.Horizontal.TProgressbar", maximum=3, length=300)
+        self.setup_bar.pack(fill="x", pady=(4, 0))
         login = self.step(side, 1, "Вход")
         login.columnconfigure(1, weight=1)
         self.action_button(login, "Войти в HH", "hh_login").grid(row=1, column=0, sticky="ew", padx=(0, 6))
@@ -285,12 +386,11 @@ class Application:
 
         # Risky mode stays folded away from the main flow.
         self.auto_toggle = ttk.Button(side, text="▸ Дополнительно: автоотклики без проверки",
-                                      command=self.toggle_auto)
-        self.auto_toggle.pack(fill="x", pady=(0, 6))
-        self.auto_frame = auto = ttk.LabelFrame(side, text="Автоотклики без проверки", padding=(10, 6, 10, 10))
-        auto.columnconfigure(0, weight=1)
+                                      style="Expander.TButton", command=self.toggle_auto)
+        self.auto_toggle.pack(fill="x", pady=(0, 10))
+        self.auto_frame = auto = self.card(side)
         self.hint(auto, "Письма уходят без твоей проверки. Сначала посмотри предпросмотр.", 0,
-                  "Warn.TLabel", pady=(0, 6))
+                  "Warn.TLabel", pady=(0, 8))
         fields = ttk.Frame(auto)
         fields.grid(row=1, column=0, sticky="ew")
         ttk.Label(fields, text="Сколько откликов отправить").grid(row=0, column=0, columnspan=4, sticky="w")
@@ -319,8 +419,10 @@ class Application:
         frame = self.ttk.Frame(parent)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(0, weight=1)
-        text = self.tk.Text(frame, height=height, wrap="word", font=self.text_font, relief="solid",
-                            borderwidth=1, padx=8, pady=6, background="#f7f7f7" if readonly else "white",
+        text = self.tk.Text(frame, height=height, wrap="word", font=self.text_font, relief="flat",
+                            borderwidth=0, padx=12, pady=10, background="#fafafa" if readonly else CARD,
+                            foreground=TEXT, highlightthickness=1, highlightbackground=BORDER,
+                            highlightcolor=ACCENT, insertbackground=TEXT,
                             state="disabled" if readonly else "normal")
         bar = self.ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=bar.set)
@@ -335,11 +437,12 @@ class Application:
         top = ttk.Frame(main)
         top.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         top.columnconfigure(1, weight=1)
-        self.heading = ttk.Label(top, text="Начало работы", style="Heading.TLabel")
+        self.heading = ttk.Label(top, text="С чего начать", style="Heading.TLabel")
         self.heading.grid(row=0, column=0, sticky="w")
         self.counter = ttk.Label(top, style="Hint.TLabel")
         self.counter.grid(row=0, column=1, sticky="w", padx=12)
-        self.progress = ttk.Progressbar(top, mode="indeterminate", length=120)
+        self.progress = ttk.Progressbar(top, mode="indeterminate", length=120,
+                                        style="Accent.Horizontal.TProgressbar")
         self.progress.grid(row=0, column=2, padx=(0, 8))
         self.progress.grid_remove()
         self.stop_button = ttk.Button(top, text="Остановить", command=self.stop, state="disabled")
@@ -359,13 +462,12 @@ class Application:
             label = ttk.Label(welcome, text=text, style=style, justify="left")
             label.grid(row=row, column=0, sticky="w", pady=(12 if style == "Subheading.TLabel" else 4, 0))
             labels.append(label)
-        welcome.bind("<Configure>", lambda e: [item.configure(wraplength=max(e.width - 16, 300)) for item in labels])
-        # The one primary call to action: a filled button, unlike every other control.
-        self.next_button = self.tk.Button(welcome, command=self.do_next, font=("Segoe UI Semibold", 11),
-                                          bg="#1a5fb4", fg="white", activebackground="#174f96",
-                                          activeforeground="white", disabledforeground="#c9d6ea",
-                                          relief="flat", padx=18, pady=7, cursor="hand2")
-        self.next_button.grid(row=len(WELCOME), column=0, sticky="w", pady=(16, 0))
+        # Fluent typography: keep lines near 60 characters for easy reading.
+        welcome.bind("<Configure>", lambda e: [item.configure(wraplength=min(max(e.width - 16, 300), 560))
+                                               for item in labels])
+        # The one primary call to action on the page.
+        self.next_button = ttk.Button(welcome, command=self.do_next, style="Accent.TButton", cursor="hand2")
+        self.next_button.grid(row=len(WELCOME), column=0, sticky="w", pady=(20, 0), ipady=2)
 
         self.work = work = ttk.Frame(main)
         work.grid(row=1, column=0, sticky="nsew")
@@ -397,14 +499,13 @@ class Application:
         self.no = ttk.Button(decision, text="Пропустить", command=lambda: self.respond("no"))
         self.yes.pack(side="left")
         self.no.pack(side="left", padx=6)
-        ttk.Label(decision, text="Работодатель получит текст выше без изменений.",
+        ttk.Label(decision, text="Текст уйдёт без изменений.",
                   style="Hint.TLabel").pack(side="left", padx=6)
 
-        self.chat_frame = ttk.LabelFrame(work, text="Изменить ответ", padding=(10, 6, 10, 10))
-        self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(8, 0))
-        self.chat_frame.columnconfigure(0, weight=1)
-        ttk.Label(self.chat_frame, text="Попроси ChatGPT переписать ответ (работодатель не увидит просьбу):").grid(
-            row=0, column=0, columnspan=2, sticky="w")
+        self.chat_frame = self.card(work)
+        self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(12, 0))
+        ttk.Label(self.chat_frame, text="Попроси ChatGPT переписать ответ (работодатель не увидит просьбу):",
+                  style="Subheading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.instruction = ttk.Entry(self.chat_frame)
         self.instruction.grid(row=1, column=0, sticky="ew")
         self.instruction.bind("<Return>", lambda _e: self.refine())
@@ -413,7 +514,9 @@ class Application:
         ttk.Label(self.chat_frame, text="Или напиши ответ сам:").grid(
             row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
-                                   relief="solid", borderwidth=1, padx=8, pady=6)
+                                   relief="flat", borderwidth=0, padx=10, pady=8, background=CARD,
+                                   foreground=TEXT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
+                                   highlightcolor=ACCENT, insertbackground=TEXT)
         self.manual.grid(row=3, column=0, sticky="ew")
         self.manual_button = ttk.Button(self.chat_frame, text="Взять мой текст", command=self.manual_edit)
         self.manual_button.grid(row=3, column=1, sticky="new", padx=(6, 0))
@@ -431,7 +534,7 @@ class Application:
     def show_welcome(self):
         self.work.grid_remove()
         self.welcome.grid()
-        self.heading.configure(text="Начало работы")
+        self.heading.configure(text="С чего начать")
         self.view_button.configure(text="Журнал")
 
     def show_work(self, tab=0):
@@ -491,8 +594,10 @@ class Application:
         progress = self.progress_state()
         states = step_states(progress)
         locks = (None, blocker("resumes", progress), blocker("models", progress), blocker("preview", progress))
-        for (frame, title, note), state, lock in zip(self.steps, states, locks):
-            frame.configure(text=f"{MARKS[state]}  {title}")
+        for (card, header, title, note), state, lock in zip(self.steps, states, locks):
+            header.configure(text=f"{MARKS[state]}  {title}", style={
+                DONE: "StepDone.TLabel", CURRENT: "StepCurrent.TLabel"}.get(state, "StepLocked.TLabel"))
+            card.configure(style="CurrentCard.TFrame" if state == CURRENT else "Card.TFrame")
             if state == DONE:
                 note.configure(text="Готово.", style="Done.TLabel")
             elif state == LOCKED:
@@ -501,6 +606,9 @@ class Application:
                 note.configure(text="Сделай этот шаг сейчас.", style="Hint.TLabel")
             else:
                 note.configure(text="", style="Hint.TLabel")
+        finished = sum(state == DONE for state in states[:3])
+        self.setup_label.configure(text="Настройка завершена" if finished == 3 else f"Настройка: {finished} из 3 шагов")
+        self.setup_bar.configure(value=finished)
         self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
                                 style="Done.TLabel" if progress.hh else "Hint.TLabel")
         self.chatgpt_state.configure(text="✓ вход выполнен" if progress.chatgpt else "вход не выполнен",
@@ -650,7 +758,7 @@ class Application:
                 return True
             if pending == getattr(self, "recovery_acknowledgement", None):
                 return True
-            self.status.set("Прошлая отправка завершилась без подтверждения. Проверь отклики на hh.ru перед новой отправкой.")
+            self.say("Прошлая отправка завершилась без подтверждения. Проверь отклики на hh.ru перед новой отправкой.", "warning")
             if self.dialogs.askyesno("Проверь прошлую отправку", WARNING):
                 self.recovery_acknowledgement = pending
                 return True
@@ -715,7 +823,7 @@ class Application:
             self.replace_text(self.letter, "")
             self.prepare_run_view(action, limit)
             title = ACTION_TITLES.get(action, action)
-            self.status.set("Выполняется: " + title + ". Дождись результата или нажми «Остановить».")
+            self.say("Выполняется: " + title + ". Дождись результата или нажми «Остановить».")
             self.append_log("Запуск: " + title)
             self.set_busy(True)
             self.session.start()
@@ -753,7 +861,7 @@ class Application:
         try:
             self.session.respond(action, text)
             self.clear_review()  # Edits consume this review; next one has a fresh ID.
-            self.status.set("Правка принята. Новый вариант придёт на проверку и сам не отправится."
+            self.say("Правка принята. Новый вариант придёт на проверку и сам не отправится."
                             if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг.")
         except ProtocolError:
             self.stop()
@@ -775,7 +883,7 @@ class Application:
         if self.session is not None:
             self.session.cancel()
             self.clear_review()
-            self.status.set("Останавливаю после текущего шага. Если текст уже отправлялся, проверь hh.ru перед повтором.")
+            self.say("Останавливаю после текущего шага. Если текст уже отправлялся, проверь hh.ru перед повтором.", "warning")
             stop_button = getattr(self, "stop_button", None)
             if stop_button is not None:
                 stop_button.configure(state="disabled", text="Останавливаю…")
@@ -862,7 +970,7 @@ class Application:
                 self.credential_frame.grid()
                 self.submit.configure(state="normal")
                 self.credential.focus_set()
-                self.status.set("Шаг 1: введи «" + (payload["context"] or "данные для входа")
+                self.say("Шаг 1: введи «" + (payload["context"] or "данные для входа")
                                 + "» под кнопкой «Войти в HH» и нажми «Продолжить».")
                 return
             self.show_work(0)
@@ -885,7 +993,7 @@ class Application:
                     self.option.current(0)
                 else:
                     self.option.grid_remove()
-            self.status.set("Прочитай текст. Нажми «" + str(self.yes["text"]) + "» или «Пропустить».")
+            self.say("Прочитай текст. Нажми «" + str(self.yes["text"]) + "» или «Пропустить».")
             return
         payload = data["payload"]
         name, value = payload.get("name"), payload.get("data")
@@ -904,13 +1012,13 @@ class Application:
             self.append_log(f"Загружено моделей: {len(value)}")
         elif name == "device":
             self.show_device_code(value["url"], value["code"])
-            self.status.set("Окно «Вход в ChatGPT»: открой страницу входа и введи код.")
+            self.say("Окно «Вход в ChatGPT»: открой страницу входа и введи код.")
         elif name == "sending":
             self.sending = value is True
             if not self.sending and getattr(self, "run_counts", None) is not None:
                 self.run_counts["sent"] += 1
                 self.update_counter()
-            self.status.set("Идёт отправка в HH…" if self.sending else "Отправка завершена. Жду следующий шаг.")
+            self.say("Идёт отправка в HH…" if self.sending else "Отправка завершена. Жду следующий шаг.")
         elif name in {"letter", "application", "preview_skipped"}:
             if session.state.pending is not None:
                 raise ProtocolError("Output cannot replace a pending reviewed message")
@@ -950,6 +1058,23 @@ class Application:
                 message += UNKNOWN_RESULT
         return message
 
+    def say(self, text, level="info"):
+        """Show one status message in the InfoBar with its severity."""
+        self.status.set(text)
+        self.set_severity(level)
+
+    def finish_severity(self, data, action):
+        done = data["done"]
+        if data.get("busy"):
+            return "warning"
+        if action in {"apply", "auto", "chats"} and (data["forced"] or done is None or done.get("unknown")):
+            return "warning"
+        if data["success"]:
+            return "success"
+        if data["cancelled"] or (done is not None and done.get("cancelled")):
+            return "info"
+        return "error"
+
     def finish_run(self, session, data):
         from gui_steps import chatgpt_signed_in, hh_signed_in
         self.close_device_window()
@@ -964,7 +1089,7 @@ class Application:
         self.set_busy(False)
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
-        self.status.set(message)
+        self.say(message, self.finish_severity(data, session.action))
         if not data["success"] and self.work.winfo_ismapped():
             self.show_tab(1)
 
@@ -982,7 +1107,7 @@ class Application:
                         except (ProtocolError, ValueError, TypeError, KeyError):
                             self.stop()
                     elif name == "status":
-                        self.status.set(data)
+                        self.say(data)
                         self.append_log(data)
                     elif name == "finished":
                         self.clear_review()
