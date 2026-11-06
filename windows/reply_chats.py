@@ -1,5 +1,6 @@
 """Review HH chat replies, confirming each exact message before POST."""
 
+import ai_provider
 import html
 import json
 import errno
@@ -48,8 +49,7 @@ def validate(argv, *, profile=None):
     if argv != arguments(str(expected)):
         raise SystemExit("Unexpected chat arguments; refusing to run")
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
-    if config["openai"]["default"]["base_url"] != "http://127.0.0.1:8000/v1":
-        raise SystemExit("Only the local model gateway is allowed")
+    ai_provider.activate(ai_provider.from_config(config, allow_external=profile is not None))
     # The tool reads each chat's own published resume. A global chat history
     # would mix information across resumes, so never allow one here.
     if any(config.get("openai", {}).get(section, {}).get("history")
@@ -111,11 +111,10 @@ def allowed_read(request):
     url = checked_url(request.url)
     if url.username or url.password or url.fragment:
         return False
-    if (url.scheme == "http" and url.hostname == "127.0.0.1" and url.port == 8000
-            and not url.query):
-        return request.method == "GET" and url.path in ("/health", "/v1/models") or (
-            request.method == "POST" and url.path == "/v1/chat/completions"
-        )
+    if ai_provider.model_endpoint(request.method, request.url):
+        return True
+    if url.scheme == "http" and url.hostname == "127.0.0.1" and url.port == 8000:
+        return False  # The ChatMock port only serves the active provider's model routes.
     if (url.scheme != "https" or url.port is not None or not url.hostname
             or not (url.hostname == "hh.ru" or url.hostname.endswith(".hh.ru"))):
         return False
@@ -172,6 +171,8 @@ def request_target(request):
                 and url.path in {"/health", "/v1/models", "/v1/chat/completions"}):
             method = request.method if request.method in {"GET", "POST"} else "other"
             return f"{method} http://127.0.0.1:8000{url.path}"
+        if label := ai_provider.describe(request.url):
+            return label  # Provider title and route only: never a host path that could carry a secret.
     except ValueError:
         pass
     return "other"

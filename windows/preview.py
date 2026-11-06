@@ -7,8 +7,9 @@ from preview_hh import run
 
 
 def arguments(config, resume_id, search):
-    if not resume_id or not search:
-        raise SystemExit("Resume ID and search text are required")
+    """Empty search means HH's suggested vacancies for the resume (similar_vacancies)."""
+    if not resume_id:
+        raise SystemExit("Resume ID is required")
     return [
         "--config-dir", config, "--profile-id", ".", "--no-handle-captcha",
         "apply", "--dry-run", "--no-send-email", "--no-ai-filter", "--no-skip-tests",
@@ -16,8 +17,8 @@ def arguments(config, resume_id, search):
         "--work-format", "REMOTE", "--currency", "RUR", "--salary", "80000",
         "--no-only-with-salary", "--search-field", "name",
         "--order-by", "publication_time",
-        f"--resume-id={resume_id}", f"--search={search}",
-    ]
+        f"--resume-id={resume_id}",
+    ] + ([f"--search={search}"] if search else [])
 
 
 if __name__ == "__main__":

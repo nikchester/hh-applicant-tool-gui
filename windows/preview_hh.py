@@ -1,5 +1,6 @@
 """Run an HH preview with a read-only network guard and visible letter drafts."""
 
+import ai_provider
 import json
 from html.parser import HTMLParser
 import os
@@ -118,8 +119,16 @@ def enrich_prompt(prompt, vacancy):
 ALTERNATIVE_LEVEL = re.compile(r"(?i)(?:junior|джун|middle|миддл)")
 
 
+def _level(word):
+    return "junior" if word.lower() in {"junior", "джун"} else "middle"
+
+
 def check_letter_level(letter, vacancy):
-    if not senior_title_reason(vacancy) and ALTERNATIVE_LEVEL.search(letter):
+    if senior_title_reason(vacancy):
+        return
+    # Naming the vacancy's own level ("Junior SRE") is not an alternative offer.
+    own = {_level(word) for word in ALTERNATIVE_LEVEL.findall(vacancy.get("name") or "")}
+    if any(_level(word) not in own for word in ALTERNATIVE_LEVEL.findall(letter)):
         raise SystemExit("Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead")
 
 
@@ -141,10 +150,10 @@ def allowed_request(method, url, body=None):
     u = urlsplit(url)
     if u.username or u.password:
         return False
+    if ai_provider.model_endpoint(method, url):
+        return True
     if u.scheme == "http" and u.hostname == "127.0.0.1" and u.port == 8000:
-        return method == "GET" and u.path in ("/health", "/v1/models") or (
-            method == "POST" and u.path == "/v1/chat/completions"
-        )
+        return False  # The ChatMock port only serves the active provider's model routes.
     if u.scheme != "https" or u.hostname not in ("api.hh.ru", "hh.ru", "www.hh.ru"):
         return False
     if method == "GET":
@@ -164,15 +173,15 @@ def run(argv, *, profile=None, observer=None):
         args.dry_run and not args.send_email and not args.ai_filter
         and args.skip_tests is False and not args.captcha_handling
         and args.total_pages == 1 and args.per_page <= 3
-        and args.resume_id and args.text and args.verbosity == 0
+        and args.resume_id and args.verbosity == 0
         and args.work_format == ["REMOTE"] and args.currency == "RUR"
         and args.salary == 80000 and args.only_with_salary is False
         and args.order_by == "publication_time"
     ):
         raise SystemExit("Unsafe preview arguments; refusing to run")
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
-    if config["openai"]["default"]["base_url"] != "http://127.0.0.1:8000/v1":
-        raise SystemExit("Only the local model gateway is allowed")
+    # Only the GUI profile may use another provider; CLI profiles keep the local gateway.
+    ai_provider.activate(ai_provider.from_config(config, allow_external=profile is not None))
     send = requests.sessions.Session.send
     captcha = ManualCaptcha()
     get_vacancies = Operation._get_vacancies

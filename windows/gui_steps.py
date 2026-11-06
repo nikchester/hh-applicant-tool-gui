@@ -30,7 +30,8 @@ def chatgpt_signed_in():
 @dataclass
 class Progress:
     hh: bool = False
-    chatgpt: bool = False
+    chatgpt: bool = False  # The AI provider is ready: ChatGPT login, a stored key or a local model.
+    ai_kind: str = "chatmock"
     resume: bool = False
     search: bool = False
     model: bool = False
@@ -39,9 +40,9 @@ class Progress:
 # Reason shown next to a locked button: the first missing prerequisite wins.
 REQUIREMENTS = (
     ("hh", "Сначала войди в HH (шаг 1)."),
-    ("chatgpt", "Сначала войди в ChatGPT (шаг 1)."),
+    ("chatgpt", "Сначала подключи AI: войди в ChatGPT или сохрани ключ провайдера (шаг 1)."),
     ("resume", "Сначала загрузи и выбери резюме (шаг 2)."),
-    ("search", "Сначала введи поисковый запрос (шаг 2)."),
+    ("search", "Сначала введи поисковый запрос или выбери «Все подходящие» (шаг 2)."),
     ("model", "Сначала выбери модель ChatGPT (шаг 3)."),
 )
 NEEDS = {
@@ -81,11 +82,12 @@ def next_hint(progress):
     if not progress.hh:
         return "Шаг 1: нажми «Войти в HH»."
     if not progress.chatgpt:
-        return "Шаг 1: нажми «Войти в ChatGPT»."
+        return ("Шаг 1: нажми «Войти в ChatGPT»." if progress.ai_kind == "chatmock" else
+                "Шаг 1: нажми «AI-провайдер…» и сохрани ключ API.")
     if not progress.resume:
-        return "Шаг 2: нажми «Загрузить мои резюме» и выбери резюме."
+        return "Шаг 2: резюме загружаются сами после входа в HH. Если список пуст, нажми «Обновить список резюме»."
     if not progress.search:
-        return "Шаг 2: введи поисковый запрос, например «Python разработчик»."
+        return "Шаг 2: введи поисковый запрос или выбери «Все подходящие для резюме»."
     if not progress.model:
         return "Шаг 3: нажми «Загрузить список моделей» и выбери модель."
     return "Всё готово. Шаг 4: нажми «Предпросмотр писем». Он ничего не отправляет."
@@ -95,11 +97,11 @@ FAILURE_HINTS = {
     "hh_login": "Вход в HH не выполнен. Проверь email или телефон и код, потом нажми «Войти в HH» снова.",
     "chatgpt_login": "Вход в ChatGPT не выполнен. Введи код на странице входа до истечения времени и попробуй снова.",
     "resumes": "Резюме не загружены. Проверь вход в HH. На HH нужно хотя бы одно опубликованное резюме.",
-    "models": "Список моделей не загружен. Войди в ChatGPT заново и попробуй снова.",
-    "preview": "Предпросмотр не завершён. Проверь вход в HH и ChatGPT и поисковый запрос.",
-    "apply": "Отклики не завершены. Проверь вход в HH и ChatGPT.",
-    "auto": "Автоотклики не завершены. Проверь вход в HH и ChatGPT.",
-    "chats": "Ответы в чатах не завершены. Проверь вход в HH и ChatGPT.",
+    "models": "Список моделей не загружен. Проверь адрес и ключ AI-провайдера или войди в ChatGPT заново.",
+    "preview": "Предпросмотр не завершён. Проверь вход в HH, AI-провайдера и поисковый запрос.",
+    "apply": "Отклики не завершены. Проверь вход в HH и AI-провайдера.",
+    "auto": "Автоотклики не завершены. Проверь вход в HH и AI-провайдера.",
+    "chats": "Ответы в чатах не завершены. Проверь вход в HH и AI-провайдера.",
 }
 
 

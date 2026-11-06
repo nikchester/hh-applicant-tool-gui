@@ -122,13 +122,15 @@ def describe_vacancy(item):
 
 WELCOME = (
     ("TLabel", "Приложение ищет вакансии на hh.ru, пишет сопроводительные письма через ChatGPT "
+               "или другого AI-провайдера "
                "и отправляет отклики. Письмо уходит только после твоего решения."),
     ("Subheading.TLabel", "Что нужно"),
-    ("TLabel", "• аккаунт на hh.ru и хотя бы одно опубликованное резюме;\n• аккаунт ChatGPT."),
+    ("TLabel", "• аккаунт на hh.ru и хотя бы одно опубликованное резюме;\n"
+               "• аккаунт ChatGPT, ключ OpenAI-совместимого API или локальная модель."),
     ("Subheading.TLabel", "Порядок работы"),
-    ("TLabel", "1. Войди в HH и в ChatGPT.\n"
-               "2. Загрузи резюме и введи поисковый запрос.\n"
-               "3. Выбери модель ChatGPT.\n"
+    ("TLabel", "1. Войди в HH и подключи AI: ChatGPT или другого провайдера.\n"
+               "2. Загрузи резюме и выбери, какие вакансии искать.\n"
+               "3. Выбери модель и, если нужно, настрой стиль письма.\n"
                "4. Запусти предпросмотр: он показывает письма и ничего не отправляет.\n"
                "5. Нажми «Откликнуться с проверкой писем» и подтверди каждое письмо."),
     ("Warn.TLabel", "HH может заблокировать аккаунт за автоматизацию. Капчу вводи только сам."),
@@ -147,8 +149,10 @@ class Application:
         config = tomllib.loads(initialize().read_text(encoding="utf-8"))
         model = config["openai"]["default"]["model"]
         self.signed_hh, self.signed_chatgpt = hh_signed_in(), chatgpt_signed_in()
+        self.load_provider()
         self.model = tk.StringVar(value="" if model == "CHOOSE_AFTER_LOGIN" else model)
         self.search, self.resume = tk.StringVar(), tk.StringVar()
+        self.search_mode = tk.StringVar(value="query")  # "query" or "all" (HH suggestions for the resume).
         self.all_resumes = tk.BooleanVar(value=False)
         self.limit, self.minimum, self.maximum = tk.StringVar(value="1"), tk.StringVar(value="60"), tk.StringVar(value="180")
         self.status = tk.StringVar()
@@ -167,7 +171,7 @@ class Application:
         header = ttk.Frame(outer, style="Page.TFrame")
         header.pack(fill="x")
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
-        ttk.Label(header, text="Отклики на hh.ru с письмами от ChatGPT", style="PageHint.TLabel").pack(
+        ttk.Label(header, text="Отклики на hh.ru с письмами от AI", style="PageHint.TLabel").pack(
             side="left", padx=12, pady=(8, 0))
         self.build_infobar(outer)
 
@@ -183,12 +187,13 @@ class Application:
         self.build_main(main)
         self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
         self.clear_review()
-        for variable in (self.search, self.limit, self.minimum, self.maximum):
+        for variable in (self.search, self.search_mode, self.limit, self.minimum, self.maximum):
             variable.trace_add("write", lambda *_a: self.refresh_steps())
         self.refresh_steps()
         self.say(self.next_hint())
         root.after(100, self.poll)
         self.root.after_idle(self.check_recovery)
+        self.root.after_idle(self.auto_load_resumes)
 
     # ---- layout -----------------------------------------------------------------
 
@@ -266,6 +271,8 @@ class Application:
                       background=[("active", CONTROL_HOVER)],
                       selectbackground=[("readonly !focus", FIELD)], selectforeground=[("readonly !focus", TEXT)])
         style.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT)
+        style.configure("TRadiobutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT)
+        style.map("TRadiobutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
         style.map("TCheckbutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
         style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=BORDER,
                         bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
@@ -369,13 +376,18 @@ class Application:
         self.action_button(login, "Войти в HH", "hh_login").grid(row=1, column=0, sticky="ew", padx=(0, 6))
         self.hh_state = ttk.Label(login, style="Hint.TLabel")
         self.hh_state.grid(row=1, column=1, sticky="w")
-        self.action_button(login, "Войти в ChatGPT", "chatgpt_login").grid(
-            row=2, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
+        self.provider_button = ttk.Button(login, text="AI-провайдер…", command=self.edit_provider)
+        self.provider_button.grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
+        self.buttons.append(self.provider_button)
+        self.provider_state = ttk.Label(login, style="Hint.TLabel", wraplength=170, justify="left")
+        self.provider_state.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        self.chatgpt_button = self.action_button(login, "Войти в ChatGPT", "chatgpt_login")
+        self.chatgpt_button.grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
         self.chatgpt_state = ttk.Label(login, style="Hint.TLabel")
-        self.chatgpt_state.grid(row=2, column=1, sticky="w", pady=(4, 0))
+        self.chatgpt_state.grid(row=3, column=1, sticky="w", pady=(4, 0))
         # Login input lives next to the login buttons, not in the review area.
         self.credential_frame = ttk.Frame(login)
-        self.credential_frame.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.credential_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self.credential_frame.columnconfigure(0, weight=1)
         self.credential_label = ttk.Label(self.credential_frame, text="Email или телефон от аккаунта HH",
                                           style="Subheading.TLabel")
@@ -388,26 +400,37 @@ class Application:
         self.submit.grid(row=1, column=1, padx=(6, 0))
 
         resume = self.step(side, 2, "Резюме и поиск")
-        self.action_button(resume, "Загрузить мои резюме", "resumes").grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.action_button(resume, "Обновить список резюме", "resumes").grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Label(resume, text="Резюме").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.resume_box = ttk.Combobox(resume, textvariable=self.resume, state="readonly", width=30)
         self.resume_box.grid(row=3, column=0, columnspan=2, sticky="ew")
         self.resume_box.bind("<<ComboboxSelected>>", self.select_resume)
-        ttk.Label(resume, text="Поисковый запрос на HH").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        ttk.Label(resume, text="Какие вакансии искать").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        modes = ttk.Frame(resume)
+        modes.grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Radiobutton(modes, text="По запросу", value="query", variable=self.search_mode,
+                        command=self.select_search_mode).pack(side="left")
+        ttk.Radiobutton(modes, text="Все подходящие для резюме", value="all", variable=self.search_mode,
+                        command=self.select_search_mode).pack(side="left", padx=(12, 0))
         self.search_entry = ttk.Entry(resume, textvariable=self.search)
-        self.search_entry.grid(row=5, column=0, columnspan=2, sticky="ew")
+        self.search_entry.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         self.search_entry.bind("<FocusOut>", lambda _e: self.remember_search())
-        self.hint(resume, "Например: Python разработчик. Запрос сохраняется сам.", 6, pady=(2, 0))
+        self.search_hint = self.hint(resume, "", 7, pady=(2, 0))
         ttk.Checkbutton(resume, text="Откликаться со всех резюме по очереди", variable=self.all_resumes).grid(
-            row=7, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.hint(resume, "Для каждого резюме нужен свой запрос: выбери резюме и введи запрос.", 8, pady=(0, 0))
+            row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.hint(resume, "Для каждого резюме выбери свой режим поиска.", 9, pady=(0, 0))
+        self.update_search_mode()
 
-        model = self.step(side, 3, "Модель ChatGPT")
+        model = self.step(side, 3, "Модель и стиль письма")
         self.action_button(model, "Загрузить список моделей", "models").grid(row=1, column=0, columnspan=2, sticky="ew")
         self.models = ttk.Combobox(model, textvariable=self.model, state="readonly", width=30)
         self.models.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.models.bind("<<ComboboxSelected>>", self.select_model)
         self.hint(model, "Выбранная модель сохраняется сама.", 3)
+        self.style_button = ttk.Button(model, text="Стиль письма…", command=self.edit_letter_style)
+        self.style_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.buttons.append(self.style_button)
+        self.hint(model, "Каким ChatGPT пишет письмо: тон, длина, обращение.", 5, pady=(2, 0))
 
         run = self.step(side, 4, "Отклики")
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
@@ -609,8 +632,9 @@ class Application:
     def progress_state(self):
         from gui_steps import Progress
         index = self.resume_box.current()
-        return Progress(hh=self.signed_hh, chatgpt=self.signed_chatgpt,
-                        resume=0 <= index < len(self.resumes), search=bool(self.search.get().strip()),
+        return Progress(hh=self.signed_hh, chatgpt=self.ai_ready, ai_kind=self.provider.kind,
+                        resume=0 <= index < len(self.resumes),
+                        search=self.search_mode.get() == "all" or bool(self.search.get().strip()),
                         model=self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"})
 
     def next_hint(self):
@@ -621,19 +645,31 @@ class Application:
         if not progress.hh:
             return "hh_login", "Начать: войти в HH"
         if not progress.chatgpt:
-            return "chatgpt_login", "Войти в ChatGPT"
+            return (("chatgpt_login", "Войти в ChatGPT") if progress.ai_kind == "chatmock"
+                    else ("provider", "Сохранить ключ AI-провайдера"))
         if not progress.resume:
-            return "resumes", "Загрузить мои резюме"
+            return "resumes", "Обновить список резюме"
         if not progress.search:
             return "search", "Ввести поисковый запрос"
         if not progress.model:
             return "models", "Загрузить список моделей"
         return "preview", "Запустить предпросмотр писем"
 
+    def auto_load_resumes(self):
+        """Load resumes without a click once HH sign-in exists; reading only, never sending."""
+        if not self.signed_hh or self.resumes:
+            return
+        if self.session is not None:
+            self.root.after(1000, self.auto_load_resumes)  # Wait for the current run to end.
+            return
+        self.launch("resumes")
+
     def do_next(self):
         action, _text = self.next_action(self.progress_state())
         if action == "search":
             self.search_entry.focus_set()
+        elif action == "provider":
+            self.edit_provider()
         else:
             self.launch(action)
 
@@ -662,8 +698,19 @@ class Application:
         self.setup_bar.configure(value=finished)
         self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
                                 style="Done.TLabel" if progress.hh else "Hint.TLabel")
-        self.chatgpt_state.configure(text="✓ вход выполнен" if progress.chatgpt else "вход не выполнен",
-                                     style="Done.TLabel" if progress.chatgpt else "Hint.TLabel")
+        chatmock = self.provider.kind == "chatmock"
+        if chatmock:
+            self.chatgpt_button.grid()
+            self.chatgpt_state.grid()
+            self.chatgpt_state.configure(text="✓ вход выполнен" if progress.chatgpt else "вход не выполнен",
+                                         style="Done.TLabel" if progress.chatgpt else "Hint.TLabel")
+        else:
+            self.chatgpt_button.grid_remove()
+            self.chatgpt_state.grid_remove()
+        status = {"chatmock": "", "openai": " · ✓ ключ сохранён" if progress.chatgpt else " · нужен ключ",
+                  "local": ""}[self.provider.kind]
+        self.provider_state.configure(text=self.provider.title + status,
+                                      style="Done.TLabel" if progress.chatgpt and not chatmock else "Hint.TLabel")
         _values, auto_problem = parse_auto_settings(self.limit.get(), self.minimum.get(), self.maximum.get())
         self.auto_error.configure(text=auto_problem or "")
         action, text = self.next_action(progress)
@@ -751,11 +798,31 @@ class Application:
             raise ValueError("Сначала загрузи и выбери опубликованное резюме (шаг 2).")
         return self.resumes[index]["id"]
 
+    def search_value(self):
+        """Text sent to HH; "" asks HH for all vacancies it suggests for the resume."""
+        mode = getattr(self, "search_mode", None)
+        return "" if mode is not None and mode.get() == "all" else self.search.get()
+
+    def update_search_mode(self):
+        all_mode = self.search_mode.get() == "all"
+        self.search_entry.configure(state="disabled" if all_mode else "normal")
+        self.search_hint.configure(text="HH подберёт вакансии под это резюме, как в разделе «Подходящие вакансии». "
+                                        "Выбор сохраняется сам." if all_mode else
+                                   "Например: Python разработчик. Запрос сохраняется сам.")
+
+    def select_search_mode(self):
+        self.update_search_mode()
+        if self.search_mode.get() == "query":
+            self.search_entry.focus_set()
+        self.remember_search()
+        self.refresh_steps()
+
     def remember_search(self):
-        """Save the typed search for the selected resume without asking."""
+        """Save the search choice for the selected resume without asking."""
         from gui_profile import read_searches, save_search
-        resume_id, search = self.current_resume, self.search.get()
-        if not resume_id or not search.strip() or len(search) > 4000 or self.searches.get(resume_id) == search:
+        resume_id, search = self.current_resume, self.search_value()
+        if (not resume_id or (search and not search.strip()) or (not search and self.search_mode.get() != "all")
+                or len(search) > 4000 or self.searches.get(resume_id) == search):
             return
         try:
             save_search(resume_id, search)
@@ -767,9 +834,12 @@ class Application:
         self.remember_search()
         try:
             self.current_resume = self.selected_id()
-            self.search.set(self.searches.get(self.current_resume, ""))
+            saved = self.searches.get(self.current_resume)
+            self.search_mode.set("all" if saved == "" else "query")
+            self.search.set(saved or "")
         except ValueError:
             self.current_resume = None
+        self.update_search_mode()
         self.refresh_steps()
 
     def select_model(self, _event=None):
@@ -793,14 +863,16 @@ class Application:
         from gui_profile import save_search, set_model, read_searches
         try:
             resume_id = self.selected_id()
-            if not self.search.get().strip():
+            search = self.search_value()
+            all_mode = getattr(self, "search_mode", None) is not None and self.search_mode.get() == "all"
+            if not all_mode and not search.strip():
                 entry = getattr(self, "search_entry", None)
                 if entry is not None:
                     entry.focus_set()
-                raise ValueError("Введи поисковый запрос на HH в шаге 2, например: Python разработчик.")
-            if len(self.search.get()) > 4000:
+                raise ValueError("Введи поисковый запрос на HH в шаге 2 или выбери «Все подходящие для резюме».")
+            if len(search) > 4000:
                 raise ValueError("Поисковый запрос слишком длинный: максимум 4000 символов.")
-            save_search(resume_id, self.search.get())
+            save_search(resume_id, search)
             if self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"}:
                 set_model(self.model.get())
             self.searches = read_searches()
@@ -842,19 +914,19 @@ class Application:
             resume, search = "", ""
             if action in REVIEW_ACTIONS:
                 if self.model.get() == "CHOOSE_AFTER_LOGIN" or not self.model.get():
-                    raise ValueError("Войди в ChatGPT, загрузи список моделей и выбери модель (шаг 3).")
+                    raise ValueError("Подключи AI (шаг 1), загрузи список моделей и выбери модель (шаг 3).")
                 set_model(self.model.get())
             if action in {"preview", "apply", "auto"}:
-                resume, search = self.selected_id(), self.search.get()
+                resume, search = self.selected_id(), self.search_value()
                 if not self.save():
                     return
             if action in {"apply", "auto"} and self.all_resumes.get():
                 missing = [item.get("title") or item["id"] for item in self.resumes
-                           if not str(self.searches.get(item["id"], "")).strip()]
+                           if item["id"] not in self.searches]
                 if missing:
                     raise ValueError("Включён режим «со всех резюме по очереди», но нет запроса для резюме:\n• "
-                                     + "\n• ".join(missing) + "\n\nВыбери каждое резюме в шаге 2 и введи для него "
-                                     "запрос. Или сними этот флажок.")
+                                     + "\n• ".join(missing) + "\n\nВыбери каждое резюме в шаге 2 и задай для него "
+                                     "запрос или режим «Все подходящие». Или сними этот флажок.")
             limit, minimum, maximum, consent = 1, 60, 180, False
             if action == "auto":
                 from auto_send import validate_settings
@@ -965,6 +1037,231 @@ class Application:
                 self.stop()
             return
         self.root.destroy()
+
+    # ---- AI provider ------------------------------------------------------------
+
+    def load_provider(self):
+        """Current provider and whether it can generate letters (login, stored key or local)."""
+        import ai_provider
+        from gui_profile import read_provider
+        try:
+            self.provider = read_provider()
+        except (OSError, ValueError, KeyError):
+            self.provider = ai_provider.Provider(ai_provider.CHATMOCK, ai_provider.CHATMOCK_URL)
+        self.ai_ready = ai_provider.ready(self.provider, chatgpt_signed_in=self.signed_chatgpt)
+
+    def edit_provider(self):
+        """Choose ChatMock, an OpenAI-compatible API (key in Windows Credential Manager) or a local model."""
+        import ai_provider
+        from gui_profile import set_provider
+        tk, ttk = self.tk, self.ttk
+        if getattr(self, "provider_window", None) is not None and self.provider_window.winfo_exists():
+            self.provider_window.lift()
+            return
+        window = self.provider_window = tk.Toplevel(self.root, background=CARD)
+        window.title("AI-провайдер")
+        window.transient(self.root)
+        window.resizable(False, False)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(1, weight=1)
+        ttk.Label(frame, text="AI-провайдер", style="Heading.TLabel").grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="Кто пишет письма и ответы в чатах.", style="Hint.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        kind = tk.StringVar(value=self.provider.kind)
+        address = tk.StringVar(value=self.provider.base_url if self.provider.kind != ai_provider.CHATMOCK
+                               else ai_provider.PRESETS[ai_provider.OPENAI])
+        key = tk.StringVar()
+        for row, value in enumerate((ai_provider.CHATMOCK, ai_provider.OPENAI, ai_provider.LOCAL), start=2):
+            ttk.Radiobutton(frame, text=ai_provider.TITLES[value], value=value, variable=kind,
+                            command=lambda: update()).grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Label(frame, text="Адрес API").grid(row=5, column=0, sticky="w", pady=(12, 0), padx=(0, 8))
+        address_entry = ttk.Entry(frame, textvariable=address, width=44)
+        address_entry.grid(row=5, column=1, columnspan=2, sticky="ew", pady=(12, 0))
+        presets = ttk.Frame(frame)
+        presets.grid(row=6, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        for title, url in (("Ollama", "http://127.0.0.1:11434/v1"), ("LM Studio", "http://127.0.0.1:1234/v1")):
+            ttk.Button(presets, text=title, command=lambda value=url: address.set(value)).pack(side="left", padx=(0, 6))
+        key_label = ttk.Label(frame, text="Ключ API")
+        key_label.grid(row=7, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
+        key_entry = ttk.Entry(frame, textvariable=key, show="•", width=44)
+        key_entry.grid(row=7, column=1, sticky="ew", pady=(10, 0))
+        forget = ttk.Button(frame, text="Удалить ключ", command=lambda: delete())
+        forget.grid(row=7, column=2, sticky="w", padx=(6, 0), pady=(10, 0))
+        key_hint = ttk.Label(frame, style="Hint.TLabel", wraplength=520, justify="left")
+        key_hint.grid(row=8, column=1, columnspan=2, sticky="w", pady=(2, 0))
+        warning = ttk.Label(frame, style="Warn.TLabel", wraplength=560, justify="left")
+        warning.grid(row=9, column=0, columnspan=3, sticky="w", pady=(12, 0))
+        error = ttk.Label(frame, style="Error.TLabel", wraplength=560, justify="left")
+        error.grid(row=10, column=0, columnspan=3, sticky="w", pady=(6, 0))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=11, column=0, columnspan=3, sticky="w", pady=(12, 0))
+
+        def chosen():
+            if kind.get() == ai_provider.CHATMOCK:
+                return ai_provider.Provider(ai_provider.CHATMOCK, ai_provider.CHATMOCK_URL)
+            provider = ai_provider.parse(address.get())
+            if provider.kind != kind.get():
+                raise ValueError("Для локальной модели укажи адрес 127.0.0.1 или localhost с портом."
+                                 if kind.get() == ai_provider.LOCAL else
+                                 "Для внешнего провайдера укажи адрес https://, не локальный.")
+            return provider
+
+        def stored_key():
+            try:
+                provider = chosen()
+            except ValueError:
+                return None
+            return ai_provider.read_key(provider) if provider.needs_key else None
+
+        def update(*_args):
+            current = kind.get()
+            address_entry.configure(state="disabled" if current == ai_provider.CHATMOCK else "normal")
+            if current == ai_provider.LOCAL and ai_provider.kind_of(address.get()) != ai_provider.LOCAL:
+                address.set(ai_provider.PRESETS[ai_provider.LOCAL])
+            if current == ai_provider.OPENAI and ai_provider.kind_of(address.get()) != ai_provider.OPENAI:
+                address.set(ai_provider.PRESETS[ai_provider.OPENAI])
+            if current == ai_provider.CHATMOCK:
+                presets.grid_remove()
+            else:
+                presets.grid() if current == ai_provider.LOCAL else presets.grid_remove()
+            uses_key = current == ai_provider.OPENAI
+            for widget in (key_label, key_entry, forget, key_hint):
+                widget.grid() if uses_key else widget.grid_remove()
+            if uses_key:
+                saved = stored_key() is not None
+                key_hint.configure(text=("Ключ сохранён. Оставь поле пустым, чтобы не менять его. " if saved else "")
+                                   + "Ключ хранится в диспетчере учётных данных Windows, не в файлах.")
+                forget.configure(state="normal" if saved else "disabled")
+            warning.configure(text="" if current == ai_provider.CHATMOCK else
+                              "Тексты резюме и вакансий будут уходить выбранному провайдеру. "
+                              "Его условия обработки данных — на твоей ответственности.")
+            error.configure(text="")
+
+        def delete():
+            try:
+                ai_provider.delete_key(chosen())
+            except (OSError, ValueError) as problem:
+                error.configure(text=str(problem))
+                return
+            update()
+
+        def save():
+            try:
+                provider = chosen()
+                if provider.needs_key:
+                    if key.get().strip():
+                        ai_provider.save_key(provider, key.get())
+                    elif ai_provider.read_key(provider) is None:
+                        raise ValueError("Введи ключ API: без него провайдер не ответит.")
+                if provider != self.provider:
+                    set_provider(provider.base_url)
+                    self.model.set("")
+                    self.models.configure(values=())
+            except (OSError, ValueError) as problem:
+                error.configure(text=str(problem))
+                return
+            key.set("")
+            close()
+            self.load_provider()
+            self.refresh_steps()
+            self.say(f"AI-провайдер: {self.provider.title}. Теперь загрузи список моделей (шаг 3)."
+                     if self.ai_ready else self.next_hint(), "success" if self.ai_ready else "info")
+            self.append_log("AI-провайдер изменён: " + self.provider.title)
+
+        def close():
+            key.set("")
+            self.provider_window = None
+            window.destroy()
+        ttk.Button(buttons, text="Сохранить", style="Accent.TButton", command=save).pack(side="left")
+        ttk.Button(buttons, text="Отмена", command=close).pack(side="left", padx=6)
+        window.protocol("WM_DELETE_WINDOW", close)
+        update()
+        self.provider_controls = {"kind": kind, "address": address, "key": key, "key_entry": key_entry,
+                                  "error": error, "save": save, "update": update}
+
+    # ---- letter style -----------------------------------------------------------
+
+    def edit_letter_style(self):
+        """Edit [general].cover_letter_prompt: the instruction ChatGPT gets for every letter."""
+        from gui_profile import PROMPT_PLACEHOLDERS, default_prompt, read_prompt, set_prompt, validate_prompt
+        tk, ttk = self.tk, self.ttk
+        if getattr(self, "style_window", None) is not None and self.style_window.winfo_exists():
+            self.style_window.lift()
+            return
+        try:
+            current = read_prompt()
+        except (OSError, ValueError):
+            self.dialogs.showerror("Стиль письма", "Не удалось прочитать стиль письма из профиля.")
+            return
+        window = self.style_window = tk.Toplevel(self.root, background=CARD)
+        window.title("Стиль письма")
+        window.transient(self.root)
+        window.geometry("760x600")
+        window.minsize(560, 420)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(2, weight=1)
+        ttk.Label(frame, text="Стиль письма", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(frame, wraplength=700, justify="left", text=(
+            "ChatGPT получает этот текст как инструкцию для каждого письма. Опиши тон, длину, обращение "
+            "и чего избегать. Данные резюме и вакансии приложение добавляет само.")).grid(
+            row=1, column=0, sticky="w", pady=(6, 10))
+        editor_frame, editor = self.text_box(frame, 14, readonly=False)
+        editor_frame.grid(row=2, column=0, sticky="nsew")
+        editor.insert("1.0", current)
+        ttk.Label(frame, style="Hint.TLabel", wraplength=700, justify="left", text=(
+            "Подстановки: %(vacancy_name)s — вакансия, %(employer_name)s — компания, "
+            "%(resume_title)s — резюме, %(first_name)s — имя. Знак % пиши как %%. "
+            "%(email)s и %(phone)s добавят твои контакты в каждое письмо.")).grid(
+            row=3, column=0, sticky="w", pady=(8, 0))
+        error = ttk.Label(frame, style="Error.TLabel", wraplength=700, justify="left")
+        error.grid(row=4, column=0, sticky="w", pady=(4, 0))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+
+        def text():
+            return editor.get("1.0", "end-1c").strip()
+
+        def check(_event=None):
+            try:
+                validate_prompt(text())
+                error.configure(text="")
+                save_button.configure(state="normal")
+            except ValueError as problem:
+                error.configure(text=str(problem))
+                save_button.configure(state="disabled")
+
+        def reset():
+            editor.delete("1.0", "end")
+            editor.insert("1.0", default_prompt())
+            check()
+
+        def save():
+            try:
+                set_prompt(text())
+            except (OSError, ValueError) as problem:
+                error.configure(text=str(problem))
+                return
+            close()
+            self.say("Стиль письма сохранён. Проверь его на предпросмотре писем (шаг 4).", "success")
+            self.append_log("Стиль письма изменён.")
+
+        def close():
+            self.style_window = None
+            window.destroy()
+        save_button = ttk.Button(buttons, text="Сохранить", style="Accent.TButton", command=save)
+        save_button.pack(side="left")
+        ttk.Button(buttons, text="Отмена", command=close).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Вернуть исходный стиль", command=reset).pack(side="right")
+        window.protocol("WM_DELETE_WINDOW", close)
+        editor.bind("<KeyRelease>", check)
+        editor.focus_set()
+        check()
+        self.style_controls = (editor, save_button, error, check)
 
     # ---- ChatGPT device login ---------------------------------------------------
 
@@ -1098,6 +1395,8 @@ class Application:
                 self.preview_box.current(len(self.previews) - 1)
         elif name == "diagnostic":
             self.append_log("Сведения о сбое сети сохранены: " + value)
+        elif name == "stopped" and isinstance(value, str):
+            self.append_log("Причина остановки: " + value)
 
     def finish_message(self, data, action=None):
         from gui_steps import FAILURE_HINTS
@@ -1143,6 +1442,7 @@ class Application:
             self.signed_hh = hh_signed_in()
         elif session.action == "chatgpt_login":
             self.signed_chatgpt = chatgpt_signed_in()
+            self.load_provider()
         message = self.finish_message(data, session.action)
         self.append_log(message)
         self.sending = False
@@ -1151,6 +1451,8 @@ class Application:
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
         self.say(message, self.finish_severity(data, session.action))
+        if session.action == "hh_login" and data["success"]:
+            self.root.after_idle(self.auto_load_resumes)
         if not data["success"] and self.work.winfo_ismapped():
             self.show_tab(1)
 

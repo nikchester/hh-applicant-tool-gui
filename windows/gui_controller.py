@@ -7,7 +7,8 @@ from uuid import uuid4
 
 from gui_protocol import (ACTIONS, Cancelled, MAX_FRAME, ProtocolError, ReviewState,
                           decode, encode, frame, validate_done)
-from gui_runtime import GATEWAY_ACTIONS, Gateway, RunBusy, RunMutex, process_options, worker_command
+from gui_runtime import (GATEWAY_ACTIONS, Gateway, RunBusy, RunMutex, process_options,
+                         provider_uses_gateway, worker_command)
 from gui_owned_process import owned_job
 from gui_recovery import MUTATING_ACTIONS, RecoveryMarker
 
@@ -85,7 +86,7 @@ class Session:
             if self.action in MUTATING_ACTIONS:
                 marker.begin(self.recovery_acknowledgement)
             job = self.job_factory()  # GUI membership precedes *any* owned child.
-            if self.action in GATEWAY_ACTIONS:
+            if self.action in GATEWAY_ACTIONS and provider_uses_gateway():
                 gateway.start()
             if self.cancelled.is_set():
                 raise Cancelled

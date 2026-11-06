@@ -909,6 +909,32 @@ class SendChecks(unittest.TestCase):
                 self.assertIn("попыток отправки 1", output.getvalue())
             self.sender.assert_called_once()
 
+    def test_run_passes_operation_to_test_solver_on_keyword_call(self):
+        # Upstream calls self._solve_vacancy_test(vacancy_id=..., ...) with keywords only.
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            profile = home / ".config/pocketnode-hh"
+            profile.mkdir(parents=True)
+            shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
+            argv = arguments(str(profile), RESUME, "DevOps")
+            received = []
+
+            def solver(operation, **kwargs):
+                received.append((operation, kwargs))
+                return {"success": "true"}
+
+            def fake_main(_argv):
+                operation = Operation()
+                self.assertEqual(operation._solve_vacancy_test(vacancy_id="1", resume_hash=RESUME,
+                                                               letter=LETTER), {"success": "true"})
+                received.append(operation)
+                return 0
+
+            with patch.dict(os.environ, {"CONFIG_DIR": str(profile), "HH_PROFILE_ID": "."}),                  patch("send.Path.home", return_value=home),                  patch.object(Operation, "_solve_vacancy_test", solver),                  patch("send.main", side_effect=fake_main), redirect_stdout(StringIO()):
+                self.assertEqual(run(argv, approve=lambda _: "no"), 0)
+            self.assertIs(received[0][0], received[1])
+            self.assertEqual(received[0][1]["vacancy_id"], "1")
+
     def test_more_than_three_vacancies_no_then_yes_then_stop(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)

@@ -18,6 +18,18 @@ MUTEX_NAME = "Local\\PocketNode-HH-Run"
 GATEWAY_ACTIONS = frozenset({"models", "preview", "apply", "auto", "chats"})
 
 
+def provider_uses_gateway():
+    """Read the GUI profile without creating it; a missing or unreadable profile means ChatMock."""
+    import tomllib
+    import ai_provider
+    from gui_profile import profile_dir
+    try:
+        config = tomllib.loads((profile_dir() / "config.toml").read_text(encoding="utf-8"))
+        return ai_provider.parse(config["openai"]["default"]["base_url"]).needs_gateway
+    except (OSError, ValueError, KeyError, TypeError):
+        return True
+
+
 def attach_standard_streams():
     """Windowed frozen bootloaders may set sys.std* to None despite private pipes."""
     if os.name != "nt":
