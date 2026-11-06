@@ -1,6 +1,7 @@
 """Manual, per-vacancy HH sending with an explicit decision for each letter."""
 
 from contextlib import nullcontext
+import ai_provider
 import os
 from pathlib import Path
 import sys
@@ -113,7 +114,7 @@ def validate(argv, *, profile=None):
         args.dry_run is False and args.send_email is False and args.ai_filter is False
         and args.skip_tests is False and args.captcha_handling is False
         and args.total_pages == 100 and args.per_page == 20 and args.max_responses is None
-        and args.resume_id and args.text and args.verbosity == 0
+        and args.resume_id and args.verbosity == 0
         and args.work_format == ["REMOTE"] and args.currency == "RUR"
         and args.salary == 80000 and args.only_with_salary is False
         and args.order_by == "publication_time"
@@ -124,8 +125,7 @@ def validate(argv, *, profile=None):
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
     if argv != arguments(str(expected), args.resume_id, args.text):
         raise SystemExit("Unexpected send arguments; refusing to run")
-    if config["openai"]["default"]["base_url"] != "http://127.0.0.1:8000/v1":
-        raise SystemExit("Only the local model gateway is allowed")
+    ai_provider.activate(ai_provider.from_config(config, allow_external=profile is not None))
     return args
 
 
@@ -491,10 +491,7 @@ class ApprovalGate:
 
     @staticmethod
     def _gateway_generation(request):
-        url = urlsplit(request.url)
-        return (request.method == "POST" and url.scheme == "http"
-                and url.hostname == "127.0.0.1" and url.port == 8000
-                and url.path == "/v1/chat/completions"
+        return (ai_provider.generation(request.method, request.url)
                 and allowed_request(request.method, request.url, request.body))
 
     @staticmethod
@@ -535,6 +532,11 @@ def run(argv, approve=input, *, all_resumes=False, gate_factory=ApprovalGate, pr
     def visible_letter(client, *args, **kwargs):
         return gate.complete(client, *args, **kwargs)
 
+    # A bound method on the class is not re-bound, so upstream's keyword-only
+    # call would lose the operation; wrap it like the other patched methods.
+    def visible_test(operation, *args, **kwargs):
+        return gate.solve_test(operation, *args, **kwargs)
+
     print(gate.mode_message, flush=True)
     try:
         with patch.object(requests.sessions.Session, "send", guarded_send), \
@@ -547,7 +549,7 @@ def run(argv, approve=input, *, all_resumes=False, gate_factory=ApprovalGate, pr
                   original_get_vacancies, **({"force_fetch": True} if profile is not None else {})))
               if all_resumes else nullcontext()), \
              patch.object(OpenAIClient, "complete", visible_letter), \
-             patch.object(Operation, "_solve_vacancy_test", gate.solve_test):
+             patch.object(Operation, "_solve_vacancy_test", visible_test):
             try:
                 return main(argv)
             except StopReview:

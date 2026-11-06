@@ -48,7 +48,7 @@ def validate_start(data):
     if expected:
         if (not isinstance(settings["resume"], str) or not settings["resume"]
                 or len(settings["resume"]) > 200 or not isinstance(settings["search"], str)
-                or not settings["search"].strip() or len(settings["search"]) > 4000
+                or (settings["search"] and not settings["search"].strip()) or len(settings["search"]) > 4000
                 or type(settings["all"]) is not bool or (action == "preview" and settings["all"])):
             raise ProtocolError("Invalid resume/search")
     if action == "auto":
@@ -126,7 +126,11 @@ def dispatch(action, settings, channel):
         return chatgpt_login(channel)
     if action == "models":
         import requests
-        response = requests.get("http://127.0.0.1:8000/v1/models", timeout=(2, 5))
+        import ai_provider
+        provider = ai_provider.active()
+        key = ai_provider.read_key(provider) if provider.needs_key else None
+        response = requests.get(provider.base_url + "/models", timeout=(5, 20),
+                                headers={"Authorization": "Bearer " + key} if key else {})
         response.raise_for_status()
         models = [item["id"] for item in response.json()["data"]
                   if isinstance(item.get("id"), str) and len(item["id"]) <= 200]
@@ -156,6 +160,21 @@ def dispatch(action, settings, channel):
         raise ProtocolError("Unknown send action")
     return send.run(argv, all_resumes=settings["all"], gate_factory=factory, profile=profile,
                     observer=channel.event)
+
+
+def own_stop_reason(error):
+    """Return the SystemExit text only when a module of this app raised it."""
+    if not isinstance(error.code, str) or error.__traceback__ is None:
+        return None
+    tb = error.__traceback__
+    while tb.tb_next is not None:
+        tb = tb.tb_next
+    from pathlib import Path
+    try:
+        origin = Path(tb.tb_frame.f_code.co_filename).resolve().parent
+    except (OSError, ValueError):
+        return None
+    return error.code[:500] if origin == Path(__file__).resolve().parent else None
 
 
 def worker_main(reader=None, writer=None):
@@ -209,8 +228,19 @@ def worker_main(reader=None, writer=None):
             logging.disable(logging.CRITICAL)
             stack.callback(logging.disable, previous)
             initialize()
+            config = tomllib.loads((profile_dir() / "config.toml").read_text(encoding="utf-8"))
+            if action in {"models", "preview", "apply", "auto", "chats"}:
+                import ai_provider
+                from hh_applicant_tool.tool import HHApplicantTool
+                provider = ai_provider.from_config(config)
+                ai_provider.activate(provider)
+                key = ai_provider.read_key(provider) if provider.needs_key else None
+                if provider.needs_key and not key:
+                    raise ProtocolError("AI provider key is missing")
+                # The key stays in this process's memory: never argv, environment or files.
+                stack.enter_context(patch.object(HHApplicantTool, "get_openai_config", ai_provider.keyed_config(
+                    HHApplicantTool.get_openai_config, provider, key)))
             if action in {"preview", "apply", "auto", "chats"}:
-                config = tomllib.loads((profile_dir() / "config.toml").read_text(encoding="utf-8"))
                 model = config.get("openai", {}).get("default", {}).get("model")
                 if not isinstance(model, str) or not model.strip() or model == "CHOOSE_AFTER_LOGIN":
                     raise ProtocolError("Choose an account model before generation")
@@ -220,7 +250,15 @@ def worker_main(reader=None, writer=None):
             success = result in (0, None)
     except Cancelled:
         cancelled = True
-    except (Exception, SystemExit):
+    except SystemExit as error:
+        # Our own guards stop with fixed, sanitized texts; upstream exits stay hidden.
+        reason = own_stop_reason(error)
+        if channel is not None and reason:
+            try:
+                channel.event("stopped", reason)
+            except (OSError, ValueError):
+                pass
+    except Exception:
         pass  # Never serialize an upstream exception or credential-bearing URL.
     finally:
         if channel is not None:

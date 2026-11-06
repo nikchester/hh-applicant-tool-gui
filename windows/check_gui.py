@@ -528,6 +528,42 @@ class ConstructionChecks(unittest.TestCase):
         self.assertFalse(writer.items[-1]["payload"]["success"])
         self.assertNotIn("SECRET", json.dumps(writer.items))
 
+    def test_resumes_load_without_click_only_after_hh_sign_in(self):
+        app = gui.Application.__new__(gui.Application)
+        app.root, app.launch, app.resumes, app.session = Mock(), Mock(), [], None
+        app.signed_hh = False
+        app.auto_load_resumes()
+        app.launch.assert_not_called()
+        app.signed_hh, app.session = True, object()
+        app.auto_load_resumes()
+        app.launch.assert_not_called()
+        app.root.after.assert_called_once_with(1000, app.auto_load_resumes)
+        app.session = None
+        app.auto_load_resumes()
+        app.launch.assert_called_once_with("resumes")
+        app.resumes = [{"id": "r", "title": "DevOps"}]
+        app.auto_load_resumes()
+        app.launch.assert_called_once()
+
+    def test_worker_reports_own_stop_reason_but_hides_upstream_exit(self):
+        import preview_hh
+        def own(_action, _settings, _channel):
+            preview_hh.check_letter_level("Готов на позицию миддл", {"name": "DevOps"})
+        def upstream(_action, _settings, _channel):
+            exec(compile("raise SystemExit('SECRET upstream')", "C:/elsewhere/upstream.py", "exec"))
+        for dispatch, expected in ((own, "Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead"),
+                                   (upstream, None)):
+            with self.subTest(expected=expected):
+                reader, writer = Reader(), Writer()
+                reader.put(frame(uuid4().hex, "start", {"action": "resumes", "settings": {}}))
+                with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)),                      patch("gui_worker.dispatch", dispatch):
+                    self.assertEqual(gui_worker.worker_main(reader, writer), 1)
+                reader.put("")
+                stopped = [item["payload"]["data"] for item in writer.items
+                           if item["type"] == "event" and item["payload"]["name"] == "stopped"]
+                self.assertEqual(stopped, [expected] if expected else [])
+                self.assertNotIn("SECRET", json.dumps(writer.items))
+
     def test_worker_preserves_transport_payload_and_reports_uncertain_post_once(self):
         for failure in (False, True):
             with self.subTest(failure=failure):
@@ -788,6 +824,315 @@ class StepChecks(unittest.TestCase):
                 app.submit_credential()
                 self.assertEqual(app.session.outgoing.get_nowait()["payload"],
                                  {"action": "submit", "text": "test@example.invalid"})
+        finally:
+            root.destroy()
+
+
+class SearchAllChecks(unittest.TestCase):
+    def test_empty_search_uses_hh_suggestions_and_passes_send_validation(self):
+        import preview
+        import send
+        argv = preview.arguments("cfg", "r", "")
+        self.assertFalse(any(item.startswith("--search=") for item in argv))
+        self.assertIn("--search=Python", preview.arguments("cfg", "r", "Python"))
+        with self.assertRaises(SystemExit):
+            preview.arguments("cfg", "", "Python")
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            gui_profile.initialize()
+            gui_profile.set_model("offline-model")
+            profile = gui_profile.profile_dir()
+            send_argv = send.arguments(str(profile), "generic-resume", "")
+            with patch.dict(os.environ, gui_worker.environment()):
+                args = send.validate(send_argv, profile=profile)
+            self.assertIsNone(args.text)  # HH 2.3.7 then reads /resumes/{id}/similar_vacancies.
+
+    def test_upstream_reads_similar_vacancies_without_text(self):
+        from hh_applicant_tool.operations.apply_vacancies import Operation
+        operation = Operation.__new__(Operation)
+        operation.text, operation.total_pages = None, 1
+        operation._get_search_params = lambda _page: {}
+        client = Mock()
+        client.get.return_value = {"items": [], "found": 0, "pages": 0}
+        with patch.object(Operation, "api_client", property(lambda _self: client)):
+            list(operation._get_vacancies("resume-1"))
+        self.assertEqual(client.get.call_args.args[0], "/resumes/resume-1/similar_vacancies")
+
+    def test_empty_search_is_stored_validated_and_accepted_by_worker(self):
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            gui_profile.save_search("r1", "")
+            self.assertEqual(gui_profile.read_searches(), {"r1": ""})
+        with self.assertRaises(ValueError):
+            gui_profile.validate_searches({"r": "  "})
+        for action in ("preview", "apply"):
+            settings = gui_controller.action_settings(action, resume="r", search="")
+            gui_worker.validate_start(frame(uuid4().hex, "start", {"action": action, "settings": settings}))
+            settings = gui_controller.action_settings(action, resume="r", search="   ")
+            with self.assertRaises(ProtocolError):
+                gui_worker.validate_start(frame(uuid4().hex, "start", {"action": action, "settings": settings}))
+
+    def test_round_robin_turns_empty_search_into_suggestions(self):
+        from send_all import apply_round_robin
+        tool = Mock()
+        tool.get_resumes.return_value = [{"id": "r1", "title": "r1", "status": {"id": "published"}}]
+        tool.get_openai_settings.return_value = {}
+        operation = SimpleNamespace(tool=tool, text="stale")
+        seen = []
+
+        def vacancies(op, resume_id):
+            seen.append(op.text)  # Runs on first next(), after the loop set the search.
+            yield from ()
+        with patch("send_all.selected_resume_context", return_value=nullcontext()), redirect_stdout(StringIO()):
+            apply_round_robin(operation, "r1", {"r1": ""}, vacancies)
+        self.assertEqual(seen, [None])
+
+
+class LetterStyleChecks(unittest.TestCase):
+    def test_prompt_validation_explains_mistakes(self):
+        gui_profile.validate_prompt("Пиши коротко для %(vacancy_name)s, скидка 100%%.")
+        for bad, hint in (("", "пуст"), ("%(unknown)s", "Неизвестная подстановка"), ("100% честно", "%%"),
+                          ("x" * 8001, "длинный")):
+            with self.assertRaises(ValueError) as caught:
+                gui_profile.validate_prompt(bad)
+            self.assertIn(hint, str(caught.exception))
+
+    def test_set_prompt_replaces_single_and_multiline_values_and_keeps_other_settings(self):
+        import tomllib
+        templates = ('[general]\ncover_letter_prompt = "old"\nother = 1\n\n[openai.default]\nmodel = "m"\n',
+                     '[general]\ncover_letter_prompt = """\nold\nmulti\n"""\nother = 1\n\n[openai.default]\nmodel = "m"\n',
+                     '[openai.default]\nmodel = "m"\n\n[general]\nother = 1\n')
+        for template in templates:
+            with self.subTest(template=template[:40]), tempfile.TemporaryDirectory() as temp, \
+                    patch("pathlib.Path.home", return_value=Path(temp)):
+                path = gui_profile.profile_dir() / "config.toml"
+                path.parent.mkdir(parents=True)
+                path.write_text(template, encoding="utf-8")
+                prompt = 'Привет "ты"\nстрока два, %(employer_name)s'
+                gui_profile.set_prompt(prompt)
+                config = tomllib.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(config["general"]["cover_letter_prompt"], prompt)
+                self.assertEqual(config["general"]["other"], 1)
+                self.assertEqual(config["openai"]["default"]["model"], "m")
+                self.assertEqual(gui_profile.read_prompt(), prompt)
+                with self.assertRaises(ValueError):
+                    gui_profile.set_prompt("%(nope)s")
+                self.assertEqual(gui_profile.read_prompt(), prompt)  # A rejected style changes nothing.
+
+    def test_default_prompt_comes_from_the_shipped_template(self):
+        self.assertTrue(gui_profile.default_prompt())
+        gui_profile.validate_prompt(gui_profile.default_prompt())
+
+    def test_real_tk_search_mode_and_letter_style_dialog(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                app.resumes = [{"id": "r1", "title": "Resume"}]
+                app.resume_box.configure(values=["Resume"])
+                app.resume_box.current(0)
+                app.select_resume()
+                self.assertFalse(app.progress_state().search)
+                app.search_mode.set("all")
+                app.select_search_mode()
+                self.assertTrue(app.progress_state().search)
+                self.assertEqual(str(app.search_entry["state"]), "disabled")
+                self.assertEqual(gui_profile.read_searches(), {"r1": ""})
+                self.assertTrue(app.save())
+                self.assertEqual(app.search_value(), "")
+                app.search_mode.set("query")
+                app.select_resume()  # A saved "" restores the "all" mode.
+                self.assertEqual(app.search_mode.get(), "all")
+
+                app.edit_letter_style()
+                editor, save_button, error, check = app.style_controls
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "%(broken)s")
+                check()
+                self.assertEqual(str(save_button["state"]), "disabled")
+                self.assertIn("Неизвестная подстановка", error["text"])
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "Коротко и на «ты» для %(vacancy_name)s.")
+                check()
+                self.assertEqual(str(save_button["state"]), "normal")
+                save_button.invoke()
+                self.assertEqual(gui_profile.read_prompt(), "Коротко и на «ты» для %(vacancy_name)s.")
+                self.assertIsNone(app.style_window)
+        finally:
+            root.destroy()
+
+
+class ProviderChecks(unittest.TestCase):
+    API = "https://api.example.com/v1"
+
+    def tearDown(self):
+        import ai_provider
+        ai_provider.activate(ai_provider.Provider(ai_provider.CHATMOCK, ai_provider.CHATMOCK_URL))
+
+    def test_base_url_decides_kind_and_rejects_unsafe_addresses(self):
+        import ai_provider
+        self.assertEqual(ai_provider.parse("http://127.0.0.1:8000/v1/").kind, ai_provider.CHATMOCK)
+        self.assertEqual(ai_provider.parse(self.API).kind, ai_provider.OPENAI)
+        self.assertEqual(ai_provider.parse("http://localhost:11434/v1").kind, ai_provider.LOCAL)
+        for bad in ("", "http://api.example.com/v1", "https://user:pw@api.example.com/v1",
+                    "https://api.example.com/v1?x=1", "https://api.hh.ru/v1", "https://192.168.1.5/v1",
+                    "http://127.0.0.1/v1", "http://127.0.0.1:8000/other", "ftp://api.example.com"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                ai_provider.parse(bad)
+        with self.assertRaises(ValueError):
+            ai_provider.parse(self.API, allow_external=False)  # CLI profiles keep ChatMock.
+
+    def test_only_active_provider_model_routes_pass_the_guards(self):
+        import ai_provider
+        import preview_hh
+        import reply_chats
+        ai_provider.activate(ai_provider.parse(self.API))
+        allowed = (("GET", self.API + "/models"), ("POST", self.API + "/chat/completions"))
+        blocked = (("POST", self.API + "/models"), ("GET", "https://api.example.com/v2/models"),
+                   ("POST", "https://evil.example.com/v1/chat/completions"),
+                   ("POST", self.API + "/chat/completions?x=1"),
+                   ("POST", "http://127.0.0.1:8000/v1/chat/completions"),  # ChatMock is not active now.
+                   ("GET", "http://127.0.0.1:8000/health"))
+        for method, url in allowed:
+            with self.subTest(url=url):
+                self.assertTrue(preview_hh.allowed_request(method, url))
+                self.assertTrue(reply_chats.allowed_read(requests.Request(method, url).prepare()))
+        for method, url in blocked:
+            with self.subTest(url=url):
+                self.assertFalse(preview_hh.allowed_request(method, url))
+                self.assertFalse(reply_chats.allowed_read(requests.Request(method, url).prepare()))
+        self.assertTrue(preview_hh.allowed_request("GET", "https://api.hh.ru/resumes/mine"))
+        self.assertEqual(reply_chats.request_target(requests.Request("POST", self.API + "/chat/completions").prepare()),
+                         "OpenAI-совместимый API: completions")
+
+    def test_key_is_added_only_for_the_provider_base_url(self):
+        import ai_provider
+        provider = ai_provider.parse(self.API)
+        original = lambda _tool, section=None: {"base_url": self.API if section != "other" else "https://x.example/v1"}
+        wrapped = ai_provider.keyed_config(original, provider, "sk-test")
+        self.assertEqual(wrapped(None)["api_key"], "sk-test")
+        self.assertNotIn("api_key", wrapped(None, "other"))
+        self.assertNotIn("api_key", ai_provider.keyed_config(original, provider, None)(None))
+
+    def test_send_validation_accepts_provider_only_in_the_gui_profile(self):
+        import send
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            gui_profile.initialize()
+            gui_profile.set_provider(self.API)
+            gui_profile.set_model("offline-model")
+            profile = gui_profile.profile_dir()
+            argv = send.arguments(str(profile), "r", "Python")
+            with patch.dict(os.environ, gui_worker.environment()):
+                send.validate(argv, profile=profile)
+            import ai_provider
+            self.assertEqual(ai_provider.active().kind, ai_provider.OPENAI)
+            self.assertNotIn("api_key", (profile / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(gui_profile.read_provider().base_url, self.API)
+
+    def test_switching_provider_clears_the_old_model(self):
+        import tomllib
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            gui_profile.set_model("gpt-5")
+            gui_profile.set_provider("http://127.0.0.1:11434/v1")
+            config = tomllib.loads((gui_profile.profile_dir() / "config.toml").read_text(encoding="utf-8"))
+            self.assertEqual(config["openai"]["default"]["model"], "CHOOSE_AFTER_LOGIN")
+            self.assertEqual(config["openai"]["default"]["base_url"], "http://127.0.0.1:11434/v1")
+
+    def test_worker_lists_models_with_key_in_memory_only(self):
+        import ai_provider
+        ai_provider.activate(ai_provider.parse(self.API))
+        channel = FakeChannel()
+        response = Mock(status_code=200)
+        response.json.return_value = {"data": [{"id": "model-a"}, {"id": 5}]}
+        with patch("ai_provider.read_key", return_value="sk-secret"), \
+             patch("requests.get", return_value=response) as get:
+            self.assertEqual(gui_worker.dispatch("models", {}, channel), 0)
+        self.assertEqual(get.call_args.args[0], self.API + "/models")
+        self.assertEqual(get.call_args.kwargs["headers"], {"Authorization": "Bearer sk-secret"})
+        self.assertEqual(channel.events, [("models", ["model-a"])])
+        self.assertNotIn("sk-secret", json.dumps(dict(os.environ)))
+
+    def test_worker_refuses_external_provider_without_key(self):
+        reader, writer = Reader(), Writer()
+        reader.put(frame(uuid4().hex, "start", {"action": "models", "settings": {}}))
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+             patch("ai_provider.read_key", return_value=None), patch("gui_worker.dispatch") as dispatch:
+            gui_profile.set_provider(self.API)
+            self.assertEqual(gui_worker.worker_main(reader, writer), 1)
+            dispatch.assert_not_called()
+        reader.put("")
+        self.assertFalse(writer.items[-1]["payload"]["success"])
+
+    def test_chatmock_gateway_starts_only_for_the_chatmock_provider(self):
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            self.assertTrue(gui_runtime.provider_uses_gateway())  # No profile yet: ChatMock.
+            gui_profile.set_provider(self.API)
+            self.assertFalse(gui_runtime.provider_uses_gateway())
+            session, process, _, gateway = LifecycleChecks().make_session("models")
+            process.stdout = StringIO(encode(frame(session.run, "done", {"success": True, "cancelled": False,
+                "unknown": False, "counts": {"attempts": 0, "http_success": 0, "captcha_rejections": 0}})))
+            run_session(session)
+            gateway.start.assert_not_called()
+
+    @unittest.skipUnless(os.name == "nt", "Windows Credential Manager")
+    def test_real_credential_manager_round_trip_with_disposable_target(self):
+        import ai_provider
+        provider = ai_provider.parse(f"https://test-{uuid4().hex}.invalid/v1")
+        try:
+            self.assertIsNone(ai_provider.read_key(provider))
+            ai_provider.save_key(provider, "  sk-round-trip  ")
+            self.assertEqual(ai_provider.read_key(provider), "sk-round-trip")
+            self.assertTrue(ai_provider.ready(provider))
+        finally:
+            ai_provider.delete_key(provider)
+        self.assertIsNone(ai_provider.read_key(provider))
+        ai_provider.delete_key(provider)  # Deleting a missing key is not an error.
+        with self.assertRaises(ValueError):
+            ai_provider.save_key(provider, "sk with space")
+
+    def test_real_tk_provider_dialog_saves_url_and_key_but_never_writes_the_key_to_files(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        store = {}
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                 patch("ai_provider.save_key", lambda provider, key, api=None: store.update({provider.base_url: key.strip()})), \
+                 patch("ai_provider.read_key", lambda provider, api=None: store.get(provider.base_url)):
+                app = gui.Application(root, tk, ttk, Mock())
+                self.assertEqual(str(app.provider_state["text"]), "ChatGPT через ChatMock")
+                app.edit_provider()
+                controls = app.provider_controls
+                controls["kind"].set("openai")
+                controls["update"]()
+                controls["address"].set("http://api.example.com/v1")
+                controls["save"]()
+                self.assertIn("https://", controls["error"]["text"])
+                controls["address"].set(self.API)
+                controls["save"]()
+                self.assertIn("ключ", controls["error"]["text"])  # A new API needs a key.
+                controls["key"].set("sk-from-dialog")
+                controls["save"]()
+                self.assertIsNone(app.provider_window)
+                self.assertEqual(store, {self.API: "sk-from-dialog"})
+                self.assertEqual(app.provider.base_url, self.API)
+                self.assertTrue(app.ai_ready)
+                self.assertFalse(app.chatgpt_button.winfo_manager())  # ChatGPT login is hidden.
+                self.assertIn("ключ сохранён", str(app.provider_state["text"]))
+                self.assertEqual(app.model.get(), "")
+                text = (gui_profile.profile_dir() / "config.toml").read_text(encoding="utf-8")
+                self.assertNotIn("sk-from-dialog", text)
+                for path in Path(temp).rglob("*"):
+                    if path.is_file():
+                        self.assertNotIn("sk-from-dialog", path.read_text(encoding="utf-8", errors="ignore"))
         finally:
             root.destroy()
 

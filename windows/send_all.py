@@ -54,7 +54,8 @@ def apply_round_robin(operation, configured_id, mapping, original_get_vacancies,
                   for resume in resumes)
     while queue:
         resume, vacancies = queue.popleft()
-        operation.text = mapping[resume["id"]]
+        # "" selects HH's suggested vacancies for this resume instead of a text search.
+        operation.text = mapping[resume["id"]] or None
         vacancy = None
         while True:
             try:
@@ -71,7 +72,7 @@ def apply_round_robin(operation, configured_id, mapping, original_get_vacancies,
             continue
         queue.append((resume, vacancies))
         seen_vacancies.add(vacancy["id"])
-        print(f"\nРезюме: {resume['title']} | Поиск: {operation.text}", flush=True)
+        print(f"\nРезюме: {resume['title']} | Поиск: {operation.text or 'все подходящие вакансии'}", flush=True)
         operation._round_resume = resume
         operation._round_vacancy = vacancy
         operation.cover_letter_ai = clients[resume["id"]]

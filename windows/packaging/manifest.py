@@ -5,7 +5,7 @@ APP_VERSION = "0.2.0"
 APP_MODULES = (
     "gui", "gui_chatmock_auth", "gui_controller", "gui_owned_process", "gui_profile", "gui_protocol",
     "gui_recovery", "gui_runtime", "gui_steps", "gui_worker",
-    "auto_send", "chatmock_server", "hh_network_diagnostics", "list_resumes",
+    "ai_provider", "auto_send", "chatmock_server", "hh_network_diagnostics", "list_resumes",
     "manual_captcha", "preview", "preview_hh", "reply_chats", "resume_context",
     "send", "send_all", "vacancy_level", "vacancy_salary",
 )

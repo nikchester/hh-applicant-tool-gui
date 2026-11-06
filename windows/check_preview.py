@@ -213,6 +213,17 @@ class PreviewTests(unittest.TestCase):
                 check_letter_level(letter, vacancy)
                 self.assertNotIn("не предлагай альтернативную позицию", enrich_prompt("Шаблон", vacancy))
 
+    def test_letter_may_name_the_vacancy_own_level(self):
+        title = "Junior Infrastructure / Operations Engineer"
+        for letter in ("Откликаюсь на вакансию Junior Infrastructure Engineer.",
+                       "Готов начать с позиции джуна в вашей команде."):
+            with self.subTest(letter=letter):
+                check_letter_level(letter, {"name": title})
+        with self.assertRaises(SystemExit):
+            check_letter_level("Если есть позиция миддл, тоже готов.", {"name": title})
+        with self.assertRaises(SystemExit):
+            check_letter_level("Откликаюсь на Junior позицию.", {"name": "Middle DevOps"})
+
     def test_vacancy_language_uses_description_not_technical_title(self):
         english = {"name": "DevOps Engineer", "description": (
             "<p>We are looking for an engineer to join our team. "
