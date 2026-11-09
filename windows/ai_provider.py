@@ -142,7 +142,7 @@ def describe(url, provider=None):
 
 # ---- Windows Credential Manager ------------------------------------------------------------
 
-TARGET = "PocketNodeHH/ai-provider/{}"
+TARGET = "hh-applicant-tool-gui/ai-provider/{}"
 CRED_TYPE_GENERIC, CRED_PERSIST_LOCAL_MACHINE, ERROR_NOT_FOUND = 1, 2, 1168
 
 
@@ -219,6 +219,52 @@ def delete_key(provider, api=None):
     if not api.CredDeleteW(key_target(provider), CRED_TYPE_GENERIC, 0):
         if ctypes.get_last_error() != ERROR_NOT_FOUND:
             raise OSError("Не удалось удалить ключ из диспетчера учётных данных Windows.")
+
+
+LEGACY_TARGET_PREFIX = "PocketNodeHH/ai-provider/"  # Name before the project rename.
+
+
+def migrate_legacy_keys(api=None):
+    """Copy each pre-rename key to its new target, then delete the old record.
+
+    An existing new record wins: it is never overwritten. Returns the moved hosts.
+    """
+    api = api or credential_api()
+    api.CredEnumerateW.argtypes = (ctypes.c_wchar_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32),
+                                   ctypes.POINTER(ctypes.POINTER(ctypes.POINTER(CREDENTIAL))))
+    api.CredEnumerateW.restype = ctypes.c_int
+    count, items = ctypes.c_uint32(), ctypes.POINTER(ctypes.POINTER(CREDENTIAL))()
+    if not api.CredEnumerateW(LEGACY_TARGET_PREFIX + "*", 0, ctypes.byref(count), ctypes.byref(items)):
+        if ctypes.get_last_error() == ERROR_NOT_FOUND:
+            return []
+        raise OSError("Не удалось прочитать старые ключи из диспетчера учётных данных Windows.")
+    legacy = []
+    try:
+        for index in range(count.value):
+            credential = items[index].contents
+            if credential.Type != CRED_TYPE_GENERIC or not credential.TargetName.startswith(LEGACY_TARGET_PREFIX):
+                continue
+            blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
+            legacy.append((credential.TargetName, credential.TargetName[len(LEGACY_TARGET_PREFIX):], blob))
+    finally:
+        api.CredFree(items)
+    moved = []
+    for old_target, host, blob in legacy:
+        new_target = TARGET.format(host)
+        existing = ctypes.POINTER(CREDENTIAL)()
+        if api.CredReadW(new_target, CRED_TYPE_GENERIC, 0, ctypes.byref(existing)):
+            api.CredFree(existing)
+        else:
+            buffer = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob) if blob else None
+            credential = CREDENTIAL(Type=CRED_TYPE_GENERIC, TargetName=new_target,
+                                    CredentialBlobSize=len(blob), CredentialBlob=buffer,
+                                    Persist=CRED_PERSIST_LOCAL_MACHINE, UserName="api-key")
+            if not api.CredWriteW(ctypes.byref(credential), 0):
+                raise OSError("Не удалось перенести ключ API в новую запись диспетчера учётных данных Windows.")
+            moved.append(host)
+        if not api.CredDeleteW(old_target, CRED_TYPE_GENERIC, 0) and ctypes.get_last_error() != ERROR_NOT_FOUND:
+            raise OSError("Не удалось удалить старую запись ключа API из диспетчера учётных данных Windows.")
+    return moved
 
 
 def keyed_config(original, provider, key):

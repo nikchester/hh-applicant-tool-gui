@@ -44,7 +44,7 @@ function Start-ChatMockForHH {
     $entry = Join-Path $PSScriptRoot 'chatmock_server.py'
     if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first (ChatMock missing).' }
 
-    $authHome = Join-Path $HOME '.local\state\pocketnode-hh\chatmock'
+    $authHome = Join-Path $HOME '.local\state\hh-applicant-tool-cli\chatmock'
     $auth = Join-Path $authHome 'auth.json'
     if (-not (Test-Path -LiteralPath $auth)) { throw 'Run windows/chatmock.ps1 login first.' }
     $data = Get-Content -LiteralPath $auth -Raw | ConvertFrom-Json
@@ -59,7 +59,7 @@ function Start-ChatMockForHH {
 
     $env:CHATGPT_LOCAL_HOME = $authHome
     $env:CODEX_HOME = $authHome
-    $logDir = Join-Path $HOME '.local\state\pocketnode-hh\run'
+    $logDir = Join-Path $HOME '.local\state\hh-applicant-tool-cli\run'
     New-Item -ItemType Directory -Force -Path $logDir | Out-Null
     $stem = Join-Path $logDir ('chatmock-' + [guid]::NewGuid().ToString('N'))
     $stdout = $stem + '.out.log'

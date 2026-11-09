@@ -16,7 +16,7 @@ from functools import partial
 from unittest.mock import patch
 from uuid import uuid4
 
-from manifest import APP_MODULES, APPLICATION_PINS, PRIVATE_NAMES
+from manifest import APP_MODULES, APPLICATION_PINS, PRIVATE_NAMES, PROFILE_NAMES
 
 
 def deny_external_io(event, args, *, allowed_auth=None):
@@ -25,13 +25,15 @@ def deny_external_io(event, args, *, allowed_auth=None):
         raise RuntimeError("External IO prohibited during packaging smoke")
     if event == "open" and isinstance(args[0], (str, bytes, os.PathLike)):
         path = Path(os.fsdecode(args[0]))
+        parts = [part.lower() for part in path.parts]
         # Only gateway_smoke's fresh synthetic fixture can opt into this exception.
         if allowed_auth is not None and path.absolute() == allowed_auth:
             return
         # Reject profile reads/writes even when inherited environment points at real accounts.
         if (path.name.lower() in PRIVATE_NAMES or path.suffix.lower() in {".log", ".pid"}
-                or any(part.lower() in {"pocketnode-hh", "pocketnode-hh-gui", ".codex"}
-                       for part in path.parts)):
+                or ".codex" in parts or any(
+                    name in PROFILE_NAMES and parent in {".config", "state"}
+                    for parent, name in zip(parts, parts[1:]))):
             raise RuntimeError("Profile IO prohibited during packaging smoke")
 
 

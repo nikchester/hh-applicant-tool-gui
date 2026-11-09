@@ -1,7 +1,9 @@
 name: Offline checks
 on:
   push:
+    branches: ['**']  # tags run the same checks through release.yml
   pull_request:
+  workflow_call:
   workflow_dispatch:
     inputs:
       build_installer:

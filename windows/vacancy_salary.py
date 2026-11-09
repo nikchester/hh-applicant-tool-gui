@@ -12,7 +12,7 @@ def currency_rates(api_client):
     # Upstream ApiClient is an unhashable dataclass: lru_cache cannot key on it.
     # Keep successful loads on the client itself, without retaining other clients.
     cache = vars(api_client)
-    key = "_pocketnode_hh_currency_rates"
+    key = "_hh_applicant_tool_currency_rates"
     if key in cache:
         return cache[key]
     # HH quotes currency units per RUB, not RUB per currency unit.

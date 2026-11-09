@@ -5,11 +5,13 @@ import ai_provider
 import os
 from pathlib import Path
 import sys
+import time
 import tomllib
 from unittest.mock import patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import requests
+from hh_applicant_tool.ai.base import AIError
 from hh_applicant_tool.api import Redirect
 from hh_applicant_tool.ai.openai import OpenAIClient
 from hh_applicant_tool.main import main
@@ -23,7 +25,9 @@ from resume_context import selected_resume_context
 from vacancy_level import senior_title_reason
 from vacancy_salary import salary_rejection_reason
 from send_all import apply_round_robin, load_searches, single_round_vacancy
-from manual_captcha import ManualCaptcha, captcha_url, permits_token_refresh
+from manual_captcha import (ManualCaptcha, captcha_url, form_captcha_state, hh_url,
+                            permits_token_refresh)
+from gui_protocol import RETRY_NOTICES
 
 
 class StopReview(BaseException):
@@ -38,6 +42,32 @@ class SkippedTest(Exception):
 URL_TASK_ANSWER = "Внешние ссылки из теста не открываю. Готов обсудить это задание в чате HH."
 TEST_ANSWER_LIMIT = 2000
 
+# The gateway reports a connect/TLS failure only before any model request byte
+# left it, so a later round cannot duplicate a generation or an application.
+GENERATION_ROUNDS = 3
+GENERATION_RETRY_DELAY = 30
+# Two vacancies in a row without a letter mean the provider is down: stop.
+GENERATION_SKIP_LIMIT = 2
+# HH may show a fresh application in the vacancy relations only after a delay.
+SEND_CHECK_DELAY = 15
+
+
+def _connect_failure(error):
+    """Return the gateway's bounded connect-failure record, or None."""
+    response = getattr(error.__cause__, "response", None)
+    if not isinstance(response, requests.Response):
+        return None
+    try:
+        failure = response.json()["error"]["generation_failure"]
+        attempts = failure["attempts"]
+        if (failure["kind"] in {"connect_timeout", "tls_handshake_timeout"}
+                and type(attempts) is int and 2 <= attempts <= 10
+                and failure["connect_retry_exhausted"] is True):
+            return failure
+    except (ValueError, KeyError, TypeError):
+        pass
+    return None
+
 
 def generation_failure_detail(error):
     """Read only bounded metadata, never upstream exception text or model input."""
@@ -46,11 +76,9 @@ def generation_failure_detail(error):
     if isinstance(response, requests.Response):
         status = response.status_code
         try:
-            failure = response.json()["error"]["generation_failure"]
-            attempts = failure["attempts"]
-            if (failure["kind"] in {"connect_timeout", "tls_handshake_timeout"}
-                    and type(attempts) is int and 2 <= attempts <= 10
-                    and failure["connect_retry_exhausted"] is True):
+            failure = _connect_failure(error)
+            if failure is not None:
+                attempts = failure["attempts"]
                 request_id = failure.get("request_id", "")
                 safe_id = (request_id if isinstance(request_id, str) and len(request_id) == 32
                            and all(c in "0123456789abcdef" for c in request_id) else "unknown")
@@ -83,6 +111,73 @@ def send_failure_detail(error, vacancy_id):
     safe_id = (vacancy_id if vacancy_id.isascii() and vacancy_id.isdecimal()
                and len(vacancy_id) <= 20 else "unknown")
     return f"vacancy_id={safe_id}; {kind}: {reason}"
+
+
+RESPONSE_MARKERS = (
+    ("captcha", ("captcha", "капч")),
+    ("xsrf", ("xsrf",)),
+    ("login", ("/account/login", "account_login")),
+    ("antibot", ("ddos-guard", "qrator", "cf-chl", "cloudflare")),
+    ("forbidden", ("access denied", "forbidden", "доступ ограничен", "доступ запрещ")),
+)
+
+
+def _safe_token(value, limit=64, extra="-_./+"):
+    return (value if isinstance(value, str) and 0 < len(value) <= limit
+            and all(c.isascii() and (c.isalnum() or c in extra) for c in value) else None)
+
+
+def response_failure_detail(response):
+    """Summarize an HH error answer from allowlisted features only.
+
+    The body may hold personal data, cookies or the _xsrf token, so neither it
+    nor raw header values are echoed: only fixed marker names, safe tokens and sizes.
+    """
+    parts = []
+    headers = getattr(response, "headers", None) or {}
+    media = _safe_token(str(headers.get("Content-Type", "")).split(";")[0].strip().lower())
+    parts.append("content_type=" + (media or "unknown"))
+    location = headers.get("Location")
+    if location:
+        url = urlsplit(str(location))
+        host = (url.hostname or "").lower()
+        if host and host != "hh.ru" and not host.endswith(".hh.ru"):
+            parts.append("location=external")
+        else:
+            parts.append("location=" + (_safe_token(url.path, 100) or "unknown"))
+    request_id = _safe_token(str(headers.get("X-Request-Id", "")), extra="-")
+    if request_id:
+        parts.append("request_id=" + request_id)
+    body = getattr(response, "content", b"") or b""
+    parts.append(f"body_bytes={len(body)}")
+    try:
+        data = response.json() if callable(getattr(response, "json", None)) else None
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        found = []
+        errors = data.get("errors")
+        for error in errors if isinstance(errors, list) else ():
+            if isinstance(error, dict):
+                found += [error.get("type"), error.get("value")]
+        found.append(data.get("error"))
+        safe = list(dict.fromkeys(t for t in map(_safe_token, found) if t))[:6]
+        if safe:
+            parts.append("json_errors=" + ",".join(safe))
+        # Key names (never values) show the shape of unfamiliar HH web answers.
+        keys = []
+        for key, value in data.items():
+            if _safe_token(key, 40, "-_"):
+                keys.append(key)
+                if isinstance(value, dict):
+                    keys += [key + "." + k for k in value if _safe_token(k, 40, "-_")]
+        if keys:
+            parts.append("json_keys=" + ",".join(keys[:20]))
+    text = body[:200_000].decode("utf-8", errors="ignore").casefold()
+    markers = [name for name, needles in RESPONSE_MARKERS if any(n in text for n in needles)]
+    if markers:
+        parts.append("markers=" + ",".join(markers))
+    return "; ".join(parts)
 
 
 def arguments(config, resume_id, search):
@@ -163,15 +258,20 @@ class ApprovalGate:
                     "каждый отклик требует yes/no, stop завершает просмотр.")
     stop_message = "Просмотр завершён по команде stop."
     captcha_retry_message = "КАПЧА ПРОЙДЕНА — ПОВТОР ОТКЛИКА ТОЛЬКО ПО НОВОМУ ПОДТВЕРЖДЕНИЮ"
+    # The GUI worker counts sends at the transport level; this hook tells it how
+    # a POST without an answer was resolved: "sent" or "absent".
+    on_send_resolved = None
 
-    def __init__(self, resume_id, sender, approve=input, *, review=None):
+    def __init__(self, resume_id, sender, approve=input, *, review=None, sleep=time.sleep):
         self.resume_id = resume_id
         self.sender = sender
         self.approve = approve
         self.review = review
+        self.sleep = sleep
         self.current = None
         self.letter = None
         self._generating = False
+        self.generation_skips = 0
         self.captcha = ManualCaptcha()
         self.counts = {"vacancies": 0, "letters": 0, "skipped": 0,
                        "attempts": 0, "captcha_rejections": 0, "http_success": 0}
@@ -220,19 +320,8 @@ class ApprovalGate:
                 raise SystemExit(f"Vacancy salary changed: {reason}")
         except Exception:
             raise SystemExit("Stopped after vacancy-detail failure; no application sent for this vacancy") from None
-        try:
-            # Do not let HH's broad OpenAI transport/429 retry loop multiply the
-            # gateway's narrowly scoped connection retry or replay read failures.
-            self._generating = True
-            with (patch.object(client, "max_retries", 0)
-                  if isinstance(client, OpenAIClient) else nullcontext()):
-                letter = self.original_complete(client, enrich_prompt(prompt, vacancy), *args,
-                                                **letter_kwargs(kwargs, vacancy))
-        except Exception as error:
-            raise SystemExit("Stopped: " + generation_failure_detail(error)
-                             + "; no application sent for this vacancy") from None
-        finally:
-            self._generating = False
+        letter = self._generate(client, enrich_prompt(prompt, vacancy), args,
+                                letter_kwargs(kwargs, vacancy), "application")
         if not isinstance(letter, str) or not letter.strip():
             raise SystemExit("Stopped after empty model response")
         check_letter_level(letter, self.current)
@@ -244,20 +333,46 @@ class ApprovalGate:
     def _test_answer(self, client, prompt, *args, **kwargs):
         if not self.current.get("has_test") or self.letter is None:
             raise SystemExit("Unexpected test answer generation")
-        try:
-            self._generating = True
-            with (patch.object(client, "max_retries", 0)
-                  if isinstance(client, OpenAIClient) else nullcontext()):
-                answer = self.original_complete(client, prompt, *args, **kwargs)
-        except Exception as error:
-            raise SystemExit("Stopped: " + generation_failure_detail(error)
-                             + "; no test application sent for this vacancy") from None
-        finally:
-            self._generating = False
+        answer = self._generate(client, prompt, args, kwargs, "test application")
         if not isinstance(answer, str) or not answer.strip():
             raise SystemExit("Stopped after empty test answer")
         self.test_answers.append(answer)
         return answer
+
+    def _notice(self, code):
+        print(RETRY_NOTICES[code], flush=True)
+        if getattr(self, "observer", None) is not None:
+            self.observer("retry", code)
+
+    def _generate(self, client, prompt, args, kwargs, what):
+        """Repeat only a gateway connect failure; then skip the vacancy or stop."""
+        for round_ in range(GENERATION_ROUNDS):
+            try:
+                # Do not let HH's broad OpenAI transport/429 retry loop multiply the
+                # gateway's narrowly scoped connection retry or replay read failures.
+                self._generating = True
+                with (patch.object(client, "max_retries", 0)
+                      if isinstance(client, OpenAIClient) else nullcontext()):
+                    result = self.original_complete(client, prompt, *args, **kwargs)
+                self.generation_skips = 0
+                return result
+            except Exception as error:
+                detail = generation_failure_detail(error)
+                if _connect_failure(error) is None:
+                    raise SystemExit(f"Stopped: {detail}; no {what} sent for this vacancy") from None
+            finally:
+                self._generating = False
+            if round_ + 1 < GENERATION_ROUNDS:
+                self._notice("generation_wait")
+                self.sleep(GENERATION_RETRY_DELAY)
+        self.generation_skips += 1
+        if self.generation_skips >= GENERATION_SKIP_LIMIT:
+            raise SystemExit(f"Stopped: {detail}; {GENERATION_ROUNDS} rounds failed for "
+                             f"{self.generation_skips} vacancies in a row; no {what} sent for this vacancy")
+        self.letter = None
+        self._notice("generation_skip")
+        # Upstream logs AIError and moves on to the next vacancy without a request to HH.
+        raise AIError("model gateway unreachable; vacancy skipped")
 
     def solve_test(self, operation, *args, **kwargs):
         """Run upstream test solving with a neutral answer for link questions."""
@@ -310,55 +425,77 @@ class ApprovalGate:
             raise SystemExit("HH test payload has no answers or an oversized answer")
         if request.headers.get("Content-Type", "").split(";")[0] != "application/x-www-form-urlencoded":
             raise SystemExit("Unexpected HH content type")
+        if any(key.startswith("captcha") for key in fields):
+            raise SystemExit("HH test payload already carries captcha fields")
 
-        print("\n" + "-" * 60, flush=True)
-        print("ОТКЛИК НА ВАКАНСИЮ С ТЕСТОМ\n" + "\n".join(
-            vacancy_lines(self.current, self.counts["vacancies"])[1:]
-        ), flush=True)
-        print("Резюме: " + getattr(self, "resume_title", self.resume_id)
-              + " (" + self.resume_id + ")", flush=True)
-        print("\nСопроводительное письмо (будет отправлено дословно):\n", flush=True)
-        print(self.letter, flush=True)
-        print("\nОтветы на тест (ИИ или выбранный вариант, отправляются без проверки):", flush=True)
-        for key, value in answers:
-            print(f"  {key}: {value}", flush=True)
-        print("-" * 60, flush=True)
-        if getattr(self, "observer", None) is not None:
-            self.observer("application", {"vacancy": self.current, "text": self.letter,
-                                           "resume": self.resume_id, "retry": False,
-                                           "test_answers": dict(answers)})
-        try:
-            answer = (self.review.application(self, self.letter, retry=False)
-                      if self.review is not None else
-                      self.approve("Отправить этот отклик с тестом? [yes/no/stop]: "))
-        except (EOFError, KeyboardInterrupt):
-            raise SystemExit("No approval; stopped") from None
-        answer = answer.strip().casefold() if isinstance(answer, str) else ""
-        if answer == "stop":
-            raise StopReview
-        if answer in {"no", "n"}:
-            self.counts["skipped"] += 1
+        letter = self.letter
+        for attempt in range(2):  # One retry after the user solves an in-form HH CAPTCHA.
+            print("\n" + "-" * 60, flush=True)
+            if attempt:
+                print(self.captcha_retry_message, flush=True)
+            print("ОТКЛИК НА ВАКАНСИЮ С ТЕСТОМ\n" + "\n".join(
+                vacancy_lines(self.current, self.counts["vacancies"])[1:]
+            ), flush=True)
+            print("Резюме: " + getattr(self, "resume_title", self.resume_id)
+                  + " (" + self.resume_id + ")", flush=True)
+            print("\nСопроводительное письмо (будет отправлено дословно):\n", flush=True)
+            print(letter, flush=True)
+            print("\nОтветы на тест (ИИ или выбранный вариант, отправляются без проверки):", flush=True)
+            for key, value in answers:
+                print(f"  {key}: {value}", flush=True)
+            print("-" * 60, flush=True)
+            if getattr(self, "observer", None) is not None:
+                self.observer("application", {"vacancy": self.current, "text": letter,
+                                               "resume": self.resume_id, "retry": bool(attempt),
+                                               "test_answers": dict(answers)})
+            try:
+                answer = (self.review.application(self, letter, retry=bool(attempt))
+                          if self.review is not None else
+                          self.approve("Отправить этот отклик с тестом? [yes/no/stop]: "))
+            except (EOFError, KeyboardInterrupt):
+                raise SystemExit("No approval; stopped") from None
+            answer = answer.strip().casefold() if isinstance(answer, str) else ""
+            if answer == "stop":
+                raise StopReview
+            if answer in {"no", "n"}:
+                self.counts["skipped"] += 1
+                self.letter = None
+                print("Пропускаем этот отклик; переходим к следующей вакансии.", flush=True)
+                raise SkippedTest("Skipped by user before network request")
+            if answer not in {"yes", "y"}:
+                raise SystemExit("No approval; stopped")
+            if isinstance(session, requests.Session):
+                session.close()
+            if kwargs.get("timeout") is None:
+                kwargs["timeout"] = (10, 60)
+            self.counts["attempts"] += 1
             self.letter = None
-            print("Пропускаем этот отклик; переходим к следующей вакансии.", flush=True)
-            raise SkippedTest("Skipped by user before network request")
-        if answer not in {"yes", "y"}:
-            raise SystemExit("No approval; stopped")
-        if isinstance(session, requests.Session):
-            session.close()
-        if kwargs.get("timeout") is None:
-            kwargs["timeout"] = (10, 60)
-        self.counts["attempts"] += 1
-        self.letter = None
-        try:
-            response = self.sender(session, request, **kwargs)
-        except requests.RequestException as error:
-            detail = send_failure_detail(error, self.current["id"])
-            raise SystemExit(
-                f"Send outcome uncertain; {detail}; check HH manually before any retry"
-            ) from None
+            try:
+                response = self.sender(session, request, **kwargs)
+            except requests.RequestException as error:
+                detail = send_failure_detail(error, self.current["id"])
+                raise SystemExit(
+                    f"Send outcome uncertain; {detail}; check HH manually before any retry"
+                ) from None
+            state = form_captcha_state(response)
+            if state and attempt:
+                raise SystemExit("Repeated HH captcha on the test application; stopped without another retry")
+            if state:
+                # 403 with hhcaptcha: HH rejected the form before accepting it.
+                self.counts["captcha_rejections"] += 1
+                referer = request.headers.get("Referer")
+                solution = self.captcha.solve_state(
+                    state, self.operation.tool, referer if hh_url(str(referer or "")) else None)
+                request = request.copy()
+                request.prepare_body(
+                    data=parse_qsl(body, keep_blank_values=True, strict_parsing=True)
+                    + list(solution.items()), files=None)
+                continue
+            break
         if not 200 <= response.status_code < 300:
             raise SystemExit(
-                f"Test send returned HTTP {response.status_code}; check HH manually before any retry"
+                f"Test send returned HTTP {response.status_code}; {response_failure_detail(response)}; "
+                "check HH manually before any retry"
             )
         try:
             result = response.json()
@@ -457,15 +594,9 @@ class ApprovalGate:
                 session.close()
             if kwargs.get("timeout") is None:
                 kwargs["timeout"] = (10, 60)  # connect/read, not an overall deadline
-            self.counts["attempts"] += 1  # Count before network: uncertain results cannot be retried.
+            self.counts["attempts"] += 1  # Count before network: a lost answer needs a check.
             self.letter = None  # The original approval cannot authorize a second attempt.
-            try:
-                response = self.sender(session, request, **kwargs)
-            except requests.RequestException as error:
-                detail = send_failure_detail(error, self.current["id"])
-                raise SystemExit(
-                    f"Send outcome uncertain; {detail}; check HH manually before any retry"
-                ) from None
+            response = self._post_negotiation(session, request, kwargs)
             if response.status_code == 403 and not attempt:
                 captcha_url = self._captcha_url(response)
                 if captcha_url:
@@ -474,12 +605,71 @@ class ApprovalGate:
                     continue
             if not 200 <= response.status_code < 300:
                 raise SystemExit(
-                    f"Send returned HTTP {response.status_code}; check HH manually before any retry"
+                    f"Send returned HTTP {response.status_code}; {response_failure_detail(response)}; "
+                    "check HH manually before any retry"
                 )
             self.counts["http_success"] += 1
             print(f"HH вернул HTTP {response.status_code} для вакансии {self.current['id']}", flush=True)
             return response
         raise SystemExit("No confirmed send result; check HH manually")
+
+    def _post_negotiation(self, session, request, kwargs):
+        """Send the POST; after a lost answer, ask HH before one identical repeat.
+
+        HH may have created the application before the answer was lost, so a
+        repeat happens only when the vacancy shows no application in HH.
+        """
+        for repeat in range(2):
+            try:
+                return self.sender(session, request, **kwargs)
+            except requests.RequestException as error:
+                detail = send_failure_detail(error, self.current["id"])
+            if repeat:
+                raise SystemExit(f"Send outcome uncertain after one checked repeat; {detail}; "
+                                 "check HH manually before any retry")
+            if self._application_exists(session, request, kwargs, detail):
+                self._resolved("sent")
+                self._notice("send_confirmed")
+                confirmed = requests.Response()
+                # Upstream expects the empty body HH returns for a created application.
+                confirmed.status_code, confirmed._content = 201, b""
+                confirmed.request, confirmed.url = request, request.url
+                return confirmed
+            # This attempt provably created nothing, so it is not counted.
+            self.counts["attempts"] -= 1
+            self._resolved("absent")
+            self._notice("send_retry")
+            if isinstance(session, requests.Session):
+                session.close()
+            self.counts["attempts"] += 1
+
+    def _resolved(self, kind):
+        hook = type(self).on_send_resolved  # Read from the class: a plain function, not a method.
+        if hook is not None:
+            hook(kind)
+
+    def _application_exists(self, session, request, kwargs, detail):
+        """Read the vacancy relations directly: the upstream client lock is held here."""
+        self._notice("send_check")
+        self.sleep(SEND_CHECK_DELAY)
+        vacancy_id = str(self.current["id"])
+        failed = (f"Send outcome uncertain; {detail}; status check failed; "
+                  "check HH manually before any retry")
+        if not (vacancy_id.isascii() and vacancy_id.isdecimal() and len(vacancy_id) <= 20):
+            raise SystemExit(failed)
+        headers = {name: request.headers[name] for name in (
+            "Authorization", "User-Agent", "Accept", "X-HH-App-Active", "X-Force-App-Access")
+            if name in request.headers}
+        check = requests.Request("GET", "https://api.hh.ru/vacancies/" + vacancy_id,
+                                 headers=headers).prepare()
+        try:
+            response = self.sender(session, check, **{**kwargs, "timeout": (10, 30)})
+            relations = response.json()["relations"] if response.status_code == 200 else None
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            raise SystemExit(failed) from None
+        if not isinstance(relations, list):
+            raise SystemExit(failed)
+        return bool(relations)
 
     @staticmethod
     def _negotiation(request):
@@ -565,11 +755,11 @@ def run(argv, approve=input, *, all_resumes=False, gate_factory=ApprovalGate, pr
 
 
 if __name__ == "__main__":
-    if os.environ.get("POCKETNODE_HH_ALL") == "1":
+    if os.environ.get("HH_APPLICANT_TOOL_ALL") == "1":
         config_path = Path(os.environ.get("CONFIG_DIR", "")) / "config.toml"
         config = tomllib.loads(config_path.read_text(encoding="utf-8"))
         sys.exit(run(all_resume_arguments(os.environ.get("CONFIG_DIR", ""),
                                           config["general"]["cover_letter_resume_id"]), all_resumes=True))
     sys.exit(run(arguments(os.environ.get("CONFIG_DIR", ""),
-                           os.environ.get("POCKETNODE_HH_RESUME_ID", ""),
-                           os.environ.get("POCKETNODE_HH_SEARCH", ""))))
+                           os.environ.get("HH_APPLICANT_TOOL_RESUME_ID", ""),
+                           os.environ.get("HH_APPLICANT_TOOL_SEARCH", ""))))

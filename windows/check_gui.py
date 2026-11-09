@@ -106,6 +106,43 @@ class ProtocolChecks(unittest.TestCase):
             with self.assertRaises(ProtocolError):
                 validate_done(invalid)
 
+    def test_completion_network_host_is_a_bare_host_on_failure_only(self):
+        base = {"success": False, "cancelled": False, "unknown": False,
+                "counts": {"attempts": 0, "http_success": 0, "captcha_rejections": 0}}
+        valid = {**base, "network": "chatik.hh.ru"}
+        self.assertEqual(validate_done(valid), valid)
+        for invalid in ({**base, "network": None}, {**base, "network": ""},
+                        {**base, "network": "https://auth.openai.com/x?token=1"},
+                        {**base, "network": "user@host"}, {**base, "network": "a" * 254},
+                        {**valid, "success": True}):
+            with self.assertRaises(ProtocolError):
+                validate_done(invalid)
+
+    def test_worker_reports_unanswered_host_and_forgets_it_after_an_answer(self):
+        def run(answers):
+            reader, writer = Reader(), Writer()
+            reader.put(frame(uuid4().hex, "start", {"action": "resumes", "settings": {}}))
+            sender = Mock(side_effect=answers)
+
+            def dispatch(_action, _settings, _channel):
+                for host in ("chatik.hh.ru", "api.hh.ru")[:len(answers)]:
+                    try:
+                        requests.Session().send(requests.Request(
+                            "GET", f"https://user:SECRET@{host.upper()}/x?token=SECRET").prepare())
+                    except requests.RequestException:
+                        pass
+                raise RuntimeError("stop")
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                 patch.object(requests.sessions.Session, "send", sender), patch("gui_worker.dispatch", dispatch):
+                self.assertEqual(gui_worker.worker_main(reader, writer), 1)
+            reader.put("")
+            self.assertNotIn("SECRET", json.dumps(writer.items))
+            return writer.items[-1]["payload"]
+
+        self.assertEqual(run([requests.ReadTimeout("x")])["network"], "chatik.hh.ru")
+        self.assertEqual(run([requests.ConnectionError("x")])["network"], "chatik.hh.ru")
+        self.assertNotIn("network", run([requests.ReadTimeout("x"), Mock(status_code=200)]))
+
     def test_strict_envelope_and_malformed_data(self):
         valid = frame(uuid4().hex, "response", {"action": "yes", "text": ""})
         self.assertEqual(decode(encode(valid)), valid)
@@ -265,7 +302,7 @@ class ProfileChecks(unittest.TestCase):
 
     def test_new_profile_is_generic_existing_cli_untouched(self):
         with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
-            cli = Path(temp) / ".config/pocketnode-hh/config.toml"
+            cli = Path(temp) / ".config/hh-applicant-tool-cli/config.toml"
             cli.parent.mkdir(parents=True)
             cli.write_text("sentinel", encoding="utf-8")
             path = gui_profile.initialize()
@@ -288,7 +325,7 @@ class ProfileChecks(unittest.TestCase):
             mapping = gui_profile.read_searches()
             self.assertEqual(set(mapping), {"r1", "r2"})
             self.assertEqual(load_searches(gui_profile.search_path()), mapping)
-            with patch.dict(os.environ, {"POCKETNODE_HH_SEARCH_FILE": str(gui_profile.search_path())}):
+            with patch.dict(os.environ, {"HH_APPLICANT_TOOL_SEARCH_FILE": str(gui_profile.search_path())}):
                 self.assertEqual(load_searches(), mapping)
             self.assertEqual(list(gui_profile.search_path().parent.iterdir()), [gui_profile.search_path()])
             for invalid in ({}, {"": "x"}, {"r": " "}, {"r": 2}, []):
@@ -302,7 +339,7 @@ class ProfileChecks(unittest.TestCase):
     def test_default_cli_profile_cannot_be_redirected_by_env(self):
         with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
             with patch.dict(os.environ, {"CONFIG_DIR": "untrusted"}):
-                self.assertEqual(gui_profile.expected_profile(), Path(temp) / ".config/pocketnode-hh")
+                self.assertEqual(gui_profile.expected_profile(), Path(temp) / ".config/hh-applicant-tool-cli")
                 with self.assertRaises(SystemExit):
                     gui_profile.expected_profile(Path(temp) / "arbitrary")
 
@@ -467,7 +504,7 @@ class ConstructionChecks(unittest.TestCase):
                     self.assertEqual(exists.call_args.args, (python,))
         with self.assertRaises(ValueError):
             gui_runtime.worker_command("--apply")
-        self.assertEqual(gui_runtime.MUTEX_NAME, "Local\\PocketNode-HH-Run")
+        self.assertEqual(gui_runtime.MUTEX_NAME, "Local\\hh-applicant-tool-gui-run")
 
     def test_entrypoint_routes_before_creating_tk(self):
         with patch("gui_worker.worker_main", return_value=0) as worker:
@@ -740,6 +777,59 @@ class ConstructionChecks(unittest.TestCase):
             root.destroy()
 
 
+class AttentionChecks(unittest.TestCase):
+    def test_alert_rule_covers_errors_and_long_runs_only(self):
+        for action in ("resumes", "models", "hh_login", "auto", "apply", "chats", "preview"):
+            with self.subTest(action=action):
+                self.assertTrue(gui.needs_attention("error", action))
+                self.assertTrue(gui.needs_attention("warning", action))
+                self.assertFalse(gui.needs_attention("info", action))  # user pressed stop
+        for action in ("auto", "apply", "chats", "preview"):
+            self.assertTrue(gui.needs_attention("success", action))
+        for action in ("resumes", "models", "hh_login", "chatgpt_login"):
+            self.assertFalse(gui.needs_attention("success", action))
+
+    def test_alert_picks_sound_by_severity_and_never_raises(self):
+        import winsound
+        window = Mock()
+        window.winfo_id.side_effect = RuntimeError("no window")
+        with patch("winsound.MessageBeep") as beep:
+            for level, sound in (("error", winsound.MB_ICONHAND),
+                                 ("warning", winsound.MB_ICONEXCLAMATION),
+                                 ("success", winsound.MB_ICONASTERISK)):
+                gui.attention(window, level)
+                self.assertEqual(beep.call_args.args, (sound,))
+            beep.side_effect = RuntimeError("no sound device")
+            gui.attention(window, "error")
+
+    def test_captcha_event_alerts_and_explains(self):
+        session = SimpleNamespace(run="RUN", cancelled=threading.Event())
+        app = SimpleNamespace(append_log=Mock(), say=Mock(), root=Mock(), session=session)
+        frame = {"run": "RUN", "type": "event", "payload": {"name": "captcha", "data": True}}
+        with patch("gui.attention") as alert:
+            try:
+                gui.Application.handle_frame(app, frame)
+            except (AttributeError, KeyError, TypeError) as error:
+                self.fail(f"captcha event needs more GUI state than expected: {error!r}")
+        alert.assert_called_once_with(app.root, "warning")
+        self.assertIn("Капча", app.append_log.call_args.args[0])
+        self.assertEqual(app.say.call_args.args[1], "warning")
+
+    def test_finish_run_alerts_through_the_rule(self):
+        app = SimpleNamespace(
+            close_device_window=Mock(), stop_chat_wait=Mock(), finish_message=Mock(return_value="msg"),
+            append_log=Mock(), set_busy=Mock(), say=Mock(), next_hint=Mock(return_value=""),
+            finish_severity=Mock(return_value="error"), root=Mock(), show_tab=Mock(),
+            work=Mock(winfo_ismapped=Mock(return_value=False)))
+        session = SimpleNamespace(action="auto")
+        with patch("gui.attention") as alert:
+            gui.Application.finish_run(app, session, {"success": False})
+            alert.assert_called_once_with(app.root, "error")
+            app.finish_severity.return_value = "info"
+            gui.Application.finish_run(app, session, {"success": False})
+            alert.assert_called_once()
+
+
 class StepChecks(unittest.TestCase):
     def test_new_user_sees_one_current_step_and_locked_actions_explain_why(self):
         from gui_steps import CURRENT, DONE, LOCKED, Progress, blocker, next_hint, step_states
@@ -789,6 +879,40 @@ class StepChecks(unittest.TestCase):
         self.assertIn("Вход в HH не выполнен", app.finish_message(data, "hh_login"))
         self.assertNotIn("неизвестен", app.finish_message(data, "hh_login"))
         self.assertIn("неизвестен", app.finish_message(data, "apply"))
+
+    def test_chat_follow_up_wait_shows_countdown_and_its_end(self):
+        app = gui.Application.__new__(gui.Application)
+        app.session = SimpleNamespace(run="r", cancelled=threading.Event())
+        app.root = Mock(after=Mock(return_value="job-1"))
+        app.append_log, app.say = Mock(), Mock()
+
+        def event(name, data):
+            app.handle_frame({"run": "r", "type": "event", "payload": {"name": name, "data": data}})
+        event("chat_wait", 60)
+        app.append_log.assert_called_with("Жду следующий вопрос робота в этом чате (до 60 с).")
+        self.assertIn("осталось 60 с", app.say.call_args.args[0])
+        app.root.after.assert_called_once_with(1000, app.tick_chat_wait)
+        event("chat_wait_end", "timeout")
+        app.root.after_cancel.assert_called_once_with("job-1")
+        self.assertIsNone(app.chat_wait_until)
+        app.append_log.assert_called_with(gui.CHAT_WAIT_ENDS["timeout"])
+        app.say.assert_called_with(gui.CHAT_WAIT_ENDS["timeout"])
+        app.tick_chat_wait()  # A late tick after the end must not restart the countdown.
+        app.root.after.assert_called_once()
+        for bad in (0, 3601, "60", True):
+            event("chat_wait", bad)
+        event("chat_wait_end", "unknown")
+        app.root.after.assert_called_once()
+
+    def test_network_failure_message_names_the_host_instead_of_the_action_hint(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending = False
+        done = {"success": False, "cancelled": False, "unknown": False, "network": "auth.openai.com",
+                "counts": {"attempts": 0, "http_success": 0, "captcha_rejections": 0}}
+        message = app.finish_message({"done": done, "success": False, "cancelled": False,
+                                      "forced": False}, "chatgpt_login")
+        self.assertIn("Нет связи с сервером auth.openai.com", message)
+        self.assertNotIn("Введи код", message)
 
     def test_real_tk_first_run_locks_later_steps_and_shows_login_input_in_step_one(self):
         import tkinter as tk
@@ -1482,6 +1606,47 @@ class RecoveryChecks(unittest.TestCase):
             run_session(session)
             marker.begin.assert_called_once_with(None)
             self.assertEqual(marker.complete.call_count, int(success and stopped))
+
+
+class LegacyProfileMigrationTest(unittest.TestCase):
+    """Pre-rename PocketNode profiles move once to the new names; nothing is merged or lost."""
+
+    def test_old_folders_move_to_new_names(self):
+        import profile_migration
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            for parent, old, _ in profile_migration.FOLDERS:
+                (home / parent / old).mkdir(parents=True)
+                (home / parent / old / "marker.txt").write_text(parent + old, encoding="utf-8")
+            moved = profile_migration.migrate_folders(home)
+            self.assertEqual(len(moved), 4)
+            for parent, old, new in profile_migration.FOLDERS:
+                self.assertFalse((home / parent / old).exists())
+                self.assertEqual((home / parent / new / "marker.txt").read_text(encoding="utf-8"), parent + old)
+            self.assertEqual(profile_migration.migrate_folders(home), [])
+
+    def test_existing_new_folder_wins_and_old_is_kept(self):
+        import profile_migration
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / ".config/pocketnode-hh-gui").mkdir(parents=True)
+            (home / ".config/hh-applicant-tool-gui").mkdir(parents=True)
+            self.assertEqual(profile_migration.migrate_folders(home), [])
+            self.assertTrue((home / ".config/pocketnode-hh-gui").is_dir())
+
+    def test_failed_rename_stops_with_plain_message(self):
+        import profile_migration
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            (home / ".config/pocketnode-hh").mkdir(parents=True)
+            with patch.object(profile_migration.os, "rename", side_effect=PermissionError("busy")):
+                with self.assertRaisesRegex(profile_migration.MigrationError, "Закройте старую версию"):
+                    profile_migration.migrate_folders(home)
+
+    def test_gui_profile_uses_new_names(self):
+        self.assertEqual(gui_profile.profile_dir().name, "hh-applicant-tool-gui")
+        self.assertEqual(gui_profile.state_dir().name, "hh-applicant-tool-gui")
+        self.assertEqual(gui_profile.expected_profile().name, "hh-applicant-tool-cli")
 
 
 if __name__ == "__main__":

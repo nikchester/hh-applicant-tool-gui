@@ -69,9 +69,9 @@ Each build has a fresh ID; existing output/user work is never deleted:
 * `windows/build/<id>/stage`: exact source allowlist and generic template.
 * `windows/build/<id>/pyinstaller`: local intermediate diagnostics (may contain
   developer installation paths; **do not distribute**).
-* `windows/dist/<id>/app/PocketNodeHH/PocketNodeHH.exe`: portable onedir app;
+* `windows/dist/<id>/app/hh-applicant-tool-gui/hh-applicant-tool-gui.exe`: portable onedir app;
   keep its entire directory together.
-* `windows/dist/<id>/installer/PocketNodeHH-0.1.0-windows-x64-setup.exe`.
+* `windows/dist/<id>/installer/hh-applicant-tool-gui-0.1.0-windows-x64-setup.exe`.
 * `windows/dist/<id>/SHA256SUMS.txt`: relative-path SHA-256 inventory.
   The installer directory also contains a standalone hash manifest for the EXE.
 
@@ -127,7 +127,7 @@ To re-run, use Python only on the **developer machine** to wait/capture a
 windowed EXE reliably (not `Start-Process` without all private streams):
 
 ```powershell
-python -c "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-smoke-check'],input='',capture_output=True,text=True,encoding='utf-8',timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)" windows/dist/<id>/app/PocketNodeHH/PocketNodeHH.exe
+python -c "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-smoke-check'],input='',capture_output=True,text=True,encoding='utf-8',timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)" windows/dist/<id>/app/hh-applicant-tool-gui/hh-applicant-tool-gui.exe
 ```
 
 Real installer install/uninstall/upgrade and standard-user/DPI/antivirus testing
@@ -141,7 +141,7 @@ shortcut is per-user; desktop shortcut is optional. The installer never launches
 the app, registers an auto-start task, stops processes or deletes profile data.
 Close the app/owned workers manually before upgrading/uninstalling.
 Uninstall removes installed files/shortcuts but deliberately preserves
-`~/.config/pocketnode-hh-gui` and `~/.local/state/pocketnode-hh-gui` (including auth).
+`~/.config/hh-applicant-tool-gui` and `~/.local/state/hh-applicant-tool-gui` (including auth).
 Warn shared-machine users that uninstall is **not** account-data erasure.
 
 Keep the previous installer and its hash manifest. To roll back, close the app,

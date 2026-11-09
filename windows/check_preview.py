@@ -116,7 +116,7 @@ class PreviewTests(unittest.TestCase):
     def test_preview_skips_gross_ceiling_before_letter(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(Path(__file__).with_name("config.toml"), profile / "config.toml")
             vacancy = {"id": "123", "name": "Специалист технической поддержки",
@@ -141,7 +141,7 @@ class PreviewTests(unittest.TestCase):
     def test_preview_skips_senior_before_upstream_letter(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(Path(__file__).with_name("config.toml"), profile / "config.toml")
             vacancy = {"id": "123", "name": "Senior DevOps", "employer": {"name": "Test"}}

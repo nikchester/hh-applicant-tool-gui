@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<job id="PocketNodeHH">
+<job id="hh-applicant-tool-gui">
 <?job error="true" debug="false" ?>
 <script language="JScript"><![CDATA[
 // WSF keeps Russian text Unicode-safe without relying on the system ANSI codepage.

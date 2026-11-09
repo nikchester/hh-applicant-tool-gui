@@ -22,6 +22,9 @@ from types import SimpleNamespace
 from resume_context import facts_from_resume, selected_resume_context
 
 
+# One-time move of pre-rename PocketNode profile folders, before any profile use.
+MIGRATION = "& $python -I (Join-Path $PSScriptRoot 'profile_migration.py')"
+
 class WindowsChecks(unittest.TestCase):
     def test_conditional_junior_prompt_preserves_closing(self):
         config = tomllib.loads((ROOT / 'windows/config.toml').read_text(encoding='utf-8'))
@@ -63,13 +66,15 @@ class WindowsChecks(unittest.TestCase):
             source = (ROOT / 'windows' / name).read_text(encoding='utf-8')
             with self.subTest(name=name):
                 self.assertIn("'ensure-chatmock.ps1'", source)
-                self.assertLess(source.index('Start-ChatMockForHH'), source.index('& $python'))
+                self.assertLess(source.index(MIGRATION), source.index('Start-ChatMockForHH'))
+                run = source.replace(MIGRATION, '')  # Only the HH run must wait for the gateway.
+                self.assertLess(run.index('Start-ChatMockForHH'), run.index('& $python'))
                 self.assertIn('Stop-ChatMockForHH $ownedGateway', source)
                 self.assertIn('$runSucceeded = $false', source)
                 self.assertIn('$runSucceeded = $exitCode -eq 0', source)
                 self.assertIn('-KeepLogs:(-not $runSucceeded)', source)
                 self.assertIn('} finally {', source)
-                self.assertIn("'Local\\PocketNode-HH-Run'", source)
+                self.assertIn("'Local\\hh-applicant-tool-gui-run'", source)
                 self.assertIn('if ($runLocked) { $runMutex.ReleaseMutex() }', source)
 
     def test_gateway_log_cleanup_without_real_processes_or_network(self):
@@ -117,12 +122,12 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
 
 
     def test_local_config_and_profile(self):
-        local = Path.home() / '.config/pocketnode-hh/config.toml'
+        local = Path.home() / '.config/hh-applicant-tool-cli/config.toml'
         source = local if local.exists() else ROOT / 'windows/config.toml'
         config = tomllib.loads(source.read_text(encoding='utf-8'))
         self.assertEqual(config['openai']['default']['base_url'], 'http://127.0.0.1:8000/v1')
         self.assertEqual(config['general']['cover_letter_resume_id'], '9749b651ff056b6c970039ed1f5a63765a5178')
-        target = Path.home() / '.config/pocketnode-hh'
+        target = Path.home() / '.config/hh-applicant-tool-cli'
         with patch.dict(os.environ, {'CONFIG_DIR': str(target), 'HH_PROFILE_ID': '.'}):
             with patch('requests.sessions.Session.request', side_effect=AssertionError('Network forbidden')):
                 self.assertEqual(HHApplicantTool().config_dir_path, target.resolve())
@@ -131,8 +136,8 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
         source = (ROOT / 'windows/hh-preview.ps1').read_text(encoding='utf-8')
         self.assertIn("$env:CONFIG_DIR = $config", source)
         self.assertIn("$env:HH_PROFILE_ID = '.'", source)
-        self.assertIn('$env:POCKETNODE_HH_SEARCH = Resolve-HHSearchText', source)
-        self.assertIn("$env:POCKETNODE_HH_RESUME_ID = $ResumeId", source)
+        self.assertIn('$env:HH_APPLICANT_TOOL_SEARCH = Resolve-HHSearchText', source)
+        self.assertIn("$env:HH_APPLICANT_TOOL_RESUME_ID = $ResumeId", source)
         self.assertIn("'windows\\preview.py'", source)
         self.assertIn("$env:PYTHONIOENCODING = 'utf-8'", source)
         self.assertIn('[Console]::OutputEncoding =', source)
@@ -175,8 +180,10 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
     def test_chat_reply_wrapper_uses_shared_gateway_and_lock(self):
         source = (ROOT / 'windows/hh-reply-chats.ps1').read_text(encoding='utf-8')
         self.assertIn("'ensure-chatmock.ps1'", source)
-        self.assertIn("'Local\\PocketNode-HH-Run'", source)
-        self.assertLess(source.index('Start-ChatMockForHH'), source.index('& $python'))
+        self.assertIn("'Local\\hh-applicant-tool-gui-run'", source)
+        self.assertLess(source.index(MIGRATION), source.index('Start-ChatMockForHH'))
+        run = source.replace(MIGRATION, '')  # Only the HH run must wait for the gateway.
+        self.assertLess(run.index('Start-ChatMockForHH'), run.index('& $python'))
         self.assertIn('Stop-ChatMockForHH $ownedGateway', source)
         self.assertIn('if ($runLocked) { $runMutex.ReleaseMutex() }', source)
         self.assertIn("'windows\\reply_chats.py'", source)
@@ -188,7 +195,7 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
                         wrapper.index('Start-ChatMockForHH'))
         send_wrapper = (ROOT / 'windows/hh-send.ps1').read_text(encoding='utf-8')
         self.assertIn("'select-resume.ps1'", send_wrapper)
-        self.assertIn("$env:POCKETNODE_HH_ALL = '1'", send_wrapper)
+        self.assertIn("$env:HH_APPLICANT_TOOL_ALL = '1'", send_wrapper)
         self.assertLess(send_wrapper.index('Resolve-HHSearchText -Repo'),
                         send_wrapper.index('Start-ChatMockForHH'))
         chooser = (ROOT / 'windows/select-resume.ps1').read_text(encoding='utf-8')
@@ -272,7 +279,7 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
     def test_preview_accepts_checked_config_without_network(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            target = home / '.config/pocketnode-hh'
+            target = home / '.config/hh-applicant-tool-cli'
             target.mkdir(parents=True)
             shutil.copyfile(ROOT / 'windows/config.toml', target / 'config.toml')
             args = [

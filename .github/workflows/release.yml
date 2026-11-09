@@ -1,0 +1,75 @@
+name: Release
+# Push a tag vX.Y.Z (equal to APP_VERSION in windows/packaging/manifest.py):
+# offline checks, unsigned installer build, then a GitHub release with notes
+# from the matching CHANGELOG.md section.
+on:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  tests:
+    uses: ./.github/workflows/ci.yml
+  release:
+    needs: tests
+    runs-on: windows-latest
+    timeout-minutes: 40
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+          architecture: x64
+      - name: Check tag matches APP_VERSION and CHANGELOG
+        id: version
+        shell: pwsh
+        run: |
+          $version = (python -I -c "import sys; sys.path.insert(0, 'windows/packaging'); import manifest; print(manifest.APP_VERSION)").Trim()
+          if ($LASTEXITCODE) { throw 'Cannot read APP_VERSION' }
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "Tag $env:GITHUB_REF_NAME does not match APP_VERSION $version"
+          }
+          python -I windows/packaging/release_notes.py $version CHANGELOG.md release-notes.md
+          if ($LASTEXITCODE) { throw "CHANGELOG.md has no section for $version" }
+          "version=$version" >> $env:GITHUB_OUTPUT
+      - name: Install pinned Inno Setup 6.4.3
+        shell: pwsh
+        run: |
+          # Chocolatey verifies the package checksum; the probe below verifies the engine version.
+          choco install innosetup --version=6.4.3 --allow-downgrade --yes --no-progress
+          if ($LASTEXITCODE) { throw 'Inno Setup 6.4.3 installation failed' }
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          & $iscc '/O-' windows/packaging/compiler-version.iss
+          if ($LASTEXITCODE) { throw 'Runner compiler is not Inno Setup 6.4.3' }
+      - name: Prepare isolated build dependencies
+        shell: pwsh
+        run: |
+          python -m venv windows/build/venv
+          windows/build/venv/Scripts/python.exe -m pip install -r windows/requirements-hh.txt -r windows/requirements-chatmock.txt -r windows/packaging/requirements-build.txt
+          if ($LASTEXITCODE) { throw 'Build dependency installation failed' }
+      - name: Build and smoke-check unsigned installer (never execute installer)
+        shell: pwsh
+        run: |
+          ./windows/build-installer.ps1 -Python ./windows/build/venv/Scripts/python.exe -Iscc (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+      - name: Publish GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = @(Get-ChildItem windows/dist/*/installer -Directory)
+          if ($installer.Count -ne 1) { throw "Expected one installer directory, found $($installer.Count)" }
+          $setup = Join-Path $installer[0].FullName "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
+          $sums = Join-Path $installer[0].FullName 'SHA256SUMS.txt'
+          foreach ($file in $setup, $sums) {
+            if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing release file $file" }
+          }
+          gh release create $env:GITHUB_REF_NAME $setup $sums --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag
+          if ($LASTEXITCODE) { throw 'GitHub release creation failed' }

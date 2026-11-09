@@ -51,7 +51,7 @@ def manual_tool(**kwargs):
 def profile():
     with tempfile.TemporaryDirectory() as temp:
         home = Path(temp)
-        config = home / ".config/pocketnode-hh"
+        config = home / ".config/hh-applicant-tool-cli"
         config.mkdir(parents=True)
         shutil.copyfile(Path(__file__).with_name("config.toml"), config / "config.toml")
         with patch("pathlib.Path.home", return_value=home), \
@@ -111,6 +111,24 @@ class CaptchaChecks(unittest.TestCase):
         with self.assertRaises(requests.Timeout):
             ManualCaptcha().send(sender, None, requests.Request("GET", "https://api.hh.ru/me").prepare())
         sender.assert_called_once()
+
+    def test_prompt_hook_alerts_before_both_captcha_kinds_and_cannot_break_them(self):
+        events = []
+        tool = Mock()
+        tool._can_use_tkinter.return_value = True
+        tool.handle_captcha.side_effect = lambda _url: events.append("window") or True
+        tool.solve_captcha.side_effect = lambda *a, **k: events.append("window") or SimpleNamespace(
+            text="abc", key="KEY")
+        with patch.object(ManualCaptcha, "on_prompt", lambda: events.append("alert")), \
+                redirect_stderr(StringIO()):
+            ManualCaptcha().solve("https://hh.ru/account/captcha?state=x", tool)
+            ManualCaptcha().solve_state("STATE", tool)
+        self.assertEqual(events, ["alert", "window", "alert", "window"])
+        broken = Mock(side_effect=RuntimeError("closed pipe"))
+        with patch.object(ManualCaptcha, "on_prompt", broken), redirect_stderr(StringIO()):
+            self.assertEqual(ManualCaptcha().solve_state("STATE", tool)["captchaText"], "abc")
+        broken.assert_called_once()
+        self.assertIsNone(ManualCaptcha.on_prompt)
 
     def test_non_hh_response_cannot_start_captcha(self):
         with patch("manual_captcha.HHApplicantTool") as tool:

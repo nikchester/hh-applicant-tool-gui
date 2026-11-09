@@ -24,6 +24,6 @@ def arguments(config, resume_id, search):
 if __name__ == "__main__":
     sys.exit(run(arguments(
         os.environ.get("CONFIG_DIR", ""),
-        os.environ.get("POCKETNODE_HH_RESUME_ID", ""),
-        os.environ.get("POCKETNODE_HH_SEARCH", ""),
+        os.environ.get("HH_APPLICANT_TOOL_RESUME_ID", ""),
+        os.environ.get("HH_APPLICANT_TOOL_SEARCH", ""),
     )))

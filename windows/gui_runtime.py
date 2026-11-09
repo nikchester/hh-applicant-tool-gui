@@ -14,7 +14,7 @@ from uuid import uuid4
 from gui_profile import state_dir
 from gui_protocol import Cancelled
 
-MUTEX_NAME = "Local\\PocketNode-HH-Run"
+MUTEX_NAME = "Local\\hh-applicant-tool-gui-run"
 GATEWAY_ACTIONS = frozenset({"models", "preview", "apply", "auto", "chats"})
 
 

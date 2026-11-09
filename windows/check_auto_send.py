@@ -69,11 +69,12 @@ class AutoChecks(unittest.TestCase):
         tool.handle_captcha.assert_not_called()
         self.sleep.assert_not_called()
 
-    def test_network_failure_is_not_retried(self):
+    def test_network_failure_without_status_is_not_retried(self):
         self.sender.side_effect = requests.Timeout()
         with self.assertRaisesRegex(SystemExit, 'outcome uncertain'):
             self.send()
-        self.sender.assert_called_once()
+        # The POST and the failed status read; no repeat POST.
+        self.assertEqual([call.args[1].method for call in self.sender.call_args_list], ['POST', 'GET'])
         self.assertEqual(self.gate.counts['http_success'], 0)
 
     def test_pause_precedes_pool_refresh_and_failed_post_has_safe_diagnostics(self):
@@ -86,12 +87,15 @@ class AutoChecks(unittest.TestCase):
         with patch.object(session, 'close', side_effect=lambda: events.append('clear')), \
              redirect_stdout(StringIO()), self.assertRaises(SystemExit) as caught:
             self.gate.send(session, negotiation())
-        self.assertEqual(events, [('pause', 75), 'clear'])
+        self.assertEqual(events, [('pause', 75), 'clear', ('pause', 15)])
         self.assertIn('ConnectionError', str(caught.exception))
         self.assertIn('vacancy_id=123', str(caught.exception))
         self.assertNotIn('SECRET', str(caught.exception))
         self.assertNotIn('proxy.invalid', str(caught.exception))
-        self.sender.assert_called_once_with(session, unittest.mock.ANY, timeout=(10, 60))
+        self.assertEqual(self.sender.call_args_list[0],
+                         unittest.mock.call(session, unittest.mock.ANY, timeout=(10, 60)))
+        self.assertEqual(self.sender.call_args_list[1].args[1].method, 'GET')
+        self.assertEqual(self.sender.call_count, 2)
         self.assertEqual(self.gate.counts['attempts'], 1)
         self.assertEqual(self.gate.counts['http_success'], 1)
         self.assertIsNone(self.gate.letter)
@@ -170,7 +174,7 @@ class AutoChecks(unittest.TestCase):
     def test_run_stops_before_next_vacancy_or_letter(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / '.config/pocketnode-hh'
+            profile = home / '.config/hh-applicant-tool-cli'
             profile.mkdir(parents=True)
             shutil.copyfile(Path(__file__).with_name('config.toml'), profile / 'config.toml')
             fetched = []

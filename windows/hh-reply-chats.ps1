@@ -1,9 +1,12 @@
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo 'venvs\hh\Scripts\python.exe'
-$env:CONFIG_DIR = Join-Path $HOME '.config\pocketnode-hh'
+$env:CONFIG_DIR = Join-Path $HOME '.config\hh-applicant-tool-cli'
 $env:HH_PROFILE_ID = '.'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first.' }
+# Move pre-rename PocketNode profile folders once; refuses to merge or delete.
+& $python -I (Join-Path $PSScriptRoot 'profile_migration.py')
+if ($LASTEXITCODE -ne 0) { throw 'Legacy profile migration failed.' }
 . (Join-Path $PSScriptRoot 'ensure-chatmock.ps1')
 
 $previousEncoding = [Console]::OutputEncoding
@@ -12,7 +15,7 @@ $previousChatHome = $env:CHATGPT_LOCAL_HOME
 $previousCodexHome = $env:CODEX_HOME
 $ownedGateway = $null
 $runSucceeded = $false
-$runMutex = New-Object System.Threading.Mutex($false, 'Local\PocketNode-HH-Run')
+$runMutex = New-Object System.Threading.Mutex($false, 'Local\hh-applicant-tool-gui-run')
 $runLocked = $false
 try {
     if (-not $runMutex.WaitOne(0)) { throw 'Another HH run is active. Finish it before starting this one.' }
