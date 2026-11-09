@@ -182,7 +182,7 @@ def audit_runtime(root):
     root = Path(root)
     audit_tree(root)
     internal = root / "_internal"
-    required = [root / "PocketNodeHH.exe", internal / "config.example.toml",
+    required = [root / "hh-applicant-tool-gui.exe", internal / "config.example.toml",
                 internal / "THIRD-PARTY-NOTICES.txt", internal / "dependency-inventory.json",
                 internal / "Python-LICENSE.txt", internal / "certifi/cacert.pem",
                 internal / "hh_applicant_tool/operations/authorize.py",

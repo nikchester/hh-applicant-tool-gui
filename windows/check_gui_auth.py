@@ -34,7 +34,7 @@ def setUpModule():
     global TEMP, HOME, PATH, GUARD, PATCHES, utils, oauth, cli, catalog
     TEMP = tempfile.TemporaryDirectory()
     HOME = Path(TEMP.name)
-    PATH = HOME / ".local/state/pocketnode-hh-gui/chatmock/auth.json"
+    PATH = HOME / ".local/state/hh-applicant-tool-gui/chatmock/auth.json"
     old_builtin, old_io, old_expand = builtins.open, io.open, os.path.expanduser
 
     def instrument(original):

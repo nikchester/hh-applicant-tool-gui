@@ -2,6 +2,8 @@
 
 import sys
 
+from gui_protocol import RETRY_NOTICES
+
 
 APP_TITLE = "Автоотклики HH"
 ACTION_TITLES = {
@@ -14,6 +16,13 @@ SUCCESS_TITLES = {
     "resumes": "Резюме загружены.", "models": "Список моделей загружен.",
     "preview": "Предпросмотр готов. Письма — в списке «Готовые письма».",
     "apply": "Отклики завершены.", "auto": "Автоотклики завершены.", "chats": "Ответы в чатах завершены.",
+}
+CHAT_WAIT_ENDS = {
+    "question": "Робот прислал следующий вопрос. Готовлю ответ на проверку.",
+    "timeout": "Робот не прислал следующий вопрос. Перехожу к следующему чату.",
+    "left": "Робот вышел из чата. Перехожу к следующему чату.",
+    "skipped": "Чат изменился во время ожидания. Чат пропущен, новый ответ не отправлен.",
+    "stopped": "Ожидание следующего вопроса прервано.",
 }
 COUNT_TITLES = {
     "attempts": "попыток отправки", "http_success": "отправлено", "captcha_rejections": "остановлено капчей",
@@ -55,6 +64,13 @@ def main(argv=None):
     from tkinter import ttk, messagebox
     enable_dpi_awareness()
     root = tk.Tk()
+    from profile_migration import MigrationError, migrate_all
+    try:
+        migrate_all()
+    except MigrationError as error:
+        messagebox.showerror(APP_TITLE, str(error))
+        root.destroy()
+        return 1
     try:
         Application(root, tk, ttk, messagebox)
     except (OSError, ValueError):
@@ -86,6 +102,39 @@ def dark_title_bar(window):
                                                          ctypes.sizeof(value)) == 0:
                 break
     except (AttributeError, ImportError, OSError):
+        pass
+
+
+def needs_attention(severity, action):
+    """Long runs always call the user back; short ones only when something went wrong.
+    A stop the user pressed ("info") needs no alert."""
+    return severity in {"error", "warning"} or (severity == "success" and action in REVIEW_ACTIONS)
+
+
+def attention(window, level):
+    """Soft system sound and a taskbar flash until the user returns to the window."""
+    try:
+        import winsound
+        sound = {"error": winsound.MB_ICONHAND, "warning": winsound.MB_ICONEXCLAMATION}
+        winsound.MessageBeep(sound.get(level, winsound.MB_ICONASTERISK))
+    except (ImportError, RuntimeError):
+        pass
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [("cbSize", wintypes.UINT), ("hwnd", wintypes.HWND),
+                        ("dwFlags", wintypes.DWORD), ("uCount", wintypes.UINT),
+                        ("dwTimeout", wintypes.DWORD)]
+
+        handle = ctypes.windll.user32.GetParent(window.winfo_id())
+        if handle == ctypes.windll.user32.GetForegroundWindow():
+            return  # The user already looks at the window; the sound is enough.
+        # FLASHW_ALL | FLASHW_TIMERNOFG: caption and taskbar button until foreground.
+        info = FLASHWINFO(ctypes.sizeof(FLASHWINFO), handle, 0x3 | 0xC, 0, 0)
+        ctypes.windll.user32.FlashWindowEx(ctypes.byref(info))
+    except Exception:  # An alert must never break the finish of a run.
         pass
 
 
@@ -480,11 +529,43 @@ class Application:
                             foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=BORDER,
                             highlightcolor=ACCENT, insertbackground=TEXT,
                             state="disabled" if readonly else "normal")
+        if readonly:
+            self.make_copyable(text)
         bar = self.ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=bar.set)
         text.grid(row=0, column=0, sticky="nsew")
         bar.grid(row=0, column=1, sticky="ns")
         return frame, text
+
+    def make_copyable(self, text):
+        """Let a disabled Text be copied: Tk gives it no focus on Windows and
+        maps Ctrl+C to Cyrillic keysyms in the Russian layout."""
+        def copy(_event=None):
+            try:
+                selected = text.get("sel.first", "sel.last")
+            except self.tk.TclError:
+                selected = text.get("1.0", "end-1c")
+            if selected:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(selected)
+            return "break"
+
+        def select_all(_event=None):
+            text.tag_add("sel", "1.0", "end-1c")
+            return "break"
+
+        def control_key(event):
+            # Windows virtual-key codes do not depend on the keyboard layout.
+            actions = {67: copy, 65: select_all, 45: copy}  # C, A, Insert
+            action = actions.get(event.keycode)
+            return action(event) if action else None
+
+        menu = self.tk.Menu(text, tearoff=0)
+        menu.add_command(label="Копировать", command=copy)
+        menu.add_command(label="Выделить всё", command=select_all)
+        text.bind("<Button-1>", lambda _e: text.focus_set(), add="+")
+        text.bind("<Control-KeyPress>", control_key)
+        text.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
 
     def build_main(self, main):
         ttk = self.ttk
@@ -1313,6 +1394,7 @@ class Application:
         if session is None or data["run"] != session.run or session.cancelled.is_set():
             return
         if data["type"] == "review":
+            self.stop_chat_wait()
             session.state.accept(data)
             payload = data["payload"]
             if (set(payload) != {"kind", "context", "text", "options"}
@@ -1371,6 +1453,10 @@ class Application:
         elif name == "device":
             self.show_device_code(value["url"], value["code"])
             self.say("Окно «Вход в ChatGPT»: открой страницу входа и введи код.")
+        elif name == "captcha":
+            self.append_log("HH запросил капчу. Введи текст с картинки в окне «Капча».")
+            self.say("HH запросил капчу. Введи текст с картинки в окне «Капча».", "warning")
+            attention(self.root, "warning")
         elif name == "sending":
             self.sending = value is True
             if not self.sending and getattr(self, "run_counts", None) is not None:
@@ -1395,8 +1481,46 @@ class Application:
                 self.preview_box.current(len(self.previews) - 1)
         elif name == "diagnostic":
             self.append_log("Сведения о сбое сети сохранены: " + value)
+        elif name == "chat_wait" and type(value) is int and 0 < value <= 3600:
+            self.append_log(f"Жду следующий вопрос робота в этом чате (до {value} с).")
+            self.start_chat_wait(value)
+        elif name == "chat_wait_end" and value in CHAT_WAIT_ENDS:
+            self.stop_chat_wait()
+            self.append_log(CHAT_WAIT_ENDS[value])
+            if value != "question":
+                self.say(CHAT_WAIT_ENDS[value])
+        elif name == "retry" and isinstance(value, str) and value in RETRY_NOTICES:
+            self.append_log(RETRY_NOTICES[value])
+        elif name == "fallback" and value == "chatik.hh.ru":
+            self.append_log("Узел chatik.hh.ru не ответил. Подключаюсь через резервный узел HH.")
         elif name == "stopped" and isinstance(value, str):
             self.append_log("Причина остановки: " + value)
+
+    def start_chat_wait(self, seconds):
+        """Count down in the InfoBar while the worker polls the same chat."""
+        import time
+        self.stop_chat_wait()
+        self.chat_wait_until = time.monotonic() + seconds
+        self.tick_chat_wait()
+
+    def tick_chat_wait(self):
+        import math
+        import time
+        self.chat_wait_job = None
+        until = getattr(self, "chat_wait_until", None)
+        if until is None or self.session is None:
+            return
+        left = max(0, math.ceil(until - time.monotonic()))
+        self.say(f"Жду следующий вопрос робота в этом чате: осталось {left} с. "
+                 "Новый вопрос придёт на проверку сам.")
+        if left > 0:
+            self.chat_wait_job = self.root.after(1000, self.tick_chat_wait)
+
+    def stop_chat_wait(self):
+        self.chat_wait_until = None
+        job, self.chat_wait_job = getattr(self, "chat_wait_job", None), None
+        if job is not None:
+            self.root.after_cancel(job)
 
     def finish_message(self, data, action=None):
         from gui_steps import FAILURE_HINTS
@@ -1408,6 +1532,9 @@ class Application:
             message = SUCCESS_TITLES.get(action, "Готово.")
         elif data["cancelled"] or (done is not None and done.get("cancelled")):
             message = "Остановлено. Уже отправленные отклики не отменяются."
+        elif done is not None and done.get("network"):
+            message = (f"Нет связи с сервером {done['network']}. Проверь интернет или VPN и повтори."
+                       " Подробности — в журнале.")
         else:
             message = FAILURE_HINTS.get(action, "Не удалось завершить.") + " Подробности — в журнале."
         if done is not None and isinstance(done.get("counts"), dict) and any(done["counts"].values()):
@@ -1437,6 +1564,7 @@ class Application:
 
     def finish_run(self, session, data):
         from gui_steps import chatgpt_signed_in, hh_signed_in
+        self.stop_chat_wait()
         self.close_device_window()
         if session.action == "hh_login":
             self.signed_hh = hh_signed_in()
@@ -1450,7 +1578,10 @@ class Application:
         self.set_busy(False)
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
-        self.say(message, self.finish_severity(data, session.action))
+        severity = self.finish_severity(data, session.action)
+        self.say(message, severity)
+        if needs_attention(severity, session.action):
+            attention(self.root, severity)
         if session.action == "hh_login" and data["success"]:
             self.root.after_idle(self.auto_load_resumes)
         if not data["success"] and self.work.winfo_ismapped():

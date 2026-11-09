@@ -8,6 +8,14 @@ from uuid import UUID, uuid4
 VERSION = 1
 MAX_FRAME = 1024 * 1024
 ACTIONS = frozenset({"hh_login", "chatgpt_login", "models", "resumes", "preview", "apply", "auto", "chats"})
+# Fixed texts for the "retry" event: the worker sends only the key, never free text.
+RETRY_NOTICES = {
+    "generation_wait": "AI-провайдер не ответил. Повторяю генерацию письма через 30 с.",
+    "generation_skip": "AI-провайдер не ответил после повторов. Вакансия пропущена, отклик не отправлен.",
+    "send_check": "HH не ответил на отклик. Через 15 с проверю, дошёл ли отклик.",
+    "send_confirmed": "Проверка: отклик есть в HH. Повтор не нужен.",
+    "send_retry": "Проверка: отклика нет в HH. Отправляю отклик ещё раз.",
+}
 
 
 class Cancelled(BaseException):
@@ -63,8 +71,18 @@ def encode(data):
     return text
 
 
+NETWORK_HOST_CHARS = frozenset("abcdefghijklmnopqrstuvwxyz0123456789.-:")
+
+
+def valid_network_host(host):
+    """A bare host name only: no scheme, path, query or credentials."""
+    return isinstance(host, str) and 0 < len(host) <= 253 and set(host) <= NETWORK_HOST_CHARS
+
+
 def validate_done(payload):
-    if (set(payload) != {"success", "cancelled", "unknown", "counts"}
+    keys = {"success", "cancelled", "unknown", "counts"}
+    if (set(payload) not in (keys, keys | {"network"})
+            or ("network" in payload and not valid_network_host(payload["network"]))
             or any(type(payload[k]) is not bool for k in ("success", "cancelled", "unknown"))
             or not isinstance(payload["counts"], dict)
             or set(payload["counts"]) != {"attempts", "http_success", "captcha_rejections"}
@@ -73,7 +91,8 @@ def validate_done(payload):
     counts = payload["counts"]
     confirmed = counts["http_success"] + counts["captcha_rejections"]
     if (confirmed > counts["attempts"] or payload["unknown"] != (confirmed != counts["attempts"])
-            or (payload["success"] and payload["cancelled"])):
+            or (payload["success"] and payload["cancelled"])
+            or (payload["success"] and "network" in payload)):
         raise ProtocolError("Inconsistent completion")
     return payload
 

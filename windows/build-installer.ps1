@@ -45,12 +45,12 @@ $oldStage = [Environment]::GetEnvironmentVariable('HH_PACKAGING_STAGE', 'Process
 try {
     Invoke-PythonChecked @('-I', '-c', "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')", $packaging, $helper, 'stage', $stage)
     $env:HH_PACKAGING_STAGE = $stage
-    Invoke-PythonChecked @('-I', '-m', 'PyInstaller', '--noconfirm', '--distpath', $frozen, '--workpath', (Join-Path $build 'pyinstaller'), (Join-Path $packaging 'PocketNodeHH.spec'))
-    $app = Join-Path $frozen 'PocketNodeHH'
+    Invoke-PythonChecked @('-I', '-m', 'PyInstaller', '--noconfirm', '--distpath', $frozen, '--workpath', (Join-Path $build 'pyinstaller'), (Join-Path $packaging 'hh-applicant-tool-gui.spec'))
+    $app = Join-Path $frozen 'hh-applicant-tool-gui'
     Invoke-PythonChecked @('-I', '-c', "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')", $packaging, $helper, 'audit', $app)
     # Python's subprocess API waits for windowed EXEs and supplies all private pipes.
-    Invoke-PythonChecked @('-I', '-c', "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-smoke-check'],input='',text=True,encoding='utf-8',capture_output=True,timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)", (Join-Path $app 'PocketNodeHH.exe'))
-    Invoke-PythonChecked @('-I', '-c', "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-gateway-smoke'],input='',text=True,encoding='utf-8',capture_output=True,timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)", (Join-Path $app 'PocketNodeHH.exe'))
+    Invoke-PythonChecked @('-I', '-c', "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-smoke-check'],input='',text=True,encoding='utf-8',capture_output=True,timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)", (Join-Path $app 'hh-applicant-tool-gui.exe'))
+    Invoke-PythonChecked @('-I', '-c', "import subprocess,sys; p=subprocess.run([sys.argv[1],'--packaging-gateway-smoke'],input='',text=True,encoding='utf-8',capture_output=True,timeout=120,creationflags=subprocess.CREATE_NO_WINDOW); print(p.stdout); print(p.stderr); sys.exit(p.returncode)", (Join-Path $app 'hh-applicant-tool-gui.exe'))
     if (-not $PortableOnly) {
         New-Item -ItemType Directory -Path $installer | Out-Null
         # Single source of the release version: packaging/manifest.py.
@@ -58,7 +58,7 @@ try {
         if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Cannot read APP_VERSION from packaging/manifest.py' }
         & $Iscc "/DAppSource=$app" "/DOutputPath=$installer" "/DAppVersion=$version" (Join-Path $packaging 'installer.iss')
         if ($LASTEXITCODE -ne 0) { throw "Inno compilation failed (exit $LASTEXITCODE)" }
-        $setup = Join-Path $installer "PocketNodeHH-$version-windows-x64-setup.exe"
+        $setup = Join-Path $installer "hh-applicant-tool-gui-$version-windows-x64-setup.exe"
         if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw 'Compiler did not produce the expected installer' }
         Invoke-PythonChecked @('-I', '-c', "import runpy,sys; sys.path.insert(0,sys.argv[1]); sys.argv=sys.argv[2:]; runpy.run_path(sys.argv[0],run_name='__main__')", $packaging, $helper, 'hashes', $installer)
         Write-Host "Unsigned development installer: $setup"

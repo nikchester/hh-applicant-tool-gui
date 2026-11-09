@@ -6,10 +6,13 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo 'venvs\hh\Scripts\python.exe'
-$config = Join-Path $HOME '.config\pocketnode-hh'
+$config = Join-Path $HOME '.config\hh-applicant-tool-cli'
 $env:CONFIG_DIR = $config
 $env:HH_PROFILE_ID = '.'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first.' }
+# Move pre-rename PocketNode profile folders once; refuses to merge or delete.
+& $python -I (Join-Path $PSScriptRoot 'profile_migration.py')
+if ($LASTEXITCODE -ne 0) { throw 'Legacy profile migration failed.' }
 . (Join-Path $PSScriptRoot 'ensure-chatmock.ps1')
 . (Join-Path $PSScriptRoot 'select-resume.ps1')
 
@@ -21,7 +24,7 @@ $previousChatHome = $env:CHATGPT_LOCAL_HOME
 $previousCodexHome = $env:CODEX_HOME
 $ownedGateway = $null
 $runSucceeded = $false
-$runMutex = New-Object System.Threading.Mutex($false, 'Local\PocketNode-HH-Run')
+$runMutex = New-Object System.Threading.Mutex($false, 'Local\hh-applicant-tool-gui-run')
 $runLocked = $false
 try {
     if (-not $runMutex.WaitOne(0)) { throw 'Another HH run is active. Finish it before starting this one.' }
@@ -29,8 +32,8 @@ try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $env:PYTHONIOENCODING = 'utf-8'
     if (-not $ResumeId) { $ResumeId = Select-HHResume -Python $python -Repo $repo }
-    $env:POCKETNODE_HH_RESUME_ID = $ResumeId
-    $env:POCKETNODE_HH_SEARCH = Resolve-HHSearchText -Repo $repo -ResumeId $ResumeId -OverrideText $SearchText
+    $env:HH_APPLICANT_TOOL_RESUME_ID = $ResumeId
+    $env:HH_APPLICANT_TOOL_SEARCH = Resolve-HHSearchText -Repo $repo -ResumeId $ResumeId -OverrideText $SearchText
     $ownedGateway = Start-ChatMockForHH
     & $python (Join-Path $repo 'windows\preview.py')
     $exitCode = $LASTEXITCODE
