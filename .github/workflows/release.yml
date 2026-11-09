@@ -42,12 +42,21 @@ jobs:
       - name: Install pinned Inno Setup 6.4.3
         shell: pwsh
         run: |
-          # Chocolatey verifies the package checksum; the probe below verifies the engine version.
-          choco install innosetup --version=6.4.3 --allow-downgrade --yes --no-progress
-          if ($LASTEXITCODE) { throw 'Inno Setup 6.4.3 installation failed' }
-          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe'
+          # Official signed installer, pinned by SHA-256; installed into a private
+          # directory so a preinstalled Inno Setup of another version is never used.
+          $setup = Join-Path $env:RUNNER_TEMP 'innosetup-6.4.3.exe'
+          Invoke-WebRequest -UseBasicParsing 'https://github.com/jrsoftware/issrc/releases/download/is-6_4_3/innosetup-6.4.3.exe' -OutFile $setup
+          $hash = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash
+          if ($hash -ne 'F3C42116542C4CC57263C5BA6C4FEABFC49FE771F2F98A79D2F7628B8762723B') {
+            throw "Inno Setup installer hash mismatch: $hash"
+          }
+          $dir = Join-Path $env:RUNNER_TEMP 'inno-6.4.3'
+          $p = Start-Process -FilePath $setup -Wait -PassThru -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-', '/CURRENTUSER', "/DIR=$dir"
+          if ($p.ExitCode) { throw "Inno Setup 6.4.3 installation failed (exit $($p.ExitCode))" }
+          $iscc = Join-Path $dir 'ISCC.exe'
           & $iscc '/O-' windows/packaging/compiler-version.iss
           if ($LASTEXITCODE) { throw 'Runner compiler is not Inno Setup 6.4.3' }
+          "ISCC=$iscc" >> $env:GITHUB_ENV
       - name: Prepare isolated build dependencies
         shell: pwsh
         run: |
@@ -57,7 +66,7 @@ jobs:
       - name: Build and smoke-check unsigned installer (never execute installer)
         shell: pwsh
         run: |
-          ./windows/build-installer.ps1 -Python ./windows/build/venv/Scripts/python.exe -Iscc (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+          ./windows/build-installer.ps1 -Python ./windows/build/venv/Scripts/python.exe -Iscc $env:ISCC
       - name: Publish GitHub release
         shell: pwsh
         env:
