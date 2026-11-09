@@ -116,7 +116,7 @@ class NetworkDiagnostics:
         self.size, self.limit = 0, max(4096, max_bytes)
         self.warned = self.broken = self.capped = self.finished = False
         try:
-            directory = Path(directory) if directory is not None else Path.home() / ".local/state/pocketnode-hh/run"
+            directory = Path(directory) if directory is not None else Path.home() / ".local/state/hh-applicant-tool-cli/run"
             directory.mkdir(parents=True, exist_ok=True)
             candidate = directory / f"hh-chats-{self.run_id}.jsonl"
             self.file = candidate.open("xb")  # Never truncate or claim a previous log.

@@ -3,9 +3,9 @@
   #error Use exactly Inno Setup 6.4.3
 #endif
 [Setup]
-AppName=PocketNode compiler version probe
+AppName=hh-applicant-tool-gui compiler version probe
 AppVersion=0.0.0
-DefaultDirName={tmp}\PocketNode-compiler-version-probe
+DefaultDirName={tmp}\hh-applicant-tool-gui-compiler-version-probe
 CreateAppDir=no
 Uninstallable=no
 PrivilegesRequired=lowest

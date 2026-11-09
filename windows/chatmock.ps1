@@ -3,9 +3,12 @@ param([Parameter(Mandatory = $true)][ValidateSet('login', 'serve')][string]$Acti
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo 'venvs\chatmock\Scripts\python.exe'
-$env:CHATGPT_LOCAL_HOME = Join-Path $HOME '.local\state\pocketnode-hh\chatmock'
+$env:CHATGPT_LOCAL_HOME = Join-Path $HOME '.local\state\hh-applicant-tool-cli\chatmock'
 $env:CODEX_HOME = $env:CHATGPT_LOCAL_HOME
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first.' }
+# Move pre-rename PocketNode profile folders once; refuses to merge or delete.
+& $python -I (Join-Path $PSScriptRoot 'profile_migration.py')
+if ($LASTEXITCODE -ne 0) { throw 'Legacy profile migration failed.' }
 # Call the entry point directly: pip .exe launchers break when the venv is moved.
 $chatmock = @('-c', "import sys; from chatmock.cli import main; sys.argv[0] = 'chatmock'; main()")
 

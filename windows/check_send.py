@@ -2,7 +2,7 @@
 
 import os
 from contextlib import contextmanager
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
 from pathlib import Path
 import shutil
@@ -11,7 +11,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 import requests
 from hh_applicant_tool.ai.openai import OpenAIClient, OpenAIError
@@ -52,14 +52,14 @@ class SendChecks(unittest.TestCase):
     def setUp(self):
         self.sender = Mock()
         self.sender.return_value = SimpleNamespace(status_code=200)
-        self.gate = ApprovalGate(RESUME, self.sender, approve=lambda _: "yes")
+        self.gate = ApprovalGate(RESUME, self.sender, approve=lambda _: "yes", sleep=Mock())
         self.gate.current = VACANCY.copy()
         self.gate.letter = LETTER
 
     def test_fixed_arguments_and_profile(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             search = 'DevOps OR "Linux administrator"'
@@ -158,6 +158,141 @@ class SendChecks(unittest.TestCase):
         with redirect_stdout(StringIO()),              self.assertRaisesRegex(SystemExit, "error=negotiations-limit-exceeded"):
             self.gate.send(None, test_response())
         self.assertEqual(self.gate.counts["http_success"], 0)
+
+    def test_test_send_http_error_is_summarized_without_secrets(self):
+        self.gate.current = VACANCY | {"has_test": True}
+        response = requests.Response()
+        response.status_code = 403
+        response.headers.update({
+            "Content-Type": "text/html; charset=utf-8",
+            "Location": "https://hh.ru/account/captcha?backurl=SECRET&state=PRIVATE",
+            "X-Request-Id": "1762520699abc-def",
+            "Set-Cookie": "hhtoken=SECRET",
+        })
+        response._content = ("<html><title>Иван Петров</title><input name=_xsrf value=SECRET>"
+                             "Подтвердите, что вы не робот: captcha</html>").encode()
+        self.sender.return_value = response
+        with redirect_stdout(StringIO()), self.assertRaises(SystemExit) as caught:
+            self.gate.send(None, test_response())
+        message = str(caught.exception)
+        for expected in ("HTTP 403", "content_type=text/html", "location=/account/captcha",
+                         "request_id=1762520699abc-def", "markers=captcha,xsrf",
+                         "check HH manually before any retry"):
+            self.assertIn(expected, message)
+        for forbidden in ("SECRET", "PRIVATE", "Иван", "hhtoken", LETTER, RESUME):
+            self.assertNotIn(forbidden, message)
+        self.assertEqual(self.gate.counts["attempts"], 1)
+        self.assertEqual(self.gate.counts["http_success"], 0)
+
+    def form_captcha_gate(self, *responses, solution=None):
+        self.gate.current = VACANCY | {"has_test": True}
+        self.sender.side_effect = list(responses)
+        self.sender.return_value = None
+        tool = Mock()
+        tool._can_use_tkinter.return_value = True
+        tool.solve_captcha.return_value = solution or SimpleNamespace(text=" abc12 ", key="KEY", state="STATE")
+        self.gate.operation = SimpleNamespace(tool=tool)
+        self.gate.approve = Mock(return_value="yes")
+        return tool
+
+    @staticmethod
+    def form_captcha(state="STATE-1"):
+        return SimpleNamespace(status_code=403, headers={"Content-Type": "application/json"},
+                               content=b"{}", json=lambda: {"hhcaptcha": {
+                                   "isBot": False, "captchaState": state, "captchaError": False}})
+
+    def test_test_send_in_form_captcha_is_solved_once_and_resent_with_solution(self):
+        accepted = Mock(status_code=200, json=Mock(return_value={"success": "true"}))
+        tool = self.form_captcha_gate(self.form_captcha(), accepted)
+        request = test_response()
+        request.headers["Referer"] = "https://hh.ru/vacancy/123"
+        output = StringIO()
+        with redirect_stdout(output), redirect_stderr(StringIO()):
+            self.gate.send(None, request)
+        tool.solve_captcha.assert_called_once_with(
+            "STATE-1", referer_url="https://hh.ru/vacancy/123", session=tool.session)
+        self.assertIs(tool.captcha_manual, True)
+        self.assertEqual(self.sender.call_count, 2)
+        self.assertEqual(self.gate.approve.call_count, 2)
+        self.assertIn(self.gate.captcha_retry_message, output.getvalue())
+        first, retry = (call.args[1] for call in self.sender.call_args_list)
+        self.assertIs(first, request)
+        sent = parse_qs(retry.body)
+        original = parse_qs(request.body)
+        self.assertEqual({k: v for k, v in sent.items() if not k.startswith("captcha")}, original)
+        self.assertEqual(sent["captchaText"], ["abc12"])
+        self.assertEqual(sent["captchaKey"], ["KEY"])
+        self.assertEqual(sent["captchaState"], ["STATE-1"])
+        self.assertEqual(retry.headers["Content-Length"], str(len(retry.body)))
+        self.assertEqual(self.gate.counts, self.gate.counts | {
+            "attempts": 2, "captcha_rejections": 1, "http_success": 1})
+        self.assertFalse(self.gate.captcha_active)
+
+    def test_test_send_repeated_or_cancelled_in_form_captcha_stops(self):
+        self.form_captcha_gate(self.form_captcha(), self.form_captcha("STATE-2"))
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
+                self.assertRaisesRegex(SystemExit, "Repeated HH captcha"):
+            self.gate.send(None, test_response())
+        self.assertEqual(self.sender.call_count, 2)
+
+        self.gate.letter = LETTER
+        self.sender.reset_mock()
+        tool = self.form_captcha_gate(self.form_captcha())
+        tool.solve_captcha.side_effect = RuntimeError("closed window SECRET")
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
+                self.assertRaises(SystemExit) as caught:
+            self.gate.send(None, test_response())
+        self.assertIn("cancelled", str(caught.exception))
+        self.assertNotIn("SECRET", str(caught.exception))
+        self.sender.assert_called_once()
+        self.assertFalse(self.gate.captcha_active)
+
+        self.gate.letter = LETTER
+        self.sender.reset_mock()
+        self.form_captcha_gate(self.form_captcha(), solution=SimpleNamespace(text="  ", key="KEY"))
+        with redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
+                self.assertRaisesRegex(SystemExit, "not entered"):
+            self.gate.send(None, test_response())
+        self.sender.assert_called_once()
+
+    def test_form_captcha_state_is_strict(self):
+        from manual_captcha import form_captcha_state
+        self.assertEqual(form_captcha_state(self.form_captcha("abc")), "abc")
+        for state in ("", "a b", "a\nb", 5, None, "x" * 4097, "сост"):
+            with self.subTest(state=state):
+                self.assertIsNone(form_captcha_state(self.form_captcha(state)))
+        self.assertIsNone(form_captcha_state(SimpleNamespace(status_code=200, json=lambda: {
+            "hhcaptcha": {"captchaState": "abc"}})))
+        self.assertIsNone(form_captcha_state(SimpleNamespace(status_code=403)))
+
+    def test_test_payload_cannot_smuggle_captcha_fields(self):
+        self.gate.current = VACANCY | {"has_test": True}
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "captcha fields"):
+            self.gate.send(None, test_response(captchaText="x"))
+        self.sender.assert_not_called()
+
+    def test_failure_summary_handles_json_external_location_and_bare_responses(self):
+        from send import response_failure_detail
+        detail = response_failure_detail(SimpleNamespace(
+            status_code=403, headers={"Content-Type": "application/json",
+                                      "Location": "https://evil.invalid/x?token=SECRET",
+                                      "X-Request-Id": "bad id\nSECRET"},
+            content=b'{"errors": []}',
+            json=lambda: {"errors": [{"type": "forbidden", "value": "captcha_required",
+                                      "captcha_url": "https://hh.ru/account/captcha?SECRET"},
+                                     {"value": "bad value with spaces"}]}))
+        self.assertIn("location=external", detail)
+        self.assertIn("json_errors=forbidden,captcha_required", detail)
+        self.assertIn("json_keys=errors", detail)
+        nested = response_failure_detail(SimpleNamespace(
+            status_code=403, json=lambda: {"captcha": {"url": "SECRET", "bad key": 1}, "x y": 2}))
+        self.assertIn("json_keys=captcha,captcha.url", nested)
+        self.assertNotIn("SECRET", nested)
+        self.assertNotIn("bad key", nested)
+        self.assertNotIn("SECRET", detail)
+        self.assertNotIn("request_id", detail)
+        self.assertEqual(response_failure_detail(SimpleNamespace(status_code=403)),
+                         "content_type=unknown; body_bytes=0")
 
     def test_test_skip_and_stop(self):
         self.gate.current = VACANCY | {"has_test": True}
@@ -263,14 +398,17 @@ class SendChecks(unittest.TestCase):
         self.gate.operation = SimpleNamespace(api_client=Mock(get=Mock(return_value=VACANCY)))
         self.gate.original_complete = Mock(side_effect=error)
         self.gate.letter = None
-        with self.assertRaises(SystemExit) as caught:
+        self.gate.generation_skips = 1
+        with redirect_stdout(StringIO()), self.assertRaises(SystemExit) as caught:
             self.gate.complete(None, "PRIVATE")
         message = str(caught.exception)
         self.assertIn("ChatGPT connect timeout after 2 attempts", message)
         self.assertIn("request_id=" + "a" * 32, message)
         self.assertIn("no application sent for this vacancy", message)
+        self.assertIn("3 rounds failed for 2 vacancies in a row", message)
         self.assertNotIn("PRIVATE", message)
-        self.gate.original_complete.assert_called_once()
+        self.assertEqual(self.gate.original_complete.call_count, 3)
+        self.assertEqual(self.gate.sleep.call_count, 2)
         self.sender.assert_not_called()
         self.assertEqual(self.gate.counts["attempts"], 0)
         self.assertEqual(self.gate.counts["letters"], 0)
@@ -347,7 +485,10 @@ class SendChecks(unittest.TestCase):
                 if generation_failure is not None:
                     body["error"]["generation_failure"] = generation_failure
                 reply = self.gateway_reply(status, body)
-                gate = ApprovalGate(RESUME, None, approve=Mock(side_effect=AssertionError("No approval")))
+                gate = ApprovalGate(RESUME, None, approve=Mock(side_effect=AssertionError("No approval")),
+                                    sleep=Mock())
+                gate.generation_skips = 1
+                rounds = 3 if prefix.startswith("Stopped: ChatGPT") else 1
                 generating = []
                 sender = Mock(side_effect=lambda *args, **kwargs: (
                     generating.append(gate._generating), reply(*args, **kwargs))[1])
@@ -357,10 +498,14 @@ class SendChecks(unittest.TestCase):
                 gate.operation = SimpleNamespace(api_client=Mock(get=Mock(return_value=VACANCY)))
                 gate.original_complete = OpenAIClient.complete
                 client = OpenAIClient(base_url="http://127.0.0.1:8000/v1", model="test")
+                # The fake gate.sleep takes no time, so the client's own request pacing
+                # would sleep between gate rounds; the guard below targets replay delays.
+                client.delay = 0
                 with patch.object(requests.sessions.Session, "send",
                                   lambda session, request, **kwargs: gate.send(session, request, **kwargs)),                         patch("hh_applicant_tool.ai.openai.time.sleep",
                               side_effect=AssertionError("No replay delay")) as sleep,                         self.assertRaises(SystemExit) as caught:
-                    gate.complete(client, "PRIVATE prompt")
+                    with redirect_stdout(StringIO()):
+                        gate.complete(client, "PRIVATE prompt")
                 client.session.close()
                 message = str(caught.exception)
                 self.assertTrue(message.startswith(prefix), message)
@@ -368,9 +513,11 @@ class SendChecks(unittest.TestCase):
                 self.assertNotIn("Stopped after HTTP", message)
                 self.assertNotIn("PRIVATE", message)
                 self.assertNotIn("INJECTED", message)
-                sender.assert_called_once()  # No replay by HH's OpenAI client or the gate.
+                # No replay by HH's OpenAI client; the gate repeats only connect failures.
+                self.assertEqual(sender.call_count, rounds)
+                self.assertEqual(gate.sleep.call_count, rounds - 1)
                 sleep.assert_not_called()
-                self.assertEqual(generating, [True])
+                self.assertEqual(generating, [True] * rounds)
                 self.assertIs(gate._generating, False)
                 self.assertEqual(client.max_retries, 3)
                 request = sender.call_args.args[1]
@@ -640,13 +787,110 @@ class SendChecks(unittest.TestCase):
             self.gate.send(None, negotiation())
         self.sender.assert_not_called()
 
-    def test_uncertain_result_stops_without_retry(self):
+    def test_uncertain_result_stops_when_status_check_fails(self):
         self.sender.side_effect = requests.ConnectionError("connection dropped")
-        with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "outcome uncertain"):
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(
+                SystemExit, "outcome uncertain.*status check failed"):
             self.gate.send(None, negotiation())
-        self.sender.assert_called_once()
+        self.assertEqual([call.args[1].method for call in self.sender.call_args_list], ["POST", "GET"])
         self.assertEqual(self.gate.counts["attempts"], 1)
         self.assertEqual(self.gate.counts["http_success"], 0)
+
+    def status_reply(self, relations, status=200):
+        import json
+        response = requests.Response()
+        response.status_code = status
+        response._content = json.dumps({"id": "123", "relations": relations}).encode()
+        return response
+
+    def test_lost_answer_with_application_in_hh_is_counted_without_repeat(self):
+        resolved = []
+        post = negotiation()
+        post.headers["Authorization"] = "Bearer USERtoken"
+        self.sender.side_effect = [requests.ReadTimeout("PRIVATE"), self.status_reply(["got_response"])]
+        with patch.object(ApprovalGate, "on_send_resolved", staticmethod(resolved.append)), \
+                redirect_stdout(StringIO()) as output:
+            response = self.gate.send(None, post)
+        self.assertEqual((response.status_code, response.text), (201, ""))
+        check = self.sender.call_args_list[1]
+        self.assertEqual((check.args[1].method, check.args[1].url),
+                         ("GET", "https://api.hh.ru/vacancies/123"))
+        self.assertEqual(check.args[1].headers["Authorization"], "Bearer USERtoken")
+        self.assertIsNone(check.args[1].body)
+        self.assertEqual(check.kwargs["timeout"], (10, 30))
+        self.assertEqual(self.sender.call_count, 2)
+        self.gate.sleep.assert_called_once_with(15)
+        self.assertEqual(resolved, ["sent"])
+        self.assertEqual((self.gate.counts["attempts"], self.gate.counts["http_success"]), (1, 1))
+        self.assertIn("отклик есть в HH", output.getvalue())
+
+    def test_lost_answer_without_application_repeats_post_once(self):
+        resolved, events = [], []
+        self.gate.observer = lambda name, value: events.append((name, value))
+        ok = SimpleNamespace(status_code=201)
+        self.sender.side_effect = [requests.ReadTimeout("x"), self.status_reply([]), ok]
+        with patch.object(ApprovalGate, "on_send_resolved", staticmethod(resolved.append)), \
+                redirect_stdout(StringIO()):
+            self.assertIs(self.gate.send(None, negotiation()), ok)
+        calls = self.sender.call_args_list
+        self.assertEqual([call.args[1].method for call in calls], ["POST", "GET", "POST"])
+        self.assertIs(calls[2].args[1], calls[0].args[1])  # The identical approved request.
+        self.assertEqual(resolved, ["absent"])
+        self.assertEqual((self.gate.counts["attempts"], self.gate.counts["http_success"]), (1, 1))
+        self.assertEqual([value for name, value in events if name == "retry"], ["send_check", "send_retry"])
+
+    def test_repeated_lost_answer_stops_without_a_third_post(self):
+        self.sender.side_effect = [requests.ReadTimeout("x"), self.status_reply([]),
+                                   requests.ReadTimeout("x")]
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(
+                SystemExit, "outcome uncertain after one checked repeat.*ReadTimeout"):
+            self.gate.send(None, negotiation())
+        self.assertEqual(self.sender.call_count, 3)
+        self.assertEqual((self.gate.counts["attempts"], self.gate.counts["http_success"]), (1, 0))
+
+    def test_unclear_status_answer_forbids_a_repeat(self):
+        for reply in (self.status_reply([], status=403), self.status_reply(None),
+                      SimpleNamespace(status_code=200, json=Mock(side_effect=ValueError)),
+                      requests.ConnectionError("x")):
+            with self.subTest(reply=reply):
+                self.gate.letter = LETTER
+                self.sender.reset_mock()
+                self.sender.side_effect = [requests.ReadTimeout("x"), reply]
+                with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "status check failed"):
+                    self.gate.send(None, negotiation())
+                self.assertEqual(self.sender.call_count, 2)
+
+    def test_connect_failure_retries_generation_then_skips_vacancy(self):
+        from hh_applicant_tool.ai.base import AIError
+        import json
+        response = requests.Response()
+        response.status_code = 502
+        response._content = json.dumps({"error": {"generation_failure": {
+            "kind": "tls_handshake_timeout", "attempts": 4, "connect_retry_exhausted": True}}}).encode()
+        error = OpenAIError("PRIVATE")
+        error.__cause__ = requests.HTTPError("PRIVATE", response=response)
+        events = []
+        self.gate.observer = lambda name, value: events.append((name, value))
+        self.gate.operation = SimpleNamespace(api_client=Mock(get=Mock(return_value=VACANCY)))
+        # Recovers on the third round: the letter is used and the skip counter is reset.
+        self.gate.generation_skips = 1
+        self.gate.original_complete = Mock(side_effect=[error, error, LETTER])
+        with redirect_stdout(StringIO()):
+            self.assertEqual(self.gate.complete(None, "prompt"), LETTER)
+        self.assertEqual(self.gate.generation_skips, 0)
+        self.assertEqual([call.args for call in self.gate.sleep.call_args_list], [(30,), (30,)])
+        # Three failed rounds: skip this vacancy through upstream's AIError handling.
+        self.gate.original_complete = Mock(side_effect=error)
+        with redirect_stdout(StringIO()), self.assertRaises(AIError):
+            self.gate.complete(None, "prompt")
+        self.assertEqual(self.gate.original_complete.call_count, 3)
+        self.assertIsNone(self.gate.letter)
+        self.assertEqual(self.gate.generation_skips, 1)
+        self.assertEqual(events[-1], ("retry", "generation_skip"))
+        # The next vacancy fails too: the provider is down, stop the run.
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "2 vacancies in a row"):
+            self.gate.complete(None, "prompt")
+        self.sender.assert_not_called()
 
     def test_transport_failure_diagnostics_are_allowlisted_and_redacted(self):
         secret = "Bearer SECRET https://user:password@proxy.invalid/?token=SECRET message=PRIVATE"
@@ -675,8 +919,11 @@ class SendChecks(unittest.TestCase):
                 self.assertIn("check HH manually before any retry", message)
                 for forbidden in ("SECRET", "password", "PRIVATE", "proxy.invalid", LETTER, RESUME):
                     self.assertNotIn(forbidden, message)
+                self.assertIn("status check failed", message)
                 self.assertTrue(caught.exception.__suppress_context__)
-                self.sender.assert_called_once()
+                # The POST and one status read; the failed read forbids a repeat POST.
+                self.assertEqual([call.args[1].method for call in self.sender.call_args_list],
+                                 ["POST", "GET"])
                 self.assertIsNone(self.gate.letter)
 
     def test_diagnostic_vacancy_id_cannot_inject_text(self):
@@ -734,7 +981,7 @@ class SendChecks(unittest.TestCase):
             client.post("/negotiations", {
                 "resume_id": RESUME, "vacancy_id": "123", "message": LETTER,
             })
-        self.sender.assert_called_once()
+        self.assertEqual([call.args[1].method for call in self.sender.call_args_list], ["POST", "GET"])
         self.assertEqual(self.gate.counts["attempts"], 1)
         client.session.close()
 
@@ -818,8 +1065,9 @@ class SendChecks(unittest.TestCase):
         })
         for second in (challenge, requests.ConnectionError("lost response")):
             with self.subTest(second=second):
-                sender = Mock(side_effect=[challenge, second])
-                gate = ApprovalGate(RESUME, sender, approve=Mock(side_effect=["yes", "yes"]))
+                sender = Mock(side_effect=[challenge, second, second])
+                gate = ApprovalGate(RESUME, sender, approve=Mock(side_effect=["yes", "yes"]),
+                                    sleep=Mock())
                 gate.current, gate.letter = VACANCY.copy(), LETTER
                 handler = Mock(return_value=True)
                 gate.operation = SimpleNamespace(tool=SimpleNamespace(
@@ -827,7 +1075,8 @@ class SendChecks(unittest.TestCase):
                 ))
                 with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
                     gate.send(None, negotiation())
-                self.assertEqual(sender.call_count, 2)
+                # A lost answer adds one status read that fails here; no third POST.
+                self.assertEqual(sender.call_count, 2 if second is challenge else 3)
                 handler.assert_called_once()
                 self.assertEqual(gate.counts["attempts"], 2)
                 self.assertEqual(gate.counts["http_success"], 0)
@@ -876,7 +1125,7 @@ class SendChecks(unittest.TestCase):
     def test_run_wires_approval_to_real_post_boundary_without_network(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = arguments(str(profile), RESUME, "DevOps")
@@ -913,7 +1162,7 @@ class SendChecks(unittest.TestCase):
         # Upstream calls self._solve_vacancy_test(vacancy_id=..., ...) with keywords only.
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = arguments(str(profile), RESUME, "DevOps")
@@ -938,7 +1187,7 @@ class SendChecks(unittest.TestCase):
     def test_more_than_three_vacancies_no_then_yes_then_stop(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = arguments(str(profile), RESUME, "DevOps")
@@ -985,7 +1234,7 @@ class SendChecks(unittest.TestCase):
         mapping = load_searches()
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = all_resume_arguments(str(profile), RESUME)

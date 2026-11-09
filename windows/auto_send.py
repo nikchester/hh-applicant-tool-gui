@@ -38,10 +38,11 @@ class AutoGate(ApprovalGate):
             f"случайная пауза {min_pause}–{max_pause} с между отправками. "
             "Письма отправляются БЕЗ отдельного подтверждения. "
             "При капче вводи текст вручную в окне; после решения отправка продолжится. "
-            "Остальные ошибки останавливают запуск без повторов. Ctrl+C — остановка."
+            "Сбой связи с AI-провайдером — до 3 попыток на вакансию; потерянный ответ HH — проверка "
+            "и не больше одного повтора. Остальные ошибки останавливают запуск. Ctrl+C — остановка."
         )
 
-        super().__init__(resume_id, sender, approve=self.wait_before_send)
+        super().__init__(resume_id, sender, approve=self.wait_before_send, sleep=sleep)
 
     def check_limit(self):
         if self.counts["http_success"] >= self.max_responses:
@@ -81,13 +82,13 @@ def main(argv=None):
     except ValueError as error:
         parser.error(str(error))
     config_dir = os.environ.get("CONFIG_DIR", "")
-    all_resumes = os.environ.get("POCKETNODE_HH_ALL") == "1"
+    all_resumes = os.environ.get("HH_APPLICANT_TOOL_ALL") == "1"
     if all_resumes:
         config = tomllib.loads((Path(config_dir) / "config.toml").read_text(encoding="utf-8"))
         hh_args = all_resume_arguments(config_dir, config["general"]["cover_letter_resume_id"])
     else:
-        hh_args = arguments(config_dir, os.environ.get("POCKETNODE_HH_RESUME_ID", ""),
-                            os.environ.get("POCKETNODE_HH_SEARCH", ""))
+        hh_args = arguments(config_dir, os.environ.get("HH_APPLICANT_TOOL_RESUME_ID", ""),
+                            os.environ.get("HH_APPLICANT_TOOL_SEARCH", ""))
     return run(hh_args, all_resumes=all_resumes, gate_factory=partial(
         AutoGate, max_responses=options.max_responses,
         min_pause=options.min_pause, max_pause=options.max_pause))

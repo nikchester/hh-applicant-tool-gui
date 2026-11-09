@@ -87,10 +87,15 @@ class PackagingChecks(unittest.TestCase):
     def test_smoke_guard_rejects_network_and_personal_paths(self):
         for event, args in (("socket.connect", ()), ("socket.bind", ()),
                             ("socket.getaddrinfo", ()), ("open", ("auth.json",)),
-                            ("open", ("C:/synthetic/.config/pocketnode-hh-gui/settings.txt",))):
+                            ("open", ("C:/synthetic/.config/hh-applicant-tool-gui/settings.txt",))):
             with self.assertRaises(RuntimeError):
                 smoke.deny_external_io(event, args)
         smoke.deny_external_io("open", ("config.example.toml",))
+        for profile in ("C:/u/.config/pocketnode-hh/config.toml", "C:/u/.local/state/hh-applicant-tool-cli/run/x"):
+            with self.assertRaises(RuntimeError):
+                smoke.deny_external_io("open", (profile,))
+        # The portable app folder shares the GUI profile name but is not a profile.
+        smoke.deny_external_io("open", ("C:/dist/app/hh-applicant-tool-gui/_internal/config.example.toml",))
 
     def test_gateway_smoke_exception_allows_only_its_exact_synthetic_fixture(self):
         fixture = Path("synthetic-temp/auth.json").absolute()
@@ -125,7 +130,10 @@ class PackagingChecks(unittest.TestCase):
         self.assertIn("{userdesktop}", active)
         self.assertNotIn("[UninstallDelete]", active)
         self.assertNotIn("[Run]", active)
-        self.assertNotIn("pocketnode-hh-gui", active)
+        # No profile folders: uninstall must never touch ~/.config or ~/.local/state.
+        self.assertNotIn(".config", active)
+        self.assertNotIn(".local", active)
+        self.assertIn('Type: files; Name: "{app}\PocketNodeHH.exe"', active)
 
     def test_compiler_pin_uses_actual_engine_not_unreliable_pe_version(self):
         probe = (PACKAGING / "compiler-version.iss").read_text(encoding="utf-8")
@@ -141,7 +149,7 @@ class PackagingChecks(unittest.TestCase):
         self.assertEqual(pins, manifest.BUILD_PINS)
         hook = (PACKAGING / "hooks/hook-hh_applicant_tool.py").read_text(encoding="utf-8")
         self.assertIn('"hh_applicant_tool.operations": "pyz+py"', hook)
-        spec = (PACKAGING / "PocketNodeHH.spec").read_text(encoding="utf-8")
+        spec = (PACKAGING / "hh-applicant-tool-gui.spec").read_text(encoding="utf-8")
         self.assertIn("console=False", spec)
         self.assertIn("hiddenimports=list(APP_MODULES)", spec)
         self.assertIn("upx=False", spec)

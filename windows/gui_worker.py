@@ -15,7 +15,7 @@ from gui_protocol import ACTIONS, Cancelled, ProtocolError, ReviewAdapter, Worke
 
 def environment():
     return {"CONFIG_DIR": str(profile_dir()), "HH_PROFILE_ID": ".",
-            "POCKETNODE_HH_SEARCH_FILE": str(search_path()),
+            "HH_APPLICANT_TOOL_SEARCH_FILE": str(search_path()),
             "CHATGPT_LOCAL_HOME": str(state_dir() / "chatmock"),
             "CODEX_HOME": str(state_dir() / "chatmock")}
 
@@ -151,7 +151,7 @@ def dispatch(action, settings, channel):
     argv = (send.all_resume_arguments(str(profile), None, generic=True) if settings["all"] else
             send.arguments(str(profile), settings["resume"], settings["search"]))
     if action == "apply":
-        factory = partial(send.ApprovalGate, review=review)
+        factory = partial(send.ApprovalGate, review=review, sleep=channel.sleep)
     elif action == "auto":
         from auto_send import AutoGate
         factory = partial(AutoGate, max_responses=settings["limit"], min_pause=settings["min_pause"],
@@ -182,11 +182,15 @@ def worker_main(reader=None, writer=None):
     channel = None
     counts = {"attempts": 0, "http_success": 0, "captcha_rejections": 0}
     success, cancelled = False, False
+    network = {"host": None}  # Host of the last unanswered request; a later answer clears it.
     try:
         start = decode(reader.readline(1024 * 1024 + 1))
         action, settings = validate_start(start)
         channel = WorkerChannel(reader, writer, start["run"])
         channel.listen()
+        import manual_captcha
+        # One worker process serves one run, so a class-level hook is safe here.
+        manual_captcha.ManualCaptcha.on_prompt = lambda: channel.event("captcha", True)
         import requests
         original = requests.sessions.Session.send
 
@@ -194,19 +198,29 @@ def worker_main(reader=None, writer=None):
             channel.check()  # Covers reads, redirects, captcha and the final POST.
             from urllib.parse import urlsplit
             path = urlsplit(request.url).path
-            sending = request.method == "POST" and path in {"/negotiations", "/chatik/api/send"}
+            sending = request.method == "POST" and path in {
+                "/negotiations", "/chatik/api/send", "/applicant/vacancy_response/popup"}
             if sending:
                 counts["attempts"] += 1
                 channel.event("sending", True)
             if kwargs.get("timeout") is None:
                 kwargs["timeout"] = (10, 60)
             try:
-                response = original(session, request, **kwargs)
+                try:
+                    response = original(session, request, **kwargs)
+                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+                    network["host"] = (urlsplit(request.url).hostname or "").lower() or None
+                    raise
+                network["host"] = None
                 if sending and 200 <= response.status_code < 300:
                     counts["http_success"] += 1
                 elif sending and path == "/negotiations" and response.status_code == 403:
                     from manual_captcha import captcha_url
                     if captcha_url(response):
+                        counts["captcha_rejections"] += 1
+                elif sending and path == "/applicant/vacancy_response/popup":
+                    from manual_captcha import form_captcha_state
+                    if form_captcha_state(response):
                         counts["captcha_rejections"] += 1
                 return response
             finally:
@@ -244,6 +258,16 @@ def worker_main(reader=None, writer=None):
                 model = config.get("openai", {}).get("default", {}).get("model")
                 if not isinstance(model, str) or not model.strip() or model == "CHOOSE_AFTER_LOGIN":
                     raise ProtocolError("Choose an account model before generation")
+            if action in {"apply", "auto"}:
+                import send
+
+                def resolved(kind):
+                    # A POST without an answer, settled by a status check in HH.
+                    if kind == "sent":
+                        counts["http_success"] += 1
+                    elif kind == "absent" and counts["attempts"] > 0:
+                        counts["attempts"] -= 1  # It provably created nothing in HH.
+                send.ApprovalGate.on_send_resolved = staticmethod(resolved)
             channel.check()
             result = dispatch(action, settings, channel)
             channel.check()
@@ -262,10 +286,14 @@ def worker_main(reader=None, writer=None):
         pass  # Never serialize an upstream exception or credential-bearing URL.
     finally:
         if channel is not None:
+            from gui_protocol import valid_network_host
+            done = {"success": success, "cancelled": cancelled,
+                    "unknown": counts["attempts"] - counts["captcha_rejections"] != counts["http_success"],
+                    "counts": counts}
+            if not success and not cancelled and valid_network_host(network["host"]):
+                done["network"] = network["host"]
             try:
-                channel.emit("done", {"success": success, "cancelled": cancelled,
-                                      "unknown": counts["attempts"] - counts["captcha_rejections"] != counts["http_success"],
-                                      "counts": counts})
+                channel.emit("done", done)
             except (OSError, ValueError):
                 pass
     return 0 if success else 1

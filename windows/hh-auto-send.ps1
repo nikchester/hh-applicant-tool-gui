@@ -9,9 +9,12 @@ param(
 $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $python = Join-Path $repo 'venvs\hh\Scripts\python.exe'
-$env:CONFIG_DIR = Join-Path $HOME '.config\pocketnode-hh'
+$env:CONFIG_DIR = Join-Path $HOME '.config\hh-applicant-tool-cli'
 $env:HH_PROFILE_ID = '.'
 if (-not (Test-Path -LiteralPath $python)) { throw 'Run windows/bootstrap.ps1 first.' }
+# Move pre-rename PocketNode profile folders once; refuses to merge or delete.
+& $python -I (Join-Path $PSScriptRoot 'profile_migration.py')
+if ($LASTEXITCODE -ne 0) { throw 'Legacy profile migration failed.' }
 . (Join-Path $PSScriptRoot 'ensure-chatmock.ps1')
 . (Join-Path $PSScriptRoot 'select-resume.ps1')
 
@@ -19,12 +22,12 @@ $previousEncoding = [Console]::OutputEncoding
 $previousPythonEncoding = $env:PYTHONIOENCODING
 $previousChatHome = $env:CHATGPT_LOCAL_HOME
 $previousCodexHome = $env:CODEX_HOME
-$previousAll = $env:POCKETNODE_HH_ALL
-$previousResume = $env:POCKETNODE_HH_RESUME_ID
-$previousSearch = $env:POCKETNODE_HH_SEARCH
+$previousAll = $env:HH_APPLICANT_TOOL_ALL
+$previousResume = $env:HH_APPLICANT_TOOL_RESUME_ID
+$previousSearch = $env:HH_APPLICANT_TOOL_SEARCH
 $ownedGateway = $null
 $runSucceeded = $false
-$runMutex = New-Object System.Threading.Mutex($false, 'Local\PocketNode-HH-Run')
+$runMutex = New-Object System.Threading.Mutex($false, 'Local\hh-applicant-tool-gui-run')
 $runLocked = $false
 try {
     if (-not $runMutex.WaitOne(0)) { throw 'Another HH run is active. Finish it before starting this one.' }
@@ -40,14 +43,14 @@ try {
     [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
     $env:PYTHONIOENCODING = 'utf-8'
     if ($ResumeId) {
-        $env:POCKETNODE_HH_ALL = $null
-        $env:POCKETNODE_HH_RESUME_ID = $ResumeId
-        $env:POCKETNODE_HH_SEARCH = Resolve-HHSearchText -Repo $repo -ResumeId $ResumeId -OverrideText $SearchText
+        $env:HH_APPLICANT_TOOL_ALL = $null
+        $env:HH_APPLICANT_TOOL_RESUME_ID = $ResumeId
+        $env:HH_APPLICANT_TOOL_SEARCH = Resolve-HHSearchText -Repo $repo -ResumeId $ResumeId -OverrideText $SearchText
     } else {
         if ($SearchText) { throw 'Use -ResumeId with -SearchText; all resumes use their own saved searches.' }
-        $env:POCKETNODE_HH_ALL = '1'
-        $env:POCKETNODE_HH_RESUME_ID = $null
-        $env:POCKETNODE_HH_SEARCH = $null
+        $env:HH_APPLICANT_TOOL_ALL = '1'
+        $env:HH_APPLICANT_TOOL_RESUME_ID = $null
+        $env:HH_APPLICANT_TOOL_SEARCH = $null
     }
     $ownedGateway = Start-ChatMockForHH
     & $python (Join-Path $repo 'windows\auto_send.py') --max-responses $MaxResponses --min-pause $MinPauseSeconds --max-pause $MaxPauseSeconds
@@ -63,9 +66,9 @@ try {
         $env:PYTHONIOENCODING = $previousPythonEncoding
         $env:CHATGPT_LOCAL_HOME = $previousChatHome
         $env:CODEX_HOME = $previousCodexHome
-        $env:POCKETNODE_HH_ALL = $previousAll
-        $env:POCKETNODE_HH_RESUME_ID = $previousResume
-        $env:POCKETNODE_HH_SEARCH = $previousSearch
+        $env:HH_APPLICANT_TOOL_ALL = $previousAll
+        $env:HH_APPLICANT_TOOL_RESUME_ID = $previousResume
+        $env:HH_APPLICANT_TOOL_SEARCH = $previousSearch
     }
 }
 if ($exitCode -ne 0) { throw "HH auto send stopped (exit $exitCode); check the summary and HH account before retrying" }

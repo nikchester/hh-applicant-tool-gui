@@ -13,7 +13,7 @@ from resume_context import selected_resume_context
 
 def load_searches(path=None):
     from gui_profile import validate_searches
-    source = Path(path or os.environ.get("POCKETNODE_HH_SEARCH_FILE")
+    source = Path(path or os.environ.get("HH_APPLICANT_TOOL_SEARCH_FILE")
                   or Path(__file__).with_name("resume-search.json"))
     try:
         mapping = validate_searches(json.loads(source.read_text(encoding="utf-8")))

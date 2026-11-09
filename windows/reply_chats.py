@@ -26,6 +26,7 @@ from hh_applicant_tool.operations.reply_chats import BOT_RECRUITER_ANSWER, Opera
 from hh_applicant_tool.tool import HHApplicantTool
 from manual_captcha import ManualCaptcha
 from hh_network_diagnostics import NetworkDiagnostics, NoDiagnostics, target as diagnostic_target
+from hh_fallback import chatik_fallback
 
 
 def arguments(config):
@@ -294,8 +295,9 @@ def chat_send_failure_detail(error, chat_id):
 class ChatGate:
     def __init__(self, sender, approve=input, *, clock=time.monotonic,
                  sleep=time.sleep, poll_interval=2, wait_seconds=60, max_turns=20,
-                 diagnostics=None, review=None):
+                 diagnostics=None, review=None, observer=None):
         self.sender = sender
+        self.observer = observer  # GUI events; stdout is discarded there.
         self.diagnostics = diagnostics if diagnostics is not None else NoDiagnostics()
         self.captcha = ManualCaptcha()
         self.approve = approve
@@ -322,6 +324,10 @@ class ChatGate:
         self.chat_pages_incomplete = False
         self.counts = {"chats": 0, "drafts": 0, "skipped": 0,
                        "attempts": 0, "http_success": 0, "inspected": 0, "failures": 0}
+
+    def notify(self, name, data):
+        if self.observer is not None:
+            self.observer(name, data)
 
     def parse_chat_item(self, operation, item, *args, **kwargs):
         chat = self.original_parse_chat_item(operation, item, *args, **kwargs)
@@ -413,6 +419,7 @@ class ChatGate:
             raise SystemExit("Unexpected chat or resume")
         self.current, self.operation, self.generated = chat, operation, None
         self.completion_context, self.feedback = None, []
+        waiting = False  # True between "chat_wait" and its "chat_wait_end" event.
         try:
             data, items, me = self.snapshot()
             self.current_participant = me
@@ -444,6 +451,7 @@ class ChatGate:
                     return
                 if participant_left_after(items, question["id"]):
                     print(BOT_LEFT_NOTICE, flush=True)
+                    self.notify("chat_wait_end", "left")
                     return
                 if len(seen) >= self.max_turns:
                     break
@@ -451,6 +459,8 @@ class ChatGate:
                 deadline = self.clock() + self.wait_seconds
                 next_question = None
                 print(f"Ожидание следующего вопроса того же робота (до {self.wait_seconds:g} с).", flush=True)
+                waiting = True
+                self.notify("chat_wait", int(self.wait_seconds))
                 while self.clock() < deadline:
                     self.sleep(min(self.poll_interval, max(0, deadline - self.clock())))
                     if self.clock() >= deadline:
@@ -482,17 +492,30 @@ class ChatGate:
                         break
                     if participant_left_after(new, question["id"]):
                         print(BOT_LEFT_NOTICE, flush=True)
+                        waiting = False
+                        self.notify("chat_wait_end", "left")
                         return
+                waiting = False
                 if next_question is None:
                     print("Следующий вопрос не получен; ожидание завершено.", flush=True)
+                    self.notify("chat_wait_end", "timeout")
                     return
+                self.notify("chat_wait_end", "question")
                 question = next_question
             print("Достигнут лимит ответов роботу; чат остановлен.", flush=True)
         except ChatSkipped:
             self.counts["skipped"] += 1
             print(f"Пропущен чат {chat.vacancy_url}; новый ответ не отправлен.", flush=True)
+            if waiting:
+                waiting = False
+                self.notify("chat_wait_end", "skipped")
             return None
         finally:
+            if waiting:  # Stopped or failed mid-wait: the GUI countdown must end too.
+                try:
+                    self.notify("chat_wait_end", "stopped")
+                except Exception:  # noqa: BLE001 - never mask the original stop reason.
+                    pass
             self.current, self.operation, self.generated = None, None, None
             self.question, self.sent_text = None, None
             self.current_participant, self.poll_deadline = None, None
@@ -856,7 +879,8 @@ class ChatGate:
 def run(argv, approve=input, *, diagnostics_directory=None, profile=None, review=None, observer=None):
     args = validate(argv, profile=profile)
     diagnostics = NetworkDiagnostics(network_failure, diagnostics_directory)
-    gate = ChatGate(requests.sessions.Session.send, approve, diagnostics=diagnostics, review=review)
+    gate = ChatGate(requests.sessions.Session.send, approve, diagnostics=diagnostics, review=review,
+                    observer=observer)
     gate.original_chats = Operation.get_chats_awaiting_reply
     gate.original_process = Operation.process_chat
     gate.original_complete = OpenAIClient.complete
@@ -894,7 +918,7 @@ def run(argv, approve=input, *, diagnostics_directory=None, profile=None, review
         print("РЕЖИМ ЧАТОВ: yes/no/edit (e)/manual; edit — инструкция модели одной строкой; "
               "/cancel или пустая инструкция — отмена. manual — ввод ответа до /done, "
               "кнопки по номеру. После правки нужен отдельный yes.", flush=True)
-        with diagnostics.installed(), \
+        with diagnostics.installed(), chatik_fallback(observer), \
              patch.object(requests.sessions.Session, "send", guarded_send), \
              patch.object(Operation, "get_chats", cursor_chats), \
              patch.object(Operation, "get_chats_awaiting_reply", selected_chats), \

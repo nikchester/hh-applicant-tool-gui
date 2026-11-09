@@ -4,7 +4,7 @@ $ErrorActionPreference = 'Stop'
 $repo = Split-Path -Parent $PSScriptRoot
 $hh = Join-Path $repo 'venvs\hh\Scripts\python.exe'
 $chatmock = Join-Path $repo 'venvs\chatmock\Scripts\python.exe'
-$configDir = Join-Path $HOME '.config\pocketnode-hh'
+$configDir = Join-Path $HOME '.config\hh-applicant-tool-cli'
 $config = Join-Path $configDir 'config.toml'
 
 function Invoke-Checked([string]$Exe, [string[]]$Arguments) {
@@ -13,6 +13,8 @@ function Invoke-Checked([string]$Exe, [string[]]$Arguments) {
 }
 
 if (-not $Check) {
+    # Move pre-rename PocketNode profile folders once; refuses to merge or delete.
+    Invoke-Checked 'py' @('-3.12', '-I', (Join-Path $PSScriptRoot 'profile_migration.py'))
     New-Item -ItemType Directory -Force -Path (Join-Path $repo 'venvs'), $configDir | Out-Null
     if (-not (Test-Path -LiteralPath $hh)) {
         Invoke-Checked 'py' @('-3.12', '-m', 'venv', (Join-Path $repo 'venvs\hh'))

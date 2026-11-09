@@ -8,16 +8,16 @@ import tomllib
 
 
 def profile_dir():
-    return Path.home() / ".config/pocketnode-hh-gui"
+    return Path.home() / ".config/hh-applicant-tool-gui"
 
 
 def state_dir():
-    return Path.home() / ".local/state/pocketnode-hh-gui"
+    return Path.home() / ".local/state/hh-applicant-tool-gui"
 
 
 def expected_profile(profile=None):
     # Callers must explicitly opt in; arbitrary environment paths cannot redirect CLI.
-    expected = Path.home() / ".config/pocketnode-hh" if profile is None else Path(profile)
+    expected = Path.home() / ".config/hh-applicant-tool-cli" if profile is None else Path(profile)
     if profile is not None and expected != profile_dir():
         raise SystemExit("Unexpected GUI profile")
     return expected

@@ -533,6 +533,37 @@ class ConversationChecks(unittest.TestCase):
         self.assertEqual(self.now, 2)
         self.assertIn("Робот вышел из чата", output)
 
+    def test_follow_up_wait_reports_start_and_end_to_gui_observer(self):
+        def other_writes():
+            self.items.append(message(self.items[-1]["id"] + 1, "Человек", sender="other"))
+
+        def stop():
+            raise SystemExit("cancelled")
+        cases = (
+            (None, [("chat_wait", 60), ("chat_wait_end", "timeout")]),
+            ("question", [("chat_wait", 60), ("chat_wait_end", "question"), ("chat_wait_end", "left")]),
+            (other_writes, [("chat_wait", 60), ("chat_wait_end", "skipped")]),
+            (stop, [("chat_wait", 60), ("chat_wait_end", "stopped")]),
+        )
+        for hook, expected in cases:
+            with self.subTest(hook=getattr(hook, "__name__", hook)):
+                self.setUp()
+                events = []
+                self.gate.observer = lambda *event: events.append(event)
+                if hook == "question":
+                    def hook():
+                        if self.now == 2:
+                            self.items.extend([
+                                message(self.items[-1]["id"] + 1, "Второй вопрос", bot=True),
+                                event(self.items[-1]["id"] + 2, "PARTICIPANT_LEFT", sender="bot-service")])
+                if hook is not None:
+                    self.on_sleep = hook
+                try:
+                    self.run_chat()
+                except SystemExit:
+                    pass
+                self.assertEqual(events, expected)
+
     def test_join_during_follow_up_wait_is_ignored(self):
         def advance():
             if self.now == 2:
@@ -858,7 +889,7 @@ class ReplyChecks(unittest.TestCase):
     def test_fixed_args_and_config(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = arguments(str(profile))
@@ -1402,7 +1433,7 @@ class ReplyChecks(unittest.TestCase):
     def test_wrapper_patches_chat_effects_without_network(self):
         with tempfile.TemporaryDirectory() as temp:
             home = Path(temp)
-            profile = home / ".config/pocketnode-hh"
+            profile = home / ".config/hh-applicant-tool-cli"
             profile.mkdir(parents=True)
             shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
             argv = arguments(str(profile))
@@ -2592,6 +2623,81 @@ class NetworkDiagnosticChecks(unittest.TestCase):
         self.log.finish(successful=True, complete=True)
         self.assertFalse(self.log.path.exists())
         self.assertEqual(previous.read_text(), "previous run must remain")
+
+
+class ChatikFallbackChecks(unittest.TestCase):
+    """The spare HH node changes only the TCP address, never SNI or certificate checks."""
+
+    def run_connects(self, outcomes, connections=1, host="chatik.hh.ru", spare="10.0.0.2"):
+        from urllib3.connection import HTTPSConnection
+        from hh_fallback import chatik_fallback
+        calls, events, outcomes = [], [], list(outcomes)
+
+        def fake_connect(connection):
+            sock = Mock()
+            connection.sock = sock
+            # The TLS name urllib3 uses: server_hostname wins over host.
+            calls.append((connection._dns_host, connection.timeout,
+                          connection.server_hostname or connection.host, sock))
+            outcome = outcomes.pop(0)
+            if outcome is not None:
+                raise outcome
+        errors = []
+        with patch.object(HTTPSConnection, "connect", fake_connect):
+            with chatik_fallback(lambda *event: events.append(event), resolve=lambda: spare):
+                for _ in range(connections):
+                    connection = HTTPSConnection(host, 443, timeout=10)
+                    try:
+                        connection.connect()
+                    except Exception as error:  # noqa: BLE001 - the test inspects the type.
+                        errors.append(error)
+                    # Address change never leaks out of the connect call.
+                    self.assertEqual((connection._dns_host, connection.server_hostname), (host, None))
+            self.assertIs(HTTPSConnection.connect, fake_connect)  # Patch removed on exit.
+        return calls, events, errors
+
+    def test_stalled_node_switches_to_spare_node_once_and_stays_there(self):
+        calls, events, errors = self.run_connects([TimeoutError("handshake"), None, None], connections=2)
+        self.assertEqual(errors, [])
+        self.assertEqual([(c[0], c[1], c[2]) for c in calls], [
+            ("chatik.hh.ru", 4.0, "chatik.hh.ru"), ("10.0.0.2", 10, "chatik.hh.ru"),
+            ("10.0.0.2", 10, "chatik.hh.ru")])
+        calls[0][3].close.assert_called_once()  # The stalled socket is closed before the retry.
+        self.assertEqual(events, [("fallback", "chatik.hh.ru")])
+
+    def test_certificate_mismatch_is_never_retried(self):
+        calls, events, errors = self.run_connects([ssl.SSLCertVerificationError("bad cert")])
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(errors[0], ssl.SSLCertVerificationError)
+        self.assertEqual(events, [])
+
+    def test_other_hosts_and_missing_spare_keep_original_behaviour(self):
+        calls, events, errors = self.run_connects([TimeoutError("x")], host="api.hh.ru")
+        self.assertEqual([(c[0], c[1]) for c in calls], [("api.hh.ru", 10)])
+        self.assertIsInstance(errors[0], TimeoutError)
+        calls, events, errors = self.run_connects([TimeoutError("x")], spare=None)
+        self.assertEqual(len(calls), 1)
+        self.assertIsInstance(errors[0], TimeoutError)
+        self.assertEqual(events, [])
+
+    def test_spare_node_failure_reports_original_error_and_returns_to_dns(self):
+        first, spare = TimeoutError("primary"), ConnectionResetError("spare")
+        calls, events, errors = self.run_connects([first, spare])
+        self.assertIs(errors[0], first)
+        self.assertEqual(events, [])
+        calls, events, errors = self.run_connects([TimeoutError("p"), None, ConnectionResetError("s"), None],
+                                                  connections=2)
+        self.assertEqual(errors, [])
+        self.assertEqual([c[0] for c in calls], ["chatik.hh.ru", "10.0.0.2", "10.0.0.2", "chatik.hh.ru"])
+
+    def test_spare_address_excludes_chatik_own_addresses(self):
+        import hh_fallback
+        table = {"chatik.hh.ru": ["94.124.200.1"], "api.hh.ru": ["94.124.200.1", "94.124.200.0"]}
+        with patch.object(hh_fallback, "_addresses", lambda host: table[host]):
+            self.assertEqual(hh_fallback.fallback_address(), "94.124.200.0")
+        table["api.hh.ru"] = ["94.124.200.1"]
+        with patch.object(hh_fallback, "_addresses", lambda host: table[host]):
+            self.assertIsNone(hh_fallback.fallback_address())
 
 
 if __name__ == "__main__":
