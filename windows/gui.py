@@ -2,7 +2,7 @@
 
 import sys
 
-from gui_protocol import RETRY_NOTICES
+from gui_protocol import LETTER_REJECTIONS, RETRY_NOTICES
 
 
 APP_TITLE = "Автоотклики HH"
@@ -1045,6 +1045,7 @@ class Application:
 
     def prepare_run_view(self, action, limit):
         self.run_counts = {"vacancies": 0, "sent": 0, "limit": limit if action == "auto" else None}
+        self.stop_reason = None
         if getattr(self, "heading", None) is None:
             return
         if action in REVIEW_ACTIONS:
@@ -1493,7 +1494,17 @@ class Application:
             self.append_log(RETRY_NOTICES[value])
         elif name == "fallback" and value == "chatik.hh.ru":
             self.append_log("Узел chatik.hh.ru не ответил. Подключаюсь через резервный узел HH.")
+        elif (name == "letter_rejected" and isinstance(value, dict)
+              and value.get("reason") in LETTER_REJECTIONS and isinstance(value.get("text"), str)
+              and isinstance(value.get("vacancy"), dict)):
+            title = str(value["vacancy"].get("name") or "Вакансия")
+            employer = (value["vacancy"].get("employer") or {}).get("name")
+            self.append_log(f"Письмо отклонено проверкой: {value['reason']}. "
+                            "Вакансия пропущена, отклик не отправлен.")
+            self.append_log("Вакансия: " + title + (f" — {employer}" if employer else ""))
+            self.append_log("Отклонённое письмо: " + value["text"][:2000])
         elif name == "stopped" and isinstance(value, str):
+            self.stop_reason = value
             self.append_log("Причина остановки: " + value)
 
     def start_chat_wait(self, seconds):
@@ -1535,6 +1546,9 @@ class Application:
         elif done is not None and done.get("network"):
             message = (f"Нет связи с сервером {done['network']}. Проверь интернет или VPN и повтори."
                        " Подробности — в журнале.")
+        elif getattr(self, "stop_reason", None):
+            # Our own guard named the cause: a login/provider hint would point the wrong way.
+            message = f"Запуск остановлен проверкой: {self.stop_reason}. Подробности — в журнале."
         else:
             message = FAILURE_HINTS.get(action, "Не удалось завершить.") + " Подробности — в журнале."
         if done is not None and isinstance(done.get("counts"), dict) and any(done["counts"].values()):

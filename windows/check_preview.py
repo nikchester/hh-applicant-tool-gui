@@ -224,6 +224,15 @@ class PreviewTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             check_letter_level("Откликаюсь на Junior позицию.", {"name": "Middle DevOps"})
 
+    def test_level_check_ignores_words_that_only_contain_a_level(self):
+        for letter in ("Настраивал middleware и Kafka.", "Работал с MiddleEarth API.",
+                       "Обучал juniors в команде."):
+            with self.subTest(letter=letter):
+                check_letter_level(letter, {"name": "DevOps"})
+        for letter in ("Готов на Junior-позицию.", "Рассмотрю позицию миддла.", "Middle, если есть."):
+            with self.subTest(letter=letter), self.assertRaises(SystemExit):
+                check_letter_level(letter, {"name": "DevOps"})
+
     def test_vacancy_language_uses_description_not_technical_title(self):
         english = {"name": "DevOps Engineer", "description": (
             "<p>We are looking for an engineer to join our team. "

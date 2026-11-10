@@ -16,6 +16,10 @@ RETRY_NOTICES = {
     "send_confirmed": "Проверка: отклик есть в HH. Повтор не нужен.",
     "send_retry": "Проверка: отклика нет в HH. Отправляю отклик ещё раз.",
 }
+# Fixed reasons of the "letter_rejected" event: the GUI shows no other reason text.
+LETTER_LEVEL_REJECTED = "Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead"
+LETTER_LANGUAGE_REJECTED = "Письмо для англоязычной вакансии должно быть на английском"
+LETTER_REJECTIONS = frozenset({LETTER_LEVEL_REJECTED, LETTER_LANGUAGE_REJECTED})
 
 
 class Cancelled(BaseException):

@@ -880,6 +880,33 @@ class StepChecks(unittest.TestCase):
         self.assertNotIn("неизвестен", app.finish_message(data, "hh_login"))
         self.assertIn("неизвестен", app.finish_message(data, "apply"))
 
+    def test_own_stop_reason_replaces_the_login_hint(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending = False
+        app.stop_reason = "Stopped: 3 letters in a row failed the letter check; check the cover letter prompt"
+        data = {"done": None, "success": False, "cancelled": False, "forced": False}
+        message = app.finish_message(data, "auto")
+        self.assertIn("остановлен проверкой: Stopped: 3 letters", message)
+        self.assertNotIn("Проверь вход в HH", message)
+
+    def test_rejected_letter_is_logged_with_vacancy_and_text(self):
+        from gui_protocol import LETTER_LEVEL_REJECTED
+        app = gui.Application.__new__(gui.Application)
+        app.session = SimpleNamespace(run="r", cancelled=threading.Event())
+        app.append_log = Mock()
+
+        def event(data):
+            app.handle_frame({"run": "r", "type": "event",
+                              "payload": {"name": "letter_rejected", "data": data}})
+        event({"vacancy": {"name": "DevOps", "employer": {"name": "Example"}},
+               "reason": LETTER_LEVEL_REJECTED, "text": "Готов на миддл."})
+        logged = [call.args[0] for call in app.append_log.call_args_list]
+        self.assertIn("Вакансия пропущена", logged[0])
+        self.assertEqual(logged[1:], ["Вакансия: DevOps — Example", "Отклонённое письмо: Готов на миддл."])
+        app.append_log.reset_mock()
+        event({"vacancy": {"name": "DevOps"}, "reason": "free text", "text": "x"})
+        app.append_log.assert_not_called()
+
     def test_chat_follow_up_wait_shows_countdown_and_its_end(self):
         app = gui.Application.__new__(gui.Application)
         app.session = SimpleNamespace(run="r", cancelled=threading.Event())

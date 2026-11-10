@@ -21,6 +21,7 @@ from resume_context import selected_resume_context
 from vacancy_level import senior_title_reason
 from vacancy_salary import salary_rejection_reason
 from manual_captcha import ManualCaptcha, permits_token_refresh, token_refresh_request
+from gui_protocol import LETTER_LANGUAGE_REJECTED, LETTER_LEVEL_REJECTED
 
 
 class VacancyText(HTMLParser):
@@ -116,7 +117,13 @@ def enrich_prompt(prompt, vacancy):
             + json.dumps(data, ensure_ascii=False))
 
 
-ALTERNATIVE_LEVEL = re.compile(r"(?i)(?:junior|джун|middle|миддл)")
+# English levels are whole words ("middleware" is not a level); Russian stems
+# keep their endings ("джуна", "миддлом").
+ALTERNATIVE_LEVEL = re.compile(r"(?i)\b(?:junior\b|middle\b|джун|миддл)")
+
+
+class LetterRejected(SystemExit):
+    """A generated letter failed a content check; nothing was sent for it."""
 
 
 def _level(word):
@@ -129,7 +136,7 @@ def check_letter_level(letter, vacancy):
     # Naming the vacancy's own level ("Junior SRE") is not an alternative offer.
     own = {_level(word) for word in ALTERNATIVE_LEVEL.findall(vacancy.get("name") or "")}
     if any(_level(word) not in own for word in ALTERNATIVE_LEVEL.findall(letter)):
-        raise SystemExit("Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead")
+        raise LetterRejected(LETTER_LEVEL_REJECTED)
 
 
 def check_letter_language(letter, vacancy):
@@ -137,7 +144,7 @@ def check_letter_language(letter, vacancy):
         latin = ENGLISH_WORDS.findall(letter)
         cyrillic = RUSSIAN_WORDS.findall(letter)
         if len(latin) < 5 or cyrillic:
-            raise SystemExit("Письмо для англоязычной вакансии должно быть на английском")
+            raise LetterRejected(LETTER_LANGUAGE_REJECTED)
 
 
 def letter_kwargs(kwargs, vacancy):

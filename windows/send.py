@@ -18,8 +18,8 @@ from hh_applicant_tool.main import main
 from hh_applicant_tool.operations.apply_vacancies import Operation
 from hh_applicant_tool.tool import HHApplicantTool
 
-from preview_hh import (allowed_request, check_letter_language, check_letter_level,
-                        enrich_prompt, letter_kwargs)
+from preview_hh import (LetterRejected, allowed_request, check_letter_language,
+                        check_letter_level, enrich_prompt, letter_kwargs)
 from preview import arguments as preview_arguments  # noqa: E402
 from resume_context import selected_resume_context
 from vacancy_level import senior_title_reason
@@ -48,6 +48,8 @@ GENERATION_ROUNDS = 3
 GENERATION_RETRY_DELAY = 30
 # Two vacancies in a row without a letter mean the provider is down: stop.
 GENERATION_SKIP_LIMIT = 2
+# Three rejected letters in a row point to the prompt or the model, not one vacancy: stop.
+LETTER_REJECTION_LIMIT = 3
 # HH may show a fresh application in the vacancy relations only after a delay.
 SEND_CHECK_DELAY = 15
 
@@ -272,6 +274,7 @@ class ApprovalGate:
         self.letter = None
         self._generating = False
         self.generation_skips = 0
+        self.letter_rejections = 0
         self.captcha = ManualCaptcha()
         self.counts = {"vacancies": 0, "letters": 0, "skipped": 0,
                        "attempts": 0, "captcha_rejections": 0, "http_success": 0}
@@ -324,11 +327,29 @@ class ApprovalGate:
                                 letter_kwargs(kwargs, vacancy), "application")
         if not isinstance(letter, str) or not letter.strip():
             raise SystemExit("Stopped after empty model response")
-        check_letter_level(letter, self.current)
-        check_letter_language(letter, vacancy)
+        try:
+            check_letter_level(letter, self.current)
+            check_letter_language(letter, vacancy)
+        except LetterRejected as error:
+            self._reject_letter(error.code, letter)
+        self.letter_rejections = 0
         self.letter = letter
         self.counts["letters"] += 1
         return letter
+
+    def _reject_letter(self, reason, letter):
+        """Skip one vacancy with a bad letter; a series of them means a bad prompt."""
+        self.letter = None
+        self.letter_rejections += 1
+        print(f"Письмо отклонено проверкой: {reason}. Вакансия пропущена, отклик не отправлен.\n"
+              f"Отклонённое письмо:\n{letter}", flush=True)
+        if getattr(self, "observer", None) is not None:
+            self.observer("letter_rejected", {"vacancy": self.current, "reason": reason, "text": letter})
+        if self.letter_rejections >= LETTER_REJECTION_LIMIT:
+            raise SystemExit(f"Stopped: {self.letter_rejections} letters in a row failed the letter "
+                             "check; check the cover letter prompt")
+        # Upstream logs AIError and moves on to the next vacancy without a request to HH.
+        raise AIError("letter failed the content check; vacancy skipped")
 
     def _test_answer(self, client, prompt, *args, **kwargs):
         if not self.current.get("has_test") or self.letter is None:

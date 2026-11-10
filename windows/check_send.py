@@ -779,8 +779,11 @@ class SendChecks(unittest.TestCase):
 
         self.gate.letter = None
         generated.return_value = "Привет! Я работаю с Linux и хочу обсудить вакансию."
-        with self.assertRaisesRegex(SystemExit, "английском"):
+        from hh_applicant_tool.ai.base import AIError
+        out = StringIO()
+        with redirect_stdout(out), self.assertRaisesRegex(AIError, "vacancy skipped"):
             self.gate.complete(None, "Пиши по-русски")
+        self.assertIn("английском", out.getvalue())
         self.assertIsNone(self.gate.letter)
         self.assertEqual(self.gate.counts["letters"], 1)
         with self.assertRaisesRegex(SystemExit, "without reviewing"):
@@ -889,6 +892,34 @@ class SendChecks(unittest.TestCase):
         self.assertEqual(events[-1], ("retry", "generation_skip"))
         # The next vacancy fails too: the provider is down, stop the run.
         with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "2 vacancies in a row"):
+            self.gate.complete(None, "prompt")
+        self.sender.assert_not_called()
+
+    def test_rejected_letter_skips_vacancy_and_a_series_stops_the_run(self):
+        from hh_applicant_tool.ai.base import AIError
+        from gui_protocol import LETTER_LEVEL_REJECTED
+        bad = "Привет! Если у тебя есть позиция джун/миддл, готов её рассмотреть."
+        events = []
+        self.gate.observer = lambda name, value: events.append((name, value))
+        self.gate.operation = SimpleNamespace(api_client=Mock(get=Mock(return_value=VACANCY)))
+        self.gate.original_complete = Mock(return_value=bad)
+        out = StringIO()
+        with redirect_stdout(out), self.assertRaises(AIError):
+            self.gate.complete(None, "prompt")
+        self.assertIsNone(self.gate.letter)
+        self.assertIn(bad, out.getvalue())
+        self.assertEqual(events[-1], ("letter_rejected", {
+            "vacancy": self.gate.current, "reason": LETTER_LEVEL_REJECTED, "text": bad}))
+        # A good letter resets the series.
+        self.gate.original_complete = Mock(return_value=LETTER)
+        with redirect_stdout(StringIO()):
+            self.assertEqual(self.gate.complete(None, "prompt"), LETTER)
+        self.assertEqual(self.gate.letter_rejections, 0)
+        self.gate.original_complete = Mock(return_value=bad)
+        for _ in range(2):
+            with redirect_stdout(StringIO()), self.assertRaises(AIError):
+                self.gate.complete(None, "prompt")
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "3 letters in a row"):
             self.gate.complete(None, "prompt")
         self.sender.assert_not_called()
 
