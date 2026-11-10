@@ -907,6 +907,16 @@ class StepChecks(unittest.TestCase):
         event({"vacancy": {"name": "DevOps"}, "reason": "free text", "text": "x"})
         app.append_log.assert_not_called()
 
+    def test_chat_wait_countdown_survives_float_overshoot(self):
+        app = gui.Application.__new__(gui.Application)
+        app.session = SimpleNamespace(run="r", cancelled=threading.Event())
+        app.root = Mock(after=Mock(return_value="job-1"))
+        app.say = Mock()
+        # For this monotonic value (t + 60) - t is slightly above 60.
+        with patch("time.monotonic", return_value=4070.309673198955):
+            app.start_chat_wait(60)
+        self.assertIn("осталось 60 с", app.say.call_args.args[0])
+
     def test_chat_follow_up_wait_shows_countdown_and_its_end(self):
         app = gui.Application.__new__(gui.Application)
         app.session = SimpleNamespace(run="r", cancelled=threading.Event())

@@ -1521,7 +1521,8 @@ class Application:
         until = getattr(self, "chat_wait_until", None)
         if until is None or self.session is None:
             return
-        left = max(0, math.ceil(until - time.monotonic()))
+        # Round first: (t + 60) - t can be 60.0000000001, which ceil turns into 61.
+        left = max(0, math.ceil(round(until - time.monotonic(), 3)))
         self.say(f"Жду следующий вопрос робота в этом чате: осталось {left} с. "
                  "Новый вопрос придёт на проверку сам.")
         if left > 0:
