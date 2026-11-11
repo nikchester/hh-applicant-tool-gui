@@ -1111,6 +1111,21 @@ class LetterStyleChecks(unittest.TestCase):
 
                 app.edit_letter_style()
                 editor, save_button, error, check = app.style_controls
+                # Ctrl+A, Ctrl+C, Ctrl+V by Windows key codes, which the Russian layout keeps.
+                editor.delete("1.0", "end")
+                editor.insert("1.0", "Привет")
+                # The dialog of a withdrawn root never gets focus, so Tk would drop
+                # generated key events; call the bound handler with the event it reads.
+                self.assertTrue(editor.bind("<Control-KeyPress>"))
+                press = lambda code: editor.clipboard_keys(SimpleNamespace(keycode=code))
+                press(65)
+                press(67)
+                self.assertEqual(root.clipboard_get(), "Привет")
+                root.clipboard_clear()
+                root.clipboard_append("%(broken)s")
+                press(86)  # Paste replaces the selection.
+                self.assertEqual(editor.get("1.0", "end-1c"), "%(broken)s")
+                self.assertEqual(str(save_button["state"]), "disabled")  # Paste re-validates at once.
                 editor.delete("1.0", "end")
                 editor.insert("1.0", "%(broken)s")
                 check()

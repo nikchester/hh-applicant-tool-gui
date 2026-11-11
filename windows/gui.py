@@ -528,9 +528,11 @@ class Application:
                             borderwidth=0, padx=12, pady=10, background=FIELD if readonly else CONTROL,
                             foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=BORDER,
                             highlightcolor=ACCENT, insertbackground=TEXT,
-                            state="disabled" if readonly else "normal")
+                            state="disabled" if readonly else "normal", undo=not readonly)
         if readonly:
             self.make_copyable(text)
+        else:
+            self.make_editable(text)
         bar = self.ttk.Scrollbar(frame, orient="vertical", command=text.yview)
         text.configure(yscrollcommand=bar.set)
         text.grid(row=0, column=0, sticky="nsew")
@@ -566,6 +568,43 @@ class Application:
         text.bind("<Button-1>", lambda _e: text.focus_set(), add="+")
         text.bind("<Control-KeyPress>", control_key)
         text.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
+
+    def make_editable(self, text):
+        """Give an editable Text clipboard keys that work in any keyboard layout
+        and a context menu. Each change fires <<Edited>> so callers can re-validate."""
+        def run(virtual):
+            def action(_event=None):
+                try:
+                    text.event_generate(virtual)
+                except self.tk.TclError:  # Nothing to undo or an empty clipboard.
+                    pass
+                text.event_generate("<<Edited>>")
+                return "break"
+            return action
+
+        def select_all(_event=None):
+            text.tag_add("sel", "1.0", "end-1c")
+            text.mark_set("insert", "end-1c")
+            return "break"
+
+        cut, copy, paste = run("<<Cut>>"), run("<<Copy>>"), run("<<Paste>>")
+        undo, redo = run("<<Undo>>"), run("<<Redo>>")
+
+        def control_key(event):
+            # Windows virtual-key codes do not depend on the keyboard layout.
+            actions = {67: copy, 86: paste, 88: cut, 65: select_all, 90: undo, 89: redo, 45: copy}
+            action = actions.get(event.keycode)
+            return action(event) if action else None
+
+        menu = self.tk.Menu(text, tearoff=0)
+        menu.add_command(label="Вырезать", command=cut)
+        menu.add_command(label="Копировать", command=copy)
+        menu.add_command(label="Вставить", command=paste)
+        menu.add_separator()
+        menu.add_command(label="Выделить всё", command=select_all)
+        text.clipboard_keys = control_key  # Tests call it: a hidden window gets no key events.
+        text.bind("<Control-KeyPress>", control_key)
+        text.bind("<Button-3>", lambda e: (text.focus_set(), menu.tk_popup(e.x_root, e.y_root)))
 
     def build_main(self, main):
         ttk = self.ttk
@@ -1295,6 +1334,7 @@ class Application:
         editor_frame, editor = self.text_box(frame, 14, readonly=False)
         editor_frame.grid(row=2, column=0, sticky="nsew")
         editor.insert("1.0", current)
+        editor.edit_reset()  # Ctrl+Z must not undo the loaded style into an empty field.
         ttk.Label(frame, style="Hint.TLabel", wraplength=700, justify="left", text=(
             "Подстановки: %(vacancy_name)s — вакансия, %(employer_name)s — компания, "
             "%(resume_title)s — резюме, %(first_name)s — имя. Знак % пиши как %%. "
@@ -1341,6 +1381,7 @@ class Application:
         ttk.Button(buttons, text="Вернуть исходный стиль", command=reset).pack(side="right")
         window.protocol("WM_DELETE_WINDOW", close)
         editor.bind("<KeyRelease>", check)
+        editor.bind("<<Edited>>", check)  # Menu paste and cut send no KeyRelease.
         editor.focus_set()
         check()
         self.style_controls = (editor, save_button, error, check)
