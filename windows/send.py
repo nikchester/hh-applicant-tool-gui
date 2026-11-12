@@ -201,23 +201,26 @@ def response_failure_detail(response):
     return "; ".join(parts)
 
 
-def arguments(config, resume_id, search):
+def arguments(config, resume_id, search, *, no_letter=False):
     argv = preview_arguments(config, resume_id, search)
     argv[argv.index("--dry-run")] = "--no-dry-run"
     for option, value in (("--per-page", "20"), ("--total-pages", "100")):
         argv[argv.index(option) + 1] = value
     index = argv.index("--max-responses")
     del argv[index:index + 2]  # None means no application-count limit in HH 2.3.7.
+    if no_letter:
+        # #9: HH 2.3.7 then writes a letter only where the vacancy requires one; the gate skips those.
+        argv.append("--no-force-cover-letter")
     return argv
 
 
-def all_resume_arguments(config, configured_id, *, generic=False):
+def all_resume_arguments(config, configured_id, *, generic=False, no_letter=False):
     mapping = load_searches()
     if generic:
         configured_id = next(iter(mapping))
     if configured_id not in mapping:
         raise SystemExit("Configured resume has no SearchText; nothing was sent")
-    return arguments(config, configured_id, mapping[configured_id])
+    return arguments(config, configured_id, mapping[configured_id], no_letter=no_letter)
 
 
 def validate(argv, *, profile=None):
@@ -234,12 +237,13 @@ def validate(argv, *, profile=None):
         and args.work_format == ["REMOTE"] and args.currency == "RUR"
         and args.salary == 80000 and args.only_with_salary is False
         and args.order_by == "publication_time"
-        and args.search_field == ["name"] and args.force_cover_letter is True
+        and args.search_field == ["name"] and isinstance(args.force_cover_letter, bool)
         and args.use_ai is True and args.excluded_filter is None
     ):
         raise SystemExit("Unsafe send arguments; refusing to run")
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
-    if argv != arguments(str(expected), args.resume_id, args.text):
+    # The exact argv also fixes where --no-force-cover-letter may stand (#9).
+    if argv != arguments(str(expected), args.resume_id, args.text, no_letter=args.force_cover_letter is False):
         raise SystemExit("Unexpected send arguments; refusing to run")
     ai_provider.activate(ai_provider.from_config(config, allow_external=profile is not None))
     return args
@@ -294,6 +298,8 @@ class ApprovalGate:
         # What generated self.letter: an AI rewrite of the reviewed letter reuses it.
         self.letter_source = None
         self.letter_feedback = []
+        # #9: applications carry no cover letter; self.letter "" is then the reviewed "no letter".
+        self.no_letter = False
         self._generating = False
         self.generation_skips = 0
         self.letter_rejections = 0
@@ -319,23 +325,35 @@ class ApprovalGate:
                     "уже есть отклик или отказ в HH" if vacancy.get("relations") else
                     "вакансия в архиве" if vacancy.get("archived") else
                     "отклик ведёт на внешний сайт" if vacancy.get("response_url") else None
-                )
+                ) or self._no_letter_reason(vacancy)
             if reason:
                 print("\n" + "=" * 60, flush=True)
                 print("\n".join(vacancy_lines(vacancy, self.counts["vacancies"])), flush=True)
                 print(f"Статус: пропускаем — {reason}", flush=True)
                 if senior_title_reason(vacancy) or salary_rejection_reason(
-                        vacancy, getattr(operation, "api_client", None)):
+                        vacancy, getattr(operation, "api_client", None)) or self._no_letter_reason(vacancy):
                     continue
             else:
                 company = (vacancy.get("employer") or {}).get("name") or "не указана"
                 print(f"\nНайдена вакансия {self.counts['vacancies']}: "
                       f"{vacancy.get('name') or 'не указана'} — {company}. "
                       "Готовим письмо для проверки...", flush=True)
+            if self.no_letter:
+                self.letter = ""  # Nothing to generate: the review shows "no letter".
             yield vacancy
 
+    def _no_letter_reason(self, vacancy):
+        """Vacancies the no-letter mode cannot answer: HH needs a letter, or a test needs AI (#9)."""
+        if not self.no_letter:
+            return None
+        if vacancy.get("response_letter_required"):
+            return "работодатель требует сопроводительное письмо, а включён режим без письма"
+        if vacancy.get("has_test"):
+            return "у вакансии тест, а в режиме без письма отклики с тестом не отправляются"
+        return None
+
     def complete(self, client, prompt, *args, **kwargs):
-        if self.current is None:
+        if self.current is None or self.no_letter:
             raise SystemExit("Unexpected letter generation")
         test_ai = getattr(getattr(self, "operation", None), "test_ai", None)
         if test_ai is not None and client is test_ai:
@@ -386,8 +404,8 @@ class ApprovalGate:
         instruction = instruction.strip()
         if not instruction:
             return letter
-        if self.letter_source is None:
-            raise SystemExit("No letter context for a rewrite; stopped")
+        if self.letter_source is None:  # No generated letter, e.g. the no-letter mode (#9).
+            return self._revision_failed(LETTER_REVISION_FAILED, letter)
         client, prompt, args, kwargs, vacancy = self.letter_source
         kwargs = deepcopy(kwargs)
         system = kwargs.get("system_prompt")
@@ -516,7 +534,8 @@ class ApprovalGate:
                 and not url.fragment and not url.username and not url.password)
 
     def _send_test(self, session, request, **kwargs):
-        if (self.current is None or not self.current.get("has_test") or self.current.get("relations")
+        if (self.current is None or self.no_letter or not self.current.get("has_test")
+                or self.current.get("relations")
                 or self.current.get("archived") or self.current.get("response_url")
                 or senior_title_reason(self.current)
                 or salary_rejection_reason(
@@ -665,6 +684,8 @@ class ApprovalGate:
                       self.current, getattr(getattr(self, "operation", None), "api_client", None))
                  or self.captcha_active):
             raise SystemExit("Cannot send to a responded or test vacancy")
+        if self.no_letter and (self.letter != "" or self.current.get("response_letter_required")):
+            raise SystemExit("Cannot send this vacancy in the no-letter mode")
         if self.letter is None:
             raise SystemExit("Cannot send without reviewing a generated letter")
         if not isinstance(request.body, (bytes, str)):
@@ -848,11 +869,13 @@ def run(argv, approve=input, *, all_resumes=False, gate_factory=ApprovalGate, pr
     args = validate(argv, profile=profile)
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
     mapping = load_searches() if all_resumes else None
+    no_letter = args.force_cover_letter is False
     if all_resumes and argv != all_resume_arguments(str(expected),
                                                    config.get("general", {}).get("cover_letter_resume_id"),
-                                                   generic=profile is not None):
+                                                   generic=profile is not None, no_letter=no_letter):
         raise SystemExit("Unexpected all-resume arguments; refusing to run")
     gate = gate_factory(args.resume_id, requests.sessions.Session.send, approve)
+    gate.no_letter = no_letter
     gate.observer = observer
     gate.operation = None
     original_get_vacancies = Operation._get_vacancies

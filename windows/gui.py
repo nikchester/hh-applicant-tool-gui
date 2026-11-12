@@ -233,6 +233,9 @@ class Application:
         self.search, self.resume = tk.StringVar(), tk.StringVar()
         self.search_mode = tk.StringVar(value="query")  # "query" or "all" (HH suggestions for the resume).
         self.all_resumes = tk.BooleanVar(value=False)
+        from gui_profile import read_option
+        self.no_letter = tk.BooleanVar(value=read_option("no_letter"))
+        self.no_letter.trace_add("write", lambda *_a: self.save_no_letter())
         self.limit, self.minimum, self.maximum = tk.StringVar(value="1"), tk.StringVar(value="60"), tk.StringVar(value="180")
         self.status = tk.StringVar()
         self.review_kind, self.sending, self.current_resume = None, False, None
@@ -524,9 +527,14 @@ class Application:
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
         self.hint(run, "Показывает письма и ничего не отправляет. Начни с него.", 2, pady=(2, 8))
         self.action_button(run, "Откликнуться с проверкой писем", "apply").grid(row=3, column=0, sticky="ew")
-        self.hint(run, "Каждое письмо ты читаешь и подтверждаешь сам.", 4, pady=(2, 8))
-        self.action_button(run, "Ответить в чатах", "chats").grid(row=5, column=0, sticky="ew")
-        self.hint(run, "Ответы работодателям в чатах HH, тоже с проверкой.", 6, pady=(2, 0))
+        self.hint(run, "Каждое письмо ты читаешь и подтверждаешь сам.", 4, pady=(2, 4))
+        ttk.Checkbutton(run, text="Без сопроводительного письма", variable=self.no_letter).grid(
+            row=5, column=0, sticky="w")
+        self.hint(run, "Отклик уходит только с резюме, AI не нужен. Вакансии, где HH требует письмо "
+                       "или есть тест, пропускаются. Действует для откликов с проверкой и автооткликов.",
+                  6, pady=(2, 8))
+        self.action_button(run, "Ответить в чатах", "chats").grid(row=7, column=0, sticky="ew")
+        self.hint(run, "Ответы работодателям в чатах HH, тоже с проверкой.", 8, pady=(2, 0))
 
         # Risky mode stays folded away from the main flow.
         self.auto_toggle = ttk.Button(side, text="▸ Дополнительно: автоотклики без проверки",
@@ -780,7 +788,8 @@ class Application:
         return Progress(hh=self.signed_hh, chatgpt=self.ai_ready, ai_kind=self.provider.kind,
                         resume=0 <= index < len(self.resumes),
                         search=self.search_mode.get() == "all" or bool(self.search.get().strip()),
-                        model=self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"})
+                        model=self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"},
+                        no_letter=self.no_letter.get())
 
     def next_hint(self):
         from gui_steps import next_hint
@@ -1140,7 +1149,8 @@ class Application:
                 if not consent:
                     return
             settings = action_settings(action, resume=resume, search=search, all_resumes=self.all_resumes.get(),
-                limit=limit, min_pause=minimum, max_pause=maximum, consent=consent)
+                limit=limit, min_pause=minimum, max_pause=maximum, consent=consent,
+                no_letter=self.no_letter.get())
             self.session = Session(action, settings,
                 recovery_acknowledgement=getattr(self, "recovery_acknowledgement", None))
             self.clear_review()
@@ -1172,6 +1182,14 @@ class Application:
                                         "Сопроводительное письмо (предпросмотр, не отправляется)"
                                         if action == "preview" else "Сопроводительное письмо")
         self.update_counter()
+
+    def save_no_letter(self):
+        from gui_profile import save_option
+        try:
+            save_option("no_letter", bool(self.no_letter.get()))
+        except (OSError, ValueError):
+            self.append_log("Не удалось сохранить режим без сопроводительного письма.")
+        self.refresh_steps()
 
     def update_counter(self):
         counter = getattr(self, "counter", None)
@@ -1751,9 +1769,11 @@ class Application:
             self.replace_text(self.context, payload["context"])
             self.replace_text(self.letter, payload["text"])
             chat = self.review_kind == "chat"
-            self.letter_label.configure(text="Ответ в чат. Его получит работодатель." if chat
-                                        else "Сопроводительное письмо. Его получит работодатель.")
-            self.yes.configure(text="Отправить ответ" if chat else "Отправить письмо")
+            bare = not chat and payload["text"] == ""  # #9: an application without a letter.
+            self.letter_label.configure(text="Ответ в чат. Его получит работодатель." if chat else
+                                        "Отклик без сопроводительного письма: работодатель увидит только резюме."
+                                        if bare else "Сопроводительное письмо. Его получит работодатель.")
+            self.yes.configure(text="Отправить ответ" if chat else "Отправить отклик" if bare else "Отправить письмо")
             self.decision.grid()
             self.yes.configure(state="normal")
             self.no.configure(state="normal")
@@ -1763,9 +1783,10 @@ class Application:
             self.manual_label.configure(text="Или напиши ответ сам:" if chat else
                                         "Или исправь письмо сам и нажми «Взять мой текст»:")
             self.edit_hint.configure(text=f"После правки {what} снова придёт на проверку и сам не отправится.")
-            self.chat_frame.grid()
-            self.edit.configure(state="normal")
-            self.manual_button.configure(state="normal")
+            if not bare:  # Nothing to rewrite when no letter is sent.
+                self.chat_frame.grid()
+                self.edit.configure(state="normal")
+                self.manual_button.configure(state="normal")
             self.manual.configure(height=2 if chat else 5)
             if not chat:
                 self.manual.insert("1.0", payload["text"])  # Fix a word without retyping the letter.

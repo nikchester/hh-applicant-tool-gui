@@ -121,6 +121,35 @@ def save_search(resume_id, search):
     atomic_write(search_path(), json.dumps(mapping, ensure_ascii=False, indent=2))
 
 
+OPTIONS = {"no_letter": False}  # GUI switches kept between runs; only these names and bool values.
+
+
+def options_path():
+    return state_dir() / "options.json"
+
+
+def read_option(name):
+    """A stored GUI switch; a missing or damaged file gives the default."""
+    try:
+        data = json.loads(options_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return OPTIONS[name]
+    value = data.get(name) if isinstance(data, dict) else None
+    return value if isinstance(value, bool) else OPTIONS[name]
+
+
+def save_option(name, value):
+    if name not in OPTIONS or not isinstance(value, bool):
+        raise ValueError("Unknown GUI option")
+    try:
+        data = json.loads(options_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    data = {key: data[key] for key in OPTIONS if isinstance(data, dict) and isinstance(data.get(key), bool)}
+    data[name] = value
+    atomic_write(options_path(), json.dumps(data, indent=2))
+
+
 # Placeholders HH 2.3.7 fills in the cover letter prompt (apply_vacancies.py).
 PROMPT_PLACEHOLDERS = ("vacancy_name", "vacancy_url", "employer_name", "first_name", "last_name",
                        "email", "phone", "resume_hash", "resume_title", "resume_url")

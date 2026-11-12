@@ -35,6 +35,7 @@ class Progress:
     resume: bool = False
     search: bool = False
     model: bool = False
+    no_letter: bool = False  # #9: applications without a letter need no AI provider or model.
 
 
 # Reason shown next to a locked button: the first missing prerequisite wins.
@@ -57,8 +58,11 @@ NEEDS = {
 
 def blocker(action, progress):
     """Plain reason why an action cannot start yet, or None when it can."""
+    needs = NEEDS[action]
+    if action in {"apply", "auto"} and progress.no_letter:
+        needs = tuple(key for key in needs if key not in {"chatgpt", "model"})
     for key, reason in REQUIREMENTS:
-        if key in NEEDS[action] and not getattr(progress, key):
+        if key in needs and not getattr(progress, key):
             return reason
     return None
 

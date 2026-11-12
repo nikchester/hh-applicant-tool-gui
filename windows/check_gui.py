@@ -464,6 +464,7 @@ class ConstructionChecks(unittest.TestCase):
                 app.selected_id, app.save = Mock(return_value="r"), Mock(return_value=True)
                 app.search = SimpleNamespace(get=lambda: "Python")
                 app.all_resumes = SimpleNamespace(get=lambda: True)
+                app.no_letter = SimpleNamespace(get=lambda: action == "auto")
                 app.resumes, app.searches = [{"id": "r", "title": "Resume"}], {"r": "Python"}
                 app.limit = SimpleNamespace(get=lambda: "2")
                 app.minimum, app.maximum = SimpleNamespace(get=lambda: "60"), SimpleNamespace(get=lambda: "180")
@@ -480,6 +481,55 @@ class ConstructionChecks(unittest.TestCase):
                     gui_worker.validate_start(frame(uuid4().hex, "start", {"action": action, "settings": settings}))
                     session.return_value.start.assert_called_once()
                     app.dialogs.showerror.assert_not_called()
+                    if action in {"apply", "auto"}:  # #9: the switch reaches the worker.
+                        self.assertIs(settings["no_letter"], action == "auto")
+                    else:
+                        self.assertNotIn("no_letter", settings)
+
+    def test_no_letter_mode_needs_no_ai_and_starts_no_chatmock(self):
+        from gui_steps import Progress, blocker
+        ready = Progress(hh=True, resume=True, search=True)
+        self.assertIsNotNone(blocker("apply", ready))  # Letters need AI and a model.
+        for action in ("apply", "auto"):
+            self.assertIsNone(blocker(action, Progress(hh=True, resume=True, search=True, no_letter=True)))
+        self.assertIsNotNone(blocker("preview", Progress(hh=True, resume=True, search=True, no_letter=True)))
+        self.assertIsNotNone(blocker("apply", Progress(resume=True, search=True, no_letter=True)))  # HH login stays.
+        for no_letter in (True, False):
+            with self.subTest(no_letter=no_letter):
+                settings = gui_controller.action_settings("apply", resume="r", search="x", no_letter=no_letter)
+                session, process, _, gateway = LifecycleChecks().make_session("apply")
+                session.settings = settings
+                process.stdout = StringIO(encode(frame(session.run, "done", {"success": True, "cancelled": False,
+                    "unknown": False, "counts": {"attempts": 0, "http_success": 0, "captcha_rejections": 0}})))
+                with patch("gui_controller.provider_uses_gateway", return_value=True):
+                    run_session(session)
+                self.assertEqual(gateway.start.called, not no_letter)
+        bad = gui_controller.action_settings("apply", resume="r", search="x") | {"no_letter": "yes"}
+        with self.assertRaises(ProtocolError):
+            gui_worker.validate_start(frame(uuid4().hex, "start", {"action": "apply", "settings": bad}))
+
+    def test_worker_without_letter_needs_neither_key_nor_model(self):
+        reader, writer = Reader(), Writer()
+        settings = gui_controller.action_settings("apply", resume="r", search="Python", no_letter=True)
+        reader.put(frame(uuid4().hex, "start", {"action": "apply", "settings": settings}))
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+             patch("ai_provider.read_key", return_value=None), \
+             patch("gui_worker.dispatch", return_value=0) as dispatch:
+            gui_profile.set_provider("https://api.example.com/v1")  # A key provider without a key.
+            self.assertEqual(gui_worker.worker_main(reader, writer), 0)
+            dispatch.assert_called_once()
+        reader.put("")
+
+    def test_no_letter_option_is_kept_in_the_profile(self):
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            self.assertIs(gui_profile.read_option("no_letter"), False)
+            gui_profile.save_option("no_letter", True)
+            self.assertIs(gui_profile.read_option("no_letter"), True)
+            gui_profile.options_path().write_text("{broken", encoding="utf-8")
+            self.assertIs(gui_profile.read_option("no_letter"), False)
+            for name, value in (("unknown", True), ("no_letter", "yes")):
+                with self.assertRaises(ValueError):
+                    gui_profile.save_option(name, value)
 
     def test_all_resume_launch_refuses_before_session_when_a_search_is_missing(self):
         for action in ("apply", "auto"):
@@ -825,6 +875,30 @@ class ConstructionChecks(unittest.TestCase):
                 response = session.outgoing.get_nowait()
                 self.assertEqual(response["id"], fresh["id"])
                 self.assertEqual(response["payload"]["action"], "yes")
+        finally:
+            root.destroy()
+
+    def test_real_tk_review_of_an_application_without_a_letter(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                self.assertIs(app.no_letter.get(), False)
+                app.no_letter.set(True)  # The switch is kept for the next start.
+                self.assertIs(gui_profile.read_option("no_letter"), True)
+                app.session = gui_controller.Session("apply", {})
+                app.handle_frame(frame(app.session.run, "review", {"kind": "application", "context": "Vacancy",
+                    "text": "", "options": []}))
+                self.assertIn("без сопроводительного письма", str(app.letter_label["text"]))
+                self.assertEqual(str(app.yes["text"]), "Отправить отклик")
+                self.assertFalse(app.chat_frame.winfo_manager())  # Nothing to rewrite.
+                self.assertEqual(str(app.yes["state"]), "normal")
         finally:
             root.destroy()
 

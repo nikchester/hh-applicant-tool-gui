@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT / "windows"))
 from send import (ApprovalGate, SkippedTest, StopReview, URL_TASK_ANSWER,  # noqa: E402
                   all_resume_arguments, arguments, run, salary_text, validate)
 from send_all import apply_round_robin, load_searches  # noqa: E402
+from gui_protocol import LETTER_REVISION_FAILED  # noqa: E402
 
 
 RESUME = "9749b651ff056b6c970039ed1f5a63765a5178"
@@ -155,6 +156,86 @@ class LetterEditChecks(unittest.TestCase):
             list(gate.vacancies(SimpleNamespace()))
         self.assertIsNone(gate.letter_source)
         self.assertEqual(gate.letter_feedback, [])
+
+
+class NoLetterChecks(unittest.TestCase):
+    """#9: applications that carry only the resume, never a letter or a model call."""
+
+    def make_gate(self, *answers):
+        sender = Mock(return_value=SimpleNamespace(status_code=201))
+        gate = ApprovalGate(RESUME, sender, approve=Mock(side_effect=list(answers)), sleep=Mock())
+        gate.no_letter = True
+        return gate, sender
+
+    def test_arguments_add_the_upstream_flag_and_validation_pins_it(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            profile = home / ".config/hh-applicant-tool-cli"
+            profile.mkdir(parents=True)
+            shutil.copyfile(ROOT / "windows/config.toml", profile / "config.toml")
+            plain = arguments(str(profile), RESUME, "Linux")
+            bare = arguments(str(profile), RESUME, "Linux", no_letter=True)
+            self.assertEqual(bare, plain + ["--no-force-cover-letter"])
+            with patch.dict(os.environ, {"CONFIG_DIR": str(profile), "HH_PROFILE_ID": "."}), \
+                 patch("send.Path.home", return_value=home), \
+                 patch("requests.sessions.Session.send", side_effect=AssertionError("No network")):
+                self.assertIs(validate(plain).force_cover_letter, True)
+                self.assertIs(validate(bare).force_cover_letter, False)
+                for changed in (bare + ["--force-cover-letter"], plain + ["--no-force-cover-letter"] * 2,
+                                bare[:1] + ["--no-force-cover-letter"] + bare[1:-1]):
+                    with self.subTest(changed=changed[-2:]), self.assertRaises(SystemExit):
+                        validate(changed)
+
+    def test_vacancies_needing_a_letter_or_a_test_are_skipped(self):
+        gate, _ = self.make_gate()
+        needs = VACANCY | {"id": "1", "response_letter_required": True}
+        test = VACANCY | {"id": "2", "has_test": True}
+        plain = VACANCY | {"id": "3"}
+        gate.original_vacancies = lambda _operation: iter([needs, test, plain])
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(list(gate.vacancies(SimpleNamespace())), [plain])
+        self.assertIn("требует сопроводительное письмо", output.getvalue())
+        self.assertIn("у вакансии тест", output.getvalue())
+        self.assertEqual(gate.letter, "")
+        with self.assertRaisesRegex(SystemExit, "Unexpected letter generation"):
+            gate.complete(Mock(), "prompt")
+
+    def test_empty_message_is_reviewed_once_and_sent(self):
+        gate, sender = self.make_gate("yes")
+        gate.current, gate.letter = VACANCY.copy(), ""
+        with redirect_stdout(StringIO()):
+            self.assertEqual(gate.send(None, negotiation(letter="")).status_code, 201)
+        self.assertEqual(parse_qs(sender.call_args.args[1].body, keep_blank_values=True)["message"], [""])
+        gate.approve.assert_called_once()
+        with self.assertRaises(SystemExit):  # The approval is spent.
+            gate.send(None, negotiation(letter=""))
+        sender.assert_called_once()
+
+    def test_a_letter_or_a_letter_required_vacancy_never_goes_in_this_mode(self):
+        for current, letter in ((VACANCY, LETTER), (VACANCY | {"response_letter_required": True}, "")):
+            with self.subTest(letter=letter):
+                gate, sender = self.make_gate("yes")
+                gate.current, gate.letter = current.copy(), ""
+                with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                    gate.send(None, negotiation(letter=letter))
+                sender.assert_not_called()
+        gate, sender = self.make_gate("yes")
+        gate.current, gate.letter = VACANCY | {"has_test": True}, ""
+        with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+            gate.send(None, test_response(letter=""))
+        sender.assert_not_called()
+
+    def test_ai_rewrite_without_a_letter_keeps_the_empty_letter(self):
+        gate, sender = self.make_gate()
+        gate.review = ScriptedReview("edit:напиши письмо", "yes")
+        gate.observer = Mock()
+        gate.original_complete = Mock(side_effect=AssertionError("No model call"))
+        gate.current, gate.letter = VACANCY.copy(), ""
+        with redirect_stdout(StringIO()):
+            gate.send(None, negotiation(letter=""))
+        gate.observer.assert_any_call("letter_revision", LETTER_REVISION_FAILED)
+        self.assertEqual(parse_qs(sender.call_args.args[1].body, keep_blank_values=True)["message"], [""])
 
 
 class SendChecks(unittest.TestCase):

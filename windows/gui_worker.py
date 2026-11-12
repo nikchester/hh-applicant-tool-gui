@@ -41,6 +41,8 @@ def validate_start(data):
     if action not in ACTIONS or not isinstance(settings, dict):
         raise ProtocolError("Unknown action")
     expected = {"resume", "search", "all"} if action in {"preview", "apply", "auto"} else set()
+    if action in {"apply", "auto"}:
+        expected.add("no_letter")
     if action == "auto":
         expected |= {"limit", "min_pause", "max_pause", "consent"}
     if set(settings) != expected:
@@ -49,7 +51,8 @@ def validate_start(data):
         if (not isinstance(settings["resume"], str) or not settings["resume"]
                 or len(settings["resume"]) > 200 or not isinstance(settings["search"], str)
                 or (settings["search"] and not settings["search"].strip()) or len(settings["search"]) > 4000
-                or type(settings["all"]) is not bool or (action == "preview" and settings["all"])):
+                or type(settings["all"]) is not bool or (action == "preview" and settings["all"])
+                or type(settings.get("no_letter", False)) is not bool):
             raise ProtocolError("Invalid resume/search")
     if action == "auto":
         from auto_send import validate_settings
@@ -147,8 +150,9 @@ def dispatch(action, settings, channel):
         return preview.run(preview.arguments(str(profile), settings["resume"], settings["search"]),
                            profile=profile, observer=channel.event)
     import send
-    argv = (send.all_resume_arguments(str(profile), None, generic=True) if settings["all"] else
-            send.arguments(str(profile), settings["resume"], settings["search"]))
+    no_letter = settings["no_letter"]
+    argv = (send.all_resume_arguments(str(profile), None, generic=True, no_letter=no_letter) if settings["all"] else
+            send.arguments(str(profile), settings["resume"], settings["search"], no_letter=no_letter))
     if action == "apply":
         factory = partial(send.ApprovalGate, review=review, sleep=channel.sleep)
     elif action == "auto":
@@ -250,7 +254,8 @@ def worker_main(reader=None, writer=None):
                 provider = ai_provider.from_config(config)
                 ai_provider.activate(provider)
                 key = ai_provider.read_key(provider) if provider.needs_key else None
-                if provider.needs_key and not key:
+                # #9: applications without a letter never call the model.
+                if provider.needs_key and not key and not settings.get("no_letter"):
                     raise ProtocolError("AI provider key is missing")
                 # The key stays in this process's memory: never argv, environment or files.
                 stack.enter_context(patch.object(HHApplicantTool, "get_openai_config", ai_provider.keyed_config(
@@ -259,7 +264,7 @@ def worker_main(reader=None, writer=None):
                     from hh_applicant_tool.ai.openai import OpenAIClient
                     stack.enter_context(patch.object(OpenAIClient, "_request", ai_provider.tuned_request(
                         OpenAIClient._request, provider)))
-            if action in {"preview", "apply", "auto", "chats"}:
+            if action in {"preview", "apply", "auto", "chats"} and not settings.get("no_letter"):
                 model = config.get("openai", {}).get("default", {}).get("model")
                 if not isinstance(model, str) or not model.strip() or model == "CHOOSE_AFTER_LOGIN":
                     raise ProtocolError("Choose an account model before generation")

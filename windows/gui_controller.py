@@ -14,13 +14,15 @@ from gui_recovery import MUTATING_ACTIONS, RecoveryMarker
 
 
 def action_settings(action, *, resume="", search="", all_resumes=False,
-                    limit=1, min_pause=60, max_pause=180, consent=False):
+                    limit=1, min_pause=60, max_pause=180, consent=False, no_letter=False):
     if action not in ACTIONS:
         raise ValueError("Unknown GUI action")
     if action not in {"preview", "apply", "auto"}:
         return {}
     settings = {"resume": resume, "search": search,
                 "all": all_resumes if action != "preview" else False}
+    if action in {"apply", "auto"}:
+        settings["no_letter"] = bool(no_letter)
     if action == "auto":
         settings.update(limit=limit, min_pause=min_pause, max_pause=max_pause, consent=consent)
     return settings
@@ -86,7 +88,9 @@ class Session:
             if self.action in MUTATING_ACTIONS:
                 marker.begin(self.recovery_acknowledgement)
             job = self.job_factory()  # GUI membership precedes *any* owned child.
-            if self.action in GATEWAY_ACTIONS and provider_uses_gateway():
+            # #9: no letter means no model, so ChatMock is not needed.
+            if (self.action in GATEWAY_ACTIONS and not self.settings.get("no_letter")
+                    and provider_uses_gateway()):
                 gateway.start()
             if self.cancelled.is_set():
                 raise Cancelled
