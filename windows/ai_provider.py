@@ -378,23 +378,34 @@ def tuned_request(original, provider):
             response = send(client, payload)
         if response.status_code >= 400:
             host = (urlsplit(provider.base_url).hostname or "").lower()
-            _failure = (host, response.status_code, DAILY_LIMIT_MARK in response.text)
+            _failure = (host, response.status_code, DAILY_LIMIT_MARK in response.text, reset_epoch(response))
         return response
     return _request
 
 
 DAILY_LIMIT_MARK = "free-models-per-day"  # OpenRouter's 429 when the free daily quota is spent.
-_failure = None  # (host, status, daily limit) of the last failed model answer; never its body.
+_failure = None  # (host, status, daily limit, reset epoch) of the last failed model answer; never its body.
+
+
+def reset_epoch(response):
+    """OpenRouter's X-RateLimit-Reset (epoch milliseconds) as whole seconds, or None."""
+    headers = getattr(response, "headers", None)
+    value = headers.get("X-RateLimit-Reset") if hasattr(headers, "get") else None
+    if not isinstance(value, str) or not value.isdecimal() or len(value) > 16:
+        return None
+    seconds = int(value) // 1000 if len(value) > 11 else int(value)
+    return seconds if 1_000_000_000 < seconds < 10_000_000_000 else None
 
 
 def failure_detail():
     """Fixed, secret-free reason of the last failed model answer, or None."""
     if _failure is None:
         return None
-    host, status, daily = _failure
+    host, status, daily, reset = _failure
     if status == 429 and daily:
         return (f"{host}: daily limit of free model requests reached (HTTP 429); "
-                "wait for the daily reset, add credits or choose another provider")
+                + (f"reset_epoch={reset}; " if reset else "")
+                + "wait for the daily reset, add credits or choose another provider")
     if status == 429:
         return f"{host}: rate limit (HTTP 429); wait a minute and retry"
     if status in (401, 403):

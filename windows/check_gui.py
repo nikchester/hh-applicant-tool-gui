@@ -828,6 +828,41 @@ class ConstructionChecks(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_real_tk_journal_window_file_and_infobar_link(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                self.assertEqual(app.log_path, Path(temp) / ".local/state/hh-applicant-tool-gui/log/gui.log")
+                app.append_log("Причина остановки: Stopped after HTTP 403")
+                self.assertTrue(app.log_lines[-1].endswith("Причина остановки: Stopped after HTTP 403"))
+                self.assertIn("Stopped after HTTP 403", app.log_path.read_text(encoding="utf-8"))
+                app.say("Ошибка", "error")
+                self.assertTrue(app.infobar_more.winfo_manager())  # «Подробнее» opens the journal.
+                app.say("Готово", "info")
+                self.assertFalse(app.infobar_more.winfo_manager())
+                app.infobar_more.invoke()
+                view = app.log_view
+                self.assertIn("Stopped after HTTP 403", view.get("1.0", "end"))
+                app.append_log("Новая строка")
+                self.assertIn("Новая строка", view.get("1.0", "end"))
+                app.open_log()  # A second open reuses the window.
+                self.assertIs(app.log_view, view)
+                app.log_window.protocol("WM_DELETE_WINDOW")
+                with patch.object(gui, "LOG_FILE_LIMIT", 10):
+                    app.append_log("После ротации")
+                self.assertTrue(app.log_path.with_name("gui.log.1").exists())
+                self.assertIn("После ротации", app.log_path.read_text(encoding="utf-8"))
+                self.assertNotIn("После ротации", app.log_path.with_name("gui.log.1").read_text(encoding="utf-8"))
+        finally:
+            root.destroy()
+
     def test_real_tk_auto_counter_counts_only_hh_accepted_responses(self):
         import tkinter as tk
         from tkinter import ttk
@@ -957,6 +992,7 @@ class AttentionChecks(unittest.TestCase):
         with patch("gui.attention") as alert:
             gui.Application.finish_run(app, session, {"success": False})
             alert.assert_called_once_with(app.root, "error")
+            app.show_tab.assert_not_called()  # #11: a failure does not swap the view for the journal.
             app.finish_severity.return_value = "info"
             gui.Application.finish_run(app, session, {"success": False})
             alert.assert_called_once()
@@ -1018,8 +1054,46 @@ class StepChecks(unittest.TestCase):
         app.stop_reason = "Stopped: 3 letters in a row failed the letter check; check the cover letter prompt"
         data = {"done": None, "success": False, "cancelled": False, "forced": False}
         message = app.finish_message(data, "auto")
-        self.assertIn("остановлен проверкой: Stopped: 3 letters", message)
+        self.assertIn("Запуск остановлен. Писем подряд не прошли проверку: 3.", message)
+        self.assertNotIn("Stopped", message)  # #11: the internal English text stays in the journal.
         self.assertNotIn("Проверь вход в HH", message)
+
+    def test_known_stop_reasons_read_as_russian_sentences(self):
+        import re
+        import time
+        from gui_steps import readable_reason
+        reset = int(time.time()) + 3600
+        cases = {
+            f"Stopped: openrouter.ai: daily limit of free model requests reached (HTTP 429); reset_epoch={reset}; "
+            "wait for the daily reset, add credits or choose another provider; no automatic replay":
+                "Закончился дневной лимит бесплатных запросов openrouter.ai. Он обновится "
+                + time.strftime("%H:%M" if time.localtime(reset).tm_yday == time.localtime().tm_yday
+                                else "%d.%m в %H:%M", time.localtime(reset)),
+            "Preview stopped after model failure: api.groq.com: rate limit (HTTP 429); wait a minute and retry":
+                "AI-провайдер api.groq.com ограничил частоту запросов",
+            "Stopped: openrouter.ai: HTTP 401; check the API key and model access; no automatic replay":
+                "отклонил запрос (HTTP 401)",
+            "Stopped: openrouter.ai: HTTP 500; no automatic replay": "вернул ошибку HTTP 500",
+            "Stopped: model generation failed; check ChatMock logs; no automatic replay; no application sent":
+                "Модель не написала письмо",
+            "Preview stopped: empty model response": "пустой ответ",
+            "Preview stopped after HTTP 429": "HH ограничил частоту запросов",
+            "Stopped after HTTP 403": "Проверь вход в HH",
+            "Send outcome uncertain; connection failed; check HH manually before any retry": "Неизвестно, дошёл ли отклик",
+            "Send returned HTTP 409; json_errors=x; check HH manually before any retry": "HH не принял отклик (HTTP 409)",
+            "Manual HH captcha failed or cancelled; check HH before retrying": "Капча не введена",
+            "Preview stopped after a network failure; no automatic retry": "Нет связи с HH",
+            "HH повторно запросил капчу на 2 вакансиях подряд. Запуск остановлен.": "HH повторно запросил капчу",
+            "Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead": "Письмо упоминает уровень",
+            "Some brand new internal guard text": "Запуск остановлен защитой программы.",
+        }
+        for reason, expected in cases.items():
+            with self.subTest(reason=reason):
+                text = readable_reason(reason)
+                self.assertIn(expected, text)
+                self.assertIsNone(re.search(r"\b(?:Stopped|stopped|check|retry|failed)\b", text))
+        self.assertIn("обновится завтра", readable_reason(
+            "Stopped: openrouter.ai: daily limit of free model requests reached (HTTP 429); wait"))
 
     def test_rejected_letter_is_logged_with_vacancy_and_text(self):
         from gui_protocol import LETTER_LEVEL_REJECTED
@@ -1101,12 +1175,7 @@ class StepChecks(unittest.TestCase):
                     self.assertEqual(str(app.action_buttons[action]["state"]), "disabled", action)
                 self.assertIn("Войти в HH", app.status.get())
                 self.assertFalse(app.decision.winfo_manager())  # No disabled send button on first run.
-                app.show_tab(1)  # The selected section must be unambiguous.
-                self.assertEqual([str(button["style"]) for button, _line in app.selector_items],
-                                 ["Selector.TButton", "SelectorOn.TButton"])
-                self.assertEqual([str(line["style"]) for _button, line in app.selector_items],
-                                 ["IndicatorOff.TFrame", "IndicatorOn.TFrame"])
-                app.show_tab(0)
+                self.assertFalse(hasattr(app, "tabs"))  # #11: no journal tab in the work view.
                 app.session = gui_controller.Session("hh_login", {})
                 app.handle_frame(frame(app.session.run, "review", {"kind": "credential",
                     "context": "Email или телефон от аккаунта HH", "text": "", "options": []}))

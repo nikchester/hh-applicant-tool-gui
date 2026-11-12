@@ -120,3 +120,79 @@ def parse_auto_settings(limit, minimum, maximum):
     if not 0 < minimum <= maximum <= 86400:
         return None, "Первая пауза должна быть больше 0 и не больше второй."
     return (limit, minimum, maximum), None
+
+
+def _reset_time(reason):
+    """Local time of a provider limit reset found in the reason, or None."""
+    import re
+    import time
+    match = re.search(r"reset_epoch=(\d{10})\b", reason)
+    if not match:
+        return None
+    moment = time.localtime(int(match.group(1)))
+    today = time.localtime()
+    same_day = (moment.tm_year, moment.tm_yday) == (today.tm_year, today.tm_yday)
+    return time.strftime("%H:%M" if same_day else "%d.%m в %H:%M", moment)
+
+
+# Internal stop reasons (English, for the journal) -> what the person reads (#11).
+# Each pattern matches the text our own guards raise; the first match wins.
+_REASONS = (
+    (r"(?P<host>[\w.-]+): daily limit of free model requests", lambda m, r: (
+        f"Закончился дневной лимит бесплатных запросов {m['host']}."
+        + (f" Он обновится {_reset_time(r)}." if _reset_time(r) else " Он обновится завтра.")
+        + " Можно выбрать другого AI-провайдера или модель.")),
+    (r"(?P<host>[\w.-]+): rate limit \(HTTP 429\)", lambda m, r:
+        f"AI-провайдер {m['host']} ограничил частоту запросов. Подожди минуту и повтори."),
+    (r"(?P<host>[\w.-]+): HTTP (?P<code>40[13]); check the API key", lambda m, r:
+        f"AI-провайдер {m['host']} отклонил запрос (HTTP {m['code']}). Проверь ключ API и доступ к модели."),
+    (r"(?P<host>[a-z0-9-]+(?:\.[a-z0-9-]+)+): HTTP (?P<code>\d{3})", lambda m, r:
+        f"AI-провайдер {m['host']} вернул ошибку HTTP {m['code']}. Повтори позже или выбери другую модель."),
+    (r"AI provider request failed", lambda m, r:
+        "AI-провайдер не ответил. Повтори позже или выбери другую модель."),
+    (r"empty model response|empty test answer", lambda m, r:
+        "AI-провайдер вернул пустой ответ. Повтори или выбери другую модель."),
+    (r"rounds failed for \d+ vacancies in a row", lambda m, r:
+        "AI-провайдер не отвечает несколько вакансий подряд. Повтори позже."),
+    (r"ChatGPT (?:connect timeout|TLS handshake)|local model gateway HTTP|model generation failed"
+     r"|Preview stopped after model failure", lambda m, r:
+        "Модель не написала письмо. Повтори; если ошибка повторится, войди в ChatGPT заново или выбери другую модель."),
+    (r"after HTTP 429", lambda m, r: "HH ограничил частоту запросов (HTTP 429). Подожди несколько минут и повтори."),
+    (r"after HTTP 403", lambda m, r: "HH отказал в доступе (HTTP 403). Проверь вход в HH."),
+    (r"after HTTP (?P<code>5\d\d)", lambda m, r: f"HH временно не отвечает (HTTP {m['code']}). Повтори позже."),
+    (r"after HTTP (?P<code>\d{3})", lambda m, r: f"HH вернул ошибку HTTP {m['code']}."),
+    (r"Send outcome uncertain|No confirmed send result", lambda m, r:
+        "Неизвестно, дошёл ли отклик: HH не ответил. Проверь отклики на hh.ru, прежде чем повторять."),
+    (r"(?:Test send|Send) returned HTTP (?P<code>\d{3})", lambda m, r:
+        f"HH не принял отклик (HTTP {m['code']}). Проверь отклики на hh.ru, прежде чем повторять."),
+    (r"HH did not accept the test application", lambda m, r:
+        "HH не принял отклик с тестом. Проверь вакансию на hh.ru."),
+    (r"network failure|Network failure", lambda m, r: "Нет связи с HH. Проверь интернет или VPN и повтори."),
+    (r"Manual HH captcha failed or cancelled", lambda m, r:
+        "Капча не введена: окно закрыто или ввод прерван."),
+    (r"Captcha was not (?:accepted|entered)", lambda m, r: "HH не принял капчу."),
+    (r"requires an available Tkinter window", lambda m, r: "Не удалось открыть окно капчи."),
+    (r"Repeated HH captcha|Recursive HH captcha", lambda m, r:
+        "HH снова запросил капчу. Попробуй позже."),
+    (r"(?P<count>\d+) letters in a row failed the letter check", lambda m, r:
+        f"Писем подряд не прошли проверку: {m['count']}. Проверь стиль письма или выбери другую модель."),
+    (r"Vacancy salary changed", lambda m, r: "Зарплата в вакансии изменилась и вышла за лимит."),
+    (r"vacancy-detail failure", lambda m, r: "Не удалось прочитать вакансию в HH. Повтори позже."),
+    (r"No approval", lambda m, r: "Отклик не подтверждён."),
+    (r"Invalid manual letter", lambda m, r: "Пустой текст письма не принят."),
+    (r"[Bb]locked (?:an )?unexpected network request", lambda m, r:
+        "Защита программы остановила неожиданный сетевой запрос."),
+)
+
+
+def readable_reason(reason):
+    """The person-facing sentence for an internal stop reason; Russian reasons pass as they are."""
+    import re
+    if not isinstance(reason, str) or not reason.strip():
+        return "Запуск остановлен защитой программы."
+    if len(re.findall(r"[А-Яа-яЁё]", reason)) > len(re.findall(r"[A-Za-z]", reason)):
+        return reason.strip()  # Already written for the person, e.g. "HH повторно запросил капчу…".
+    for pattern, render in _REASONS:
+        if match := re.search(pattern, reason):
+            return render(match, reason)
+    return "Запуск остановлен защитой программы."

@@ -17,6 +17,30 @@ SUCCESS_TITLES = {
     "preview": "Предпросмотр готов. Письма — в списке «Готовые письма».",
     "apply": "Отклики завершены.", "auto": "Автоотклики завершены.", "chats": "Ответы в чатах завершены.",
 }
+# The journal (#11): this many lines stay in memory; the file rotates past LOG_FILE_LIMIT bytes.
+LOG_MEMORY_LINES = 5000
+LOG_FILE_LIMIT = 1024 * 1024
+
+
+def log_file_path():
+    from gui_profile import state_dir
+    return state_dir() / "log" / "gui.log"
+
+
+def write_log_file(path, line):
+    """Append one journal line; past the limit the file becomes gui.log.1. Never raises."""
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.exists() and path.stat().st_size > LOG_FILE_LIMIT:
+            path.replace(path.with_name(path.name + ".1"))
+        with path.open("a", encoding="utf-8") as file:
+            file.write(line + "\n")
+    except OSError:
+        pass
+
+
 CHAT_WAIT_ENDS = {
     "question": "Робот прислал следующий вопрос. Готовлю ответ на проверку.",
     "timeout": "Робот не прислал следующий вопрос. Перехожу к следующему чату.",
@@ -213,6 +237,7 @@ class Application:
         self.status = tk.StringVar()
         self.review_kind, self.sending, self.current_resume = None, False, None
         self.buttons, self.action_buttons = [], {}
+        self.log_lines, self.log_path, self.log_view = [], log_file_path(), None
         self.device_window = None
         root.title(APP_TITLE)
         root.geometry("1180x820")
@@ -311,19 +336,6 @@ class Application:
         accent_states = [("disabled", "#434343"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
         style.map("Accent.TButton", background=accent_states, lightcolor=accent_states, darkcolor=accent_states,
                   bordercolor=accent_states, foreground=[("disabled", DISABLED)])
-        # SelectorBar (Windows 11): selected item is bright and semibold with an accent line under it.
-        style.configure("Selector.TButton", background=CARD, foreground=MUTED, bordercolor=CARD,
-                        lightcolor=CARD, darkcolor=CARD, padding=(12, 6), relief="flat", font=(body, 10))
-        style.map("Selector.TButton", foreground=[("active", TEXT)], background=[("active", CARD)],
-                  lightcolor=[("active", CARD)], darkcolor=[("active", CARD)], bordercolor=[("focus", CARD)])
-        style.configure("SelectorOn.TButton", background=CARD, foreground=TEXT, bordercolor=CARD,
-                        lightcolor=CARD, darkcolor=CARD, padding=(12, 6), relief="flat", font=heavy(10))
-        style.map("SelectorOn.TButton", background=[("active", CARD)], lightcolor=[("active", CARD)],
-                  darkcolor=[("active", CARD)], bordercolor=[("focus", CARD)])
-        style.configure("IndicatorOn.TFrame", background=ACCENT)
-        style.configure("IndicatorOff.TFrame", background=CARD)
-        style.layout("Bare.TNotebook.Tab", [])
-        style.configure("Bare.TNotebook", background=CARD, borderwidth=0, tabmargins=0)
         style.configure("Expander.TButton", anchor="w", padding=(14, 9))
         for widget in ("TEntry", "TCombobox", "TSpinbox"):
             style.configure(widget, fieldbackground=FIELD, bordercolor=CONTROL_BORDER, lightcolor=FIELD,
@@ -362,6 +374,8 @@ class Application:
         message.pack(side="left", fill="x", expand=True)
         message.bind("<Configure>", lambda event: message.configure(wraplength=max(event.width - 8, 200)))
         self.infobar_message = message
+        # Errors and warnings link to the journal instead of opening it by themselves (#11).
+        self.infobar_more = ttk.Button(self.infobar, text="Подробнее", command=self.open_log)
         self.set_severity("info")
 
     def set_severity(self, level):
@@ -370,6 +384,12 @@ class Application:
             return
         _background, _icon, glyph, fallback = SEVERITY[level]
         infobar.configure(style=f"{level}.Info.TFrame")
+        more = getattr(self, "infobar_more", None)
+        if more is not None:
+            if level in ("error", "warning"):
+                more.pack(side="right", padx=(10, 0))
+            else:
+                more.pack_forget()
         self.infobar_icon.configure(style=f"{level}.InfoIcon.TLabel", text=glyph if self.icon_font else fallback)
         self.infobar_message.configure(style=f"{level}.Info.TLabel")
 
@@ -648,8 +668,10 @@ class Application:
         self.force_button = ttk.Button(top, text="Прервать сразу…", command=self.force, state="disabled")
         self.force_button.grid(row=0, column=4, padx=(4, 0))
         self.force_button.grid_remove()
-        self.view_button = ttk.Button(top, text="Журнал", command=self.toggle_view)
+        self.view_button = ttk.Button(top, text="Как начать", command=self.toggle_view)
         self.view_button.grid(row=0, column=5, padx=(8, 0))
+        self.log_button = ttk.Button(top, text="Журнал…", command=self.open_log)
+        self.log_button.grid(row=0, column=6, padx=(6, 0))
 
         self.welcome = welcome = ttk.Frame(main, padding=(4, 4, 4, 4))
         welcome.grid(row=1, column=0, sticky="nsew")
@@ -681,27 +703,10 @@ class Application:
         panel.grid(row=1, column=0, sticky="nsew", pady=(0, 8))
         panel.columnconfigure(0, weight=1)
         panel.rowconfigure(1, weight=1)
-        selector = ttk.Frame(panel)
-        selector.grid(row=0, column=0, sticky="w", pady=(0, 6))
-        self.tabs = ttk.Notebook(panel, style="Bare.TNotebook")
-        self.tabs.grid(row=1, column=0, sticky="nsew")
-        frame, self.context = self.text_box(self.tabs, 5)
-        self.tabs.add(frame, text="Вакансия или вопрос")
-        frame, self.log = self.text_box(self.tabs, 5)
-        self.log.configure(font=("Consolas", 9))
-        self.tabs.add(frame, text="Журнал")
-        self.selector_items = []
-        for index, title in enumerate(("Вакансия или вопрос", "Журнал")):
-            item = ttk.Frame(selector)
-            item.grid(row=0, column=index, padx=(0, 4))
-            button = ttk.Button(item, text=title, style="Selector.TButton", cursor="hand2",
-                                command=lambda number=index: self.show_tab(number))
-            button.pack()
-            line = ttk.Frame(item, height=3, style="IndicatorOff.TFrame")
-            line.pack(fill="x", padx=12)
-            self.selector_items.append((button, line))
-        self.tabs.bind("<<NotebookTabChanged>>", lambda _e: self.update_selector())
-        self.update_selector()
+        # The journal lives in its own window (#11): the work view shows only the vacancy.
+        ttk.Label(panel, text="Вакансия или вопрос").grid(row=0, column=0, sticky="w", pady=(0, 2))
+        frame, self.context = self.text_box(panel, 5)
+        frame.grid(row=1, column=0, sticky="nsew")
         self.letter_label = ttk.Label(work, text="Сопроводительное письмо")
         self.letter_label.grid(row=2, column=0, sticky="w")
         frame, self.letter = self.text_box(work, 7)
@@ -750,21 +755,20 @@ class Application:
         self.work.grid_remove()
         self.welcome.grid()
         self.heading.configure(text="С чего начать")
-        self.view_button.configure(text="Журнал")
+        self.view_button.configure(text="К работе")
 
-    def show_work(self, tab=0):
+    def show_work(self):
         welcome = getattr(self, "welcome", None)
         if welcome is None:
             return
         welcome.grid_remove()
         self.work.grid()
         self.view_button.configure(text="Как начать")
-        self.show_tab(tab)
 
     def toggle_view(self):
         if self.welcome.winfo_ismapped():
-            self.show_work(1)
-            self.heading.configure(text="Журнал")
+            self.show_work()
+            self.heading.configure(text="Вакансия или вопрос")
         else:
             self.show_welcome()
 
@@ -872,28 +876,74 @@ class Application:
         widget.configure(state="disabled")
 
     def append_log(self, text):
+        """One journal line: kept in memory, shown in the «Журнал» window, appended to the log file."""
         import time
-        log = getattr(self, "log", None)
-        if log is None:
+        line = time.strftime("%H:%M:%S  ") + text
+        lines = getattr(self, "log_lines", None)
+        if lines is None:
             return
-        log.configure(state="normal")
-        log.insert("end", time.strftime("%H:%M:%S  ") + text + "\n")
-        log.see("end")
-        log.configure(state="disabled")
+        lines.append(line)
+        del lines[:-LOG_MEMORY_LINES]
+        write_log_file(getattr(self, "log_path", None), time.strftime("%Y-%m-%d ") + line)
+        view = getattr(self, "log_view", None)
+        if view is not None:
+            try:
+                view.configure(state="normal")
+                view.insert("end", line + "\n")
+                view.see("end")
+                view.configure(state="disabled")
+            except self.tk.TclError:
+                self.log_view = None
 
-    def show_tab(self, index):
-        tabs = getattr(self, "tabs", None)
-        if tabs is not None:
-            tabs.select(index)
-            self.update_selector()
+    def open_log(self):
+        """The technical journal in its own window, away from the work view (#11)."""
+        tk, ttk = self.tk, self.ttk
+        window = getattr(self, "log_window", None)
+        if window is not None and window.winfo_exists():
+            window.deiconify()
+            window.lift()
+            return
+        window = self.log_window = tk.Toplevel(self.root, background=CARD)
+        window.title("Журнал")
+        window.geometry("860x480")
+        window.transient(self.root)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=14)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        frame.rowconfigure(1, weight=1)
+        ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой.",
+                  style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        box, view = self.text_box(frame, 18)
+        box.grid(row=1, column=0, sticky="nsew")
+        view.configure(font=("Consolas", 9))
+        self.replace_text(view, "".join(line + "\n" for line in self.log_lines))
+        view.see("end")
+        self.log_view = view
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=2, column=0, sticky="w", pady=(10, 0))
 
-    def update_selector(self):
-        """Selected item: bright semibold text and an accent line; others are dimmed."""
-        current = self.tabs.index("current")
-        for number, (button, line) in enumerate(getattr(self, "selector_items", ())):
-            selected = number == current
-            button.configure(style="SelectorOn.TButton" if selected else "Selector.TButton")
-            line.configure(style="IndicatorOn.TFrame" if selected else "IndicatorOff.TFrame")
+        def copy():
+            self.root.clipboard_clear()
+            self.root.clipboard_append("\n".join(self.log_lines))
+            self.say("Журнал скопирован в буфер обмена.")
+
+        def folder():
+            import os
+            path = getattr(self, "log_path", None)
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                os.startfile(path.parent)
+            except (AttributeError, OSError):
+                self.say("Не удалось открыть папку с журналом.", "warning")
+
+        def close():
+            self.log_view = self.log_window = None
+            window.destroy()
+        ttk.Button(buttons, text="Скопировать всё", command=copy).pack(side="left")
+        ttk.Button(buttons, text="Открыть папку с журналом", command=folder).pack(side="left", padx=6)
+        ttk.Button(buttons, text="Закрыть", command=close).pack(side="left")
+        window.protocol("WM_DELETE_WINDOW", close)
 
     def set_busy(self, running):
         for button in self.buttons:
@@ -1116,7 +1166,7 @@ class Application:
         if getattr(self, "heading", None) is None:
             return
         if action in REVIEW_ACTIONS:
-            self.show_work(0)
+            self.show_work()
             self.heading.configure(text=ACTION_TITLES[action].capitalize())
             self.letter_label.configure(text="Ответ в чат" if action == "chats" else
                                         "Сопроводительное письмо (предпросмотр, не отправляется)"
@@ -1697,7 +1747,7 @@ class Application:
                 self.say("Шаг 1: введи «" + (payload["context"] or "данные для входа")
                                 + "» под кнопкой «Войти в HH» и нажми «Продолжить».")
                 return
-            self.show_work(0)
+            self.show_work()
             self.replace_text(self.context, payload["context"])
             self.replace_text(self.letter, payload["text"])
             chat = self.review_kind == "chat"
@@ -1838,7 +1888,7 @@ class Application:
             self.root.after_cancel(job)
 
     def finish_message(self, data, action=None):
-        from gui_steps import FAILURE_HINTS
+        from gui_steps import FAILURE_HINTS, readable_reason
         done = data["done"]
         if data.get("busy"):
             return ("Не запущено: уже идёт другой запуск HH (окно GUI или автоотклики в PowerShell). "
@@ -1852,7 +1902,8 @@ class Application:
                        " Подробности — в журнале.")
         elif getattr(self, "stop_reason", None):
             # Our own guard named the cause: a login/provider hint would point the wrong way.
-            message = f"Запуск остановлен проверкой: {self.stop_reason}. Подробности — в журнале."
+            # The person reads a plain sentence; the internal reason stays in the journal (#11).
+            message = "Запуск остановлен. " + readable_reason(self.stop_reason)
         else:
             message = FAILURE_HINTS.get(action, "Не удалось завершить.") + " Подробности — в журнале."
         if done is not None and isinstance(done.get("counts"), dict) and any(done["counts"].values()):
@@ -1902,8 +1953,7 @@ class Application:
             attention(self.root, severity)
         if session.action == "hh_login" and data["success"]:
             self.root.after_idle(self.auto_load_resumes)
-        if not data["success"] and self.work.winfo_ismapped():
-            self.show_tab(1)
+        # A failure no longer swaps the work view for the journal (#11): «Подробнее» opens it.
 
     def poll(self):
         import queue
