@@ -136,12 +136,16 @@ def _reset_time(reason):
     moment = time.localtime(int(match.group(1)))
     today = time.localtime()
     same_day = (moment.tm_year, moment.tm_yday) == (today.tm_year, today.tm_yday)
-    return time.strftime("%H:%M" if same_day else "%d.%m в %H:%M", moment)
+    return time.strftime("в %H:%M" if same_day else "%d.%m в %H:%M", moment)
 
 
 # Internal stop reasons (English, for the journal) -> what the person reads (#11).
 # Each pattern matches the text our own guards raise; the first match wins.
 _REASONS = (
+    (r"fallback list exhausted", lambda m, r: (
+        "Модели из списка запасных закончились: у каждой кончился лимит или она недоступна."
+        + (f" Ближайший сброс лимита {_reset_time(r)}." if _reset_time(r) else "")
+        + " Добавь ещё бесплатную модель или повтори позже.")),
     (r"(?P<host>[\w.-]+): daily limit of free model requests", lambda m, r: (
         f"Закончился дневной лимит бесплатных запросов {m['host']}."
         + (f" Он обновится {_reset_time(r)}." if _reset_time(r) else " Он обновится завтра.")

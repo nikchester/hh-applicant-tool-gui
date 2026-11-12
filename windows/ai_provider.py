@@ -7,8 +7,9 @@ Credential Manager, never in config files, argv, environment or logs.
 """
 
 import ctypes
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import ipaddress
+import time
 from urllib.parse import urlsplit
 
 CHATMOCK_URL = "http://127.0.0.1:8000/v1"
@@ -147,9 +148,40 @@ def active():
     return _active
 
 
+@dataclass(frozen=True)
+class Fallback:
+    """One model of the fallback list (#10); its key goes only to its own provider host."""
+    provider: Provider
+    model: str
+    key: str = field(default=None, repr=False, compare=False)
+
+    @property
+    def label(self):
+        return f"{(urlsplit(self.provider.base_url).hostname or '').lower()} · {self.model}"
+
+
+_fallbacks = ()
+
+
+def activate_fallbacks(entries):
+    """Fallback models of this run. The network guards admit their providers too."""
+    global _fallbacks
+    _fallbacks = tuple(entries)
+    _excluded.clear()
+
+
+def fallbacks():
+    return _fallbacks
+
+
+def allowed_providers():
+    return (_active,) + tuple(entry.provider for entry in _fallbacks)
+
+
 def model_endpoint(method, url, provider=None):
-    """True only for the active provider's models list and chat completions."""
-    provider = provider or _active
+    """True only for a models list or chat completions of the active or a fallback provider."""
+    if provider is None:
+        return any(model_endpoint(method, url, candidate) for candidate in allowed_providers())
     try:
         target, base = urlsplit(url), urlsplit(provider.base_url)
         target_port, base_port = target.port, base.port
@@ -169,18 +201,17 @@ def model_endpoint(method, url, provider=None):
 
 
 def generation(method, url, provider=None):
-    provider = provider or _active
     return method == "POST" and model_endpoint(method, url, provider) and urlsplit(url).path.endswith(
         "/chat/completions")
 
 
 def describe(url, provider=None):
     """Fixed, secret-free label of a model request for error messages."""
-    provider = provider or _active
-    for method in ("GET", "POST"):
-        if model_endpoint(method, url, provider):
-            path = urlsplit(url).path
-            return f"{provider.title}: {path.rsplit('/', 1)[-1]}"
+    for candidate in ((provider,) if provider is not None else allowed_providers()):
+        for method in ("GET", "POST"):
+            if model_endpoint(method, url, candidate):
+                path = urlsplit(url).path
+                return f"{candidate.title}: {path.rsplit('/', 1)[-1]}"
     return None
 
 
@@ -351,6 +382,61 @@ def empty_reply(response):
     return not isinstance(content, str) or not content.strip()
 
 
+def _host(provider):
+    return (urlsplit(provider.base_url).hostname or "").lower()
+
+
+# Why the next fallback model gets the request (#10). Fixed codes: the GUI shows its own text.
+SWITCH_REASONS = ("daily_limit", "rate_limit", "region", "reasoning", "key", "unavailable", "empty")
+RATE_LIMIT_PAUSE = 60  # Seconds a rate-limited model rests when the provider names no time.
+_excluded = {}  # (base_url, model) -> epoch until which the model is skipped in this run.
+on_event = None  # The GUI worker sets channel.event to journal switches and the writing model.
+
+
+def switch_reason(response):
+    """Why this answer should go to the next fallback model, or None to keep it."""
+    status, text = response.status_code, str(getattr(response, "text", "") or "")
+    if status == 200:
+        return "empty" if empty_reply(response) else None
+    if status == 429:
+        return "daily_limit" if DAILY_LIMIT_MARK in text else "rate_limit"
+    if status == 403 and "region" in text.lower():
+        return "region"
+    if status == 400 and REASONING_MANDATORY in text:
+        return "reasoning"
+    if status in (401, 402, 403):
+        return "key"
+    if status in (404, 408) or status >= 500:
+        return "unavailable"
+    return None
+
+
+def _notify(name, data):
+    if on_event is not None:
+        try:
+            on_event(name, data)
+        except Exception:  # A journal line must never break a generation.
+            pass
+
+
+def _exclude(chain, entry, reason, response):
+    """Rest a failed model: a daily limit rests every model of that host until its reset."""
+    now = time.time()
+    if reason == "daily_limit":
+        until = reset_epoch(response) or float("inf")
+        for other in chain:
+            if _host(other.provider) == _host(entry.provider):
+                _excluded[(other.provider.base_url, other.model)] = until
+    elif reason == "rate_limit":
+        retry = str(getattr(response, "headers", {}).get("Retry-After", "") or "")
+        _excluded[(entry.provider.base_url, entry.model)] = now + (
+            min(int(retry), 3600) if retry.isdecimal() else RATE_LIMIT_PAUSE)
+    elif reason in ("region", "key"):
+        _excluded[(entry.provider.base_url, entry.model)] = float("inf")
+    elif reason == "unavailable" and response.status_code in (404,):
+        _excluded[(entry.provider.base_url, entry.model)] = float("inf")
+
+
 def tuned_request(original, provider):
     """Wrap OpenAIClient._request for the provider's own base_url.
 
@@ -358,33 +444,80 @@ def tuned_request(original, provider):
     sometimes think until the token limit and return no text. A model that cannot turn
     reasoning off answers 400; the same request then goes once more without the field.
     Every provider: an empty answer gets one more attempt.
+    With a fallback list (#10) a failed answer goes to the next model of the list; the
+    client's address and key are swapped only for that call, so a key reaches only its host.
     """
-    openrouter = (urlsplit(provider.base_url).hostname or "").lower() == "openrouter.ai"
-
-    def send(client, payload):
-        if openrouter and "reasoning" not in payload:
+    def send(client, payload, entry):
+        if _host(entry.provider) == "openrouter.ai" and "reasoning" not in payload:
             response = original(client, {**payload, "reasoning": REASONING_OFF})
             if not (response.status_code == 400 and REASONING_MANDATORY in response.text):
                 return response
         return original(client, payload)
+
+    def attempt(client, payload, entry):
+        response = send(client, payload, entry)
+        return send(client, payload, entry) if empty_reply(response) else response
+
+    def record(entry, response):
+        global _failure
+        _failure = (_host(entry.provider), response.status_code, DAILY_LIMIT_MARK in response.text,
+                    reset_epoch(response), False)
 
     def _request(client, payload):
         if str(getattr(client, "base_url", "")).rstrip("/") != provider.base_url:
             return original(client, payload)
         global _failure
         _failure = None  # A timeout leaves no answer: the detail must not be stale.
-        response = send(client, payload)
-        if empty_reply(response):
-            response = send(client, payload)
-        if response.status_code >= 400:
-            host = (urlsplit(provider.base_url).hostname or "").lower()
-            _failure = (host, response.status_code, DAILY_LIMIT_MARK in response.text, reset_epoch(response))
+        primary = Fallback(provider, payload.get("model"), getattr(client, "api_key", None))
+        chain = [primary] + [entry for entry in _fallbacks
+                             if (entry.provider.base_url, entry.model) != (provider.base_url, primary.model)]
+        if len(chain) == 1:  # No fallback list: one model, as before.
+            response = attempt(client, payload, primary)
+            if response.status_code >= 400:
+                record(primary, response)
+            return response
+        import requests
+        saved = (client.base_url, getattr(client, "api_key", None))
+        response, lost = None, None
+        try:
+            for entry in chain:
+                if _excluded.get((entry.provider.base_url, entry.model), 0) > time.time():
+                    continue
+                client.base_url, client.api_key = entry.provider.base_url, entry.key
+                try:
+                    response = attempt(client, {**payload, "model": entry.model}, entry)
+                except requests.RequestException as error:
+                    # An unreachable provider (e.g. a local model that is not running): try the next.
+                    lost = error
+                    _notify("model_switch", {"model": entry.label, "reason": "unavailable"})
+                    continue
+                reason = switch_reason(response)
+                if reason is None:
+                    if response.status_code >= 400:
+                        record(entry, response)
+                    else:
+                        _notify("model_used", entry.label)
+                    return response
+                record(entry, response)
+                _exclude(chain, entry, reason, response)
+                _notify("model_switch", {"model": entry.label, "reason": reason})
+        finally:
+            client.base_url, client.api_key = saved
+        resets = [until for until in _excluded.values() if until != float("inf") and until > time.time()]
+        _failure = ("", 429, False, int(min(resets)) if resets else None, True)
+        if response is None and lost is not None:
+            raise lost  # No model answered at all: upstream handles it as a network failure.
+        if response is None:  # Every model rests: answer like a rate limit, without a request.
+            response = requests.Response()
+            response.status_code, response._content = 429, b'{"error":{"message":"fallback list exhausted"}}'
         return response
     return _request
 
 
 DAILY_LIMIT_MARK = "free-models-per-day"  # OpenRouter's 429 when the free daily quota is spent.
-_failure = None  # (host, status, daily limit, reset epoch) of the last failed model answer; never its body.
+# (host, status, daily limit, reset epoch, fallback list exhausted) of the last failed model answer;
+# never its body.
+_failure = None
 
 
 def reset_epoch(response):
@@ -401,7 +534,10 @@ def failure_detail():
     """Fixed, secret-free reason of the last failed model answer, or None."""
     if _failure is None:
         return None
-    host, status, daily, reset = _failure
+    host, status, daily, reset, exhausted = _failure
+    if exhausted:
+        return ("fallback list exhausted: every model failed or rests; "
+                + (f"reset_epoch={reset}; " if reset else "") + "wait or add another free model")
     if status == 429 and daily:
         return (f"{host}: daily limit of free model requests reached (HTTP 429); "
                 + (f"reset_epoch={reset}; " if reset else "")

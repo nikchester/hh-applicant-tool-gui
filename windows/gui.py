@@ -41,6 +41,23 @@ def write_log_file(path, line):
         pass
 
 
+# Fixed texts of the fallback list (#10): the worker sends only these codes.
+MODEL_SWITCHES = {
+    "daily_limit": "закончился дневной лимит бесплатных запросов",
+    "rate_limit": "провайдер ограничил частоту запросов",
+    "region": "модель недоступна в твоём регионе",
+    "reasoning": "модель не отвечает без рассуждения",
+    "key": "провайдер отклонил ключ или доступ к модели",
+    "unavailable": "модель или провайдер недоступны",
+    "empty": "модель вернула пустой ответ",
+}
+FALLBACK_STATES = {
+    "ok": "доступна", "missing": "нет в списке моделей провайдера",
+    "no_key": "нет сохранённого ключа, модель пропущена", "network": "провайдер не ответил",
+    "damaged": "файл списка повреждён, запасные модели не используются",
+}
+
+
 CHAT_WAIT_ENDS = {
     "question": "Робот прислал следующий вопрос. Готовлю ответ на проверку.",
     "timeout": "Робот не прислал следующий вопрос. Перехожу к следующему чату.",
@@ -512,6 +529,10 @@ class Application:
         self.models.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.models.bind("<<ComboboxSelected>>", self.select_model)
         self.hint(model, "Выбранная модель сохраняется сама.", 3)
+        self.fallback_button = ttk.Button(model, text="Запасные модели…", command=self.edit_fallbacks)
+        self.fallback_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.buttons.append(self.fallback_button)
+        self.fallback_hint = self.hint(model, "", 8, pady=(2, 0))
         self.style_name = self.tk.StringVar()
         self.style_box = ttk.Combobox(model, textvariable=self.style_name, state="readonly", width=30)
         self.style_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
@@ -522,6 +543,7 @@ class Application:
         self.hint(model, "Каким ChatGPT пишет письмо: тон, длина, обращение. Выбранный стиль действует сразу.",
                   6, pady=(2, 0))
         self.load_styles()
+        self.show_fallback_count()
 
         run = self.step(side, 4, "Отклики")
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
@@ -1173,6 +1195,7 @@ class Application:
                            "limit": limit if action == "auto" else None}
         self.review_note = None
         self.stop_reason = None
+        self.letter_model, self.model_switched = None, False
         if getattr(self, "heading", None) is None:
             return
         if action in REVIEW_ACTIONS:
@@ -1182,6 +1205,117 @@ class Application:
                                         "Сопроводительное письмо (предпросмотр, не отправляется)"
                                         if action == "preview" else "Сопроводительное письмо")
         self.update_counter()
+
+    def show_fallback_count(self):
+        from gui_profile import read_fallbacks
+        try:
+            count = len(read_fallbacks())
+        except (OSError, ValueError):
+            count = 0
+        self.fallback_hint.configure(
+            text=f"Запасных моделей: {count}. Когда у модели кончается лимит, письмо пишет следующая."
+            if count else "Запасных моделей нет. Добавь их, чтобы при исчерпании лимита письмо писала другая модель.")
+
+    def edit_fallbacks(self):
+        """The ordered fallback list (#10): add the current model, reorder, remove. Saved at once."""
+        import ai_provider
+        from gui_profile import read_fallbacks, save_fallbacks
+        tk, ttk = self.tk, self.ttk
+        window = getattr(self, "fallback_window", None)
+        if window is not None and window.winfo_exists():
+            window.lift()
+            return
+        try:
+            items = read_fallbacks()
+        except (OSError, ValueError):
+            items = []
+        window = self.fallback_window = tk.Toplevel(self.root, background=CARD)
+        window.title("Запасные модели")
+        window.transient(self.root)
+        window.resizable(False, False)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        frame.columnconfigure(0, weight=1)
+        ttk.Label(frame, text="Запасные модели", style="Heading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(frame, style="Hint.TLabel", wraplength=520, justify="left", text=(
+            "Когда у основной модели кончается лимит или она недоступна, письмо пишет следующая модель "
+            "из списка, сверху вниз. Чтобы добавить модель: выбери её провайдера в «AI-провайдер…», "
+            "загрузи список моделей, выбери модель и нажми «Добавить текущую модель». Ключ каждого "
+            "провайдера хранится в диспетчере учётных данных Windows. ChatGPT через ChatMock в список "
+            "не входит. «Загрузить список моделей» заодно проверяет запасные модели.")).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(2, 10))
+        listbox = tk.Listbox(frame, height=8, width=60, activestyle="none", background=FIELD, foreground=TEXT,
+                             selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1,
+                             highlightbackground=CONTROL_BORDER, borderwidth=0, font=self.text_font)
+        listbox.grid(row=2, column=0, sticky="nsew")
+        side = ttk.Frame(frame)
+        side.grid(row=2, column=1, sticky="n", padx=(8, 0))
+        error = ttk.Label(frame, style="Error.TLabel", wraplength=520, justify="left")
+        error.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
+
+        def label(item):
+            return ai_provider.Fallback(ai_provider.parse(item["base_url"]), item["model"]).label
+
+        def show(selected=None):
+            listbox.delete(0, "end")
+            for item in items:
+                listbox.insert("end", label(item))
+            if selected is not None and items:
+                listbox.selection_set(min(selected, len(items) - 1))
+
+        def store(selected=None):
+            try:
+                save_fallbacks(items)
+            except (OSError, ValueError) as problem:
+                error.configure(text=str(problem))
+                return False
+            error.configure(text="")
+            show(selected)
+            self.show_fallback_count()
+            return True
+
+        def chosen():
+            selection = listbox.curselection()
+            return selection[0] if selection else None
+
+        def add():
+            model = self.model.get()
+            if self.provider.kind == ai_provider.CHATMOCK or model in {"", "CHOOSE_AFTER_LOGIN"}:
+                error.configure(text="Сначала выбери провайдера (не ChatMock) и модель в шаге 3.")
+                return
+            item = {"base_url": self.provider.base_url, "model": model}
+            if item in items:
+                error.configure(text="Эта модель уже в списке.")
+                return
+            items.append(item)
+            if not store(len(items) - 1):
+                items.pop()
+
+        def move(step):
+            index = chosen()
+            if index is None or not 0 <= index + step < len(items):
+                return
+            items[index], items[index + step] = items[index + step], items[index]
+            store(index + step)
+
+        def remove():
+            index = chosen()
+            if index is not None:
+                items.pop(index)
+                store(index)
+
+        def close():
+            self.fallback_window = None
+            window.destroy()
+        for row, (text, command) in enumerate((("Добавить текущую модель", add), ("Вверх", lambda: move(-1)),
+                                               ("Вниз", lambda: move(1)), ("Удалить", remove),
+                                               ("Закрыть", close))):
+            ttk.Button(side, text=text, command=command).grid(row=row, column=0, sticky="ew", pady=(0, 6))
+        window.protocol("WM_DELETE_WINDOW", close)
+        show()
+        self.fallback_controls = {"listbox": listbox, "add": add, "move": move, "remove": remove,
+                                  "error": error, "items": items, "close": close}
 
     def save_no_letter(self):
         from gui_profile import save_option
@@ -1770,9 +1904,11 @@ class Application:
             self.replace_text(self.letter, payload["text"])
             chat = self.review_kind == "chat"
             bare = not chat and payload["text"] == ""  # #9: an application without a letter.
-            self.letter_label.configure(text="Ответ в чат. Его получит работодатель." if chat else
-                                        "Отклик без сопроводительного письма: работодатель увидит только резюме."
-                                        if bare else "Сопроводительное письмо. Его получит работодатель.")
+            written = getattr(self, "letter_model", None)
+            self.letter_label.configure(text=("Ответ в чат. Его получит работодатель." if chat else
+                                              "Отклик без сопроводительного письма: работодатель увидит только резюме."
+                                              if bare else "Сопроводительное письмо. Его получит работодатель.")
+                                        + (f" Написала модель: {written}." if written and not bare else ""))
             self.yes.configure(text="Отправить ответ" if chat else "Отправить отклик" if bare else "Отправить письмо")
             self.decision.grid()
             self.yes.configure(state="normal")
@@ -1874,6 +2010,25 @@ class Application:
                             "Вакансия пропущена, отклик не отправлен.")
             self.append_log("Вакансия: " + title + (f" — {employer}" if employer else ""))
             self.append_log("Отклонённое письмо: " + value["text"][:2000])
+        elif (name == "model_switch" and isinstance(value, dict) and value.get("reason") in MODEL_SWITCHES
+              and isinstance(value.get("model"), str) and len(value["model"]) <= 300):
+            self.append_log(f"Модель {value['model']} пропущена: {MODEL_SWITCHES[value['reason']]}. "
+                            "Пробую следующую из списка запасных.")
+            self.model_switched = True
+        elif name == "model_used" and isinstance(value, str) and len(value) <= 300:
+            self.letter_model = value
+            if getattr(self, "model_switched", False):
+                self.append_log("Текст написала запасная модель " + value + ".")
+            self.model_switched = False
+        elif name == "fallback_check" and isinstance(value, list):
+            for item in value[:20]:
+                if (isinstance(item, dict) and isinstance(item.get("model"), str) and len(item["model"]) <= 300
+                        and isinstance(item.get("state"), str)):
+                    state = item["state"]
+                    text = FALLBACK_STATES.get(state) or (
+                        f"провайдер ответил HTTP {state[5:]}" if state.startswith("http_") and state[5:].isdecimal()
+                        else "состояние неизвестно")
+                    self.append_log(f"Запасная модель {item['model']}: {text}.")
         elif name == "letter_revision" and value in LETTER_REVISION_FAILURES:
             self.review_note = f"Письмо не переписано: {value}. Осталось прежнее письмо."
             self.append_log(self.review_note)

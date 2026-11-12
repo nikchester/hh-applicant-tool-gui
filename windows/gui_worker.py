@@ -137,6 +137,7 @@ def dispatch(action, settings, channel):
         response.raise_for_status()
         models = ai_provider.model_ids(provider, response.json()["data"])
         channel.event("models", models)
+        check_fallbacks(channel)
         return 0
     if action == "resumes":
         import list_resumes
@@ -163,6 +164,48 @@ def dispatch(action, settings, channel):
         raise ProtocolError("Unknown send action")
     return send.run(argv, all_resumes=settings["all"], gate_factory=factory, profile=profile,
                     observer=channel.event)
+
+
+def load_fallbacks(channel):
+    """Fallback models with their keys (#10); a model without its key is left out and journaled."""
+    import ai_provider
+    from gui_profile import read_fallbacks
+    try:
+        items = read_fallbacks()
+    except (OSError, ValueError):
+        channel.event("fallback_check", [{"model": "fallback-models.json", "state": "damaged"}])
+        return ()
+    entries = []
+    for item in items:
+        provider = ai_provider.parse(item["base_url"])
+        key = ai_provider.read_key(provider) if provider.needs_key else None
+        entry = ai_provider.Fallback(provider, item["model"], key)
+        if provider.needs_key and not key:
+            channel.event("fallback_check", [{"model": entry.label, "state": "no_key"}])
+            continue
+        entries.append(entry)
+    return tuple(entries)
+
+
+def check_fallbacks(channel):
+    """With the model list, check that each fallback model exists at its provider. No generation."""
+    import requests
+    import ai_provider
+    results = []
+    for entry in ai_provider.fallbacks():
+        try:
+            response = requests.get(entry.provider.base_url + "/models", timeout=(5, 20),
+                                    headers={"Authorization": "Bearer " + entry.key} if entry.key else {})
+            if response.status_code != 200:
+                state = f"http_{response.status_code}"
+            else:
+                listed = ai_provider.model_ids(entry.provider, response.json()["data"])
+                state = "ok" if entry.model in listed else "missing"
+        except (requests.RequestException, ValueError, KeyError, TypeError):
+            state = "network"
+        results.append({"model": entry.label, "state": state})
+    if results:
+        channel.event("fallback_check", results)
 
 
 def own_stop_reason(error):
@@ -262,6 +305,9 @@ def worker_main(reader=None, writer=None):
                     HHApplicantTool.get_openai_config, provider, key)))
                 if provider.kind != ai_provider.CHATMOCK:
                     from hh_applicant_tool.ai.openai import OpenAIClient
+                    ai_provider.activate_fallbacks(load_fallbacks(channel))
+                    ai_provider.on_event = channel.event
+                    stack.callback(setattr, ai_provider, "on_event", None)
                     stack.enter_context(patch.object(OpenAIClient, "_request", ai_provider.tuned_request(
                         OpenAIClient._request, provider)))
             if action in {"preview", "apply", "auto", "chats"} and not settings.get("no_letter"):

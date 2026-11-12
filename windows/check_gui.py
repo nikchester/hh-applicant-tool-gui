@@ -1141,8 +1141,10 @@ class StepChecks(unittest.TestCase):
             f"Stopped: openrouter.ai: daily limit of free model requests reached (HTTP 429); reset_epoch={reset}; "
             "wait for the daily reset, add credits or choose another provider; no automatic replay":
                 "Закончился дневной лимит бесплатных запросов openrouter.ai. Он обновится "
-                + time.strftime("%H:%M" if time.localtime(reset).tm_yday == time.localtime().tm_yday
+                + time.strftime("в %H:%M" if time.localtime(reset).tm_yday == time.localtime().tm_yday
                                 else "%d.%m в %H:%M", time.localtime(reset)),
+            f"Stopped: fallback list exhausted: every model failed or rests; reset_epoch={reset}; wait":
+                "Модели из списка запасных закончились",
             "Preview stopped after model failure: api.groq.com: rate limit (HTTP 429); wait a minute and retry":
                 "AI-провайдер api.groq.com ограничил частоту запросов",
             "Stopped: openrouter.ai: HTTP 401; check the API key and model access; no automatic replay":
@@ -1549,6 +1551,214 @@ class ProviderChecks(unittest.TestCase):
     def tearDown(self):
         import ai_provider
         ai_provider.activate(ai_provider.Provider(ai_provider.CHATMOCK, ai_provider.CHATMOCK_URL))
+        ai_provider.activate_fallbacks(())
+        ai_provider.on_event = None
+
+    def chain(self, *replies):
+        """A primary OpenRouter client and a recording transport for the fallback chain tests (#10)."""
+        import ai_provider
+        provider = ai_provider.parse("https://openrouter.ai/api/v1")
+        client = SimpleNamespace(base_url=provider.base_url, api_key="sk-or-primary")
+        calls, queue_ = [], list(replies)
+
+        def original(client_, payload):
+            calls.append((client_.base_url, client_.api_key, payload["model"]))
+            return queue_.pop(0)
+        events = []
+        ai_provider.on_event = lambda name, data: events.append((name, data))
+        return ai_provider.tuned_request(original, provider), client, calls, events
+
+    @staticmethod
+    def reply(status=200, content="Письмо", text="", headers=None):
+        response = Mock(status_code=status, text=text, headers=headers or {})
+        response.json.return_value = {"choices": [{"message": {"content": content}}]}
+        return response
+
+    def test_fallback_chain_moves_on_and_rests_models_until_their_reset(self):
+        import ai_provider
+        groq = ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "llama", "gsk-groq")
+        local = ai_provider.Fallback(ai_provider.parse("http://127.0.0.1:11434/v1"), "qwen")
+        ai_provider.activate_fallbacks([groq, local])
+        daily = self.reply(429, text="Rate limit exceeded: free-models-per-day")
+        wrapped, client, calls, events = self.chain(daily, self.reply(content="От Groq"))
+        result = wrapped(client, {"model": "openrouter/free", "messages": []})
+        self.assertEqual(result.json()["choices"][0]["message"]["content"], "От Groq")
+        # Each key reaches only its own host; the client is restored after the call.
+        self.assertEqual(calls, [("https://openrouter.ai/api/v1", "sk-or-primary", "openrouter/free"),
+                                 ("https://api.groq.com/openai/v1", "gsk-groq", "llama")])
+        self.assertEqual((client.base_url, client.api_key), ("https://openrouter.ai/api/v1", "sk-or-primary"))
+        self.assertEqual(events, [("model_switch", {"model": "openrouter.ai · openrouter/free",
+                                                    "reason": "daily_limit"}),
+                                  ("model_used", "api.groq.com · llama")])
+        # The spent OpenRouter quota is not asked again in this run; Groq now rests a minute.
+        calls.clear()
+        wrapped2, _, calls2, events2 = self.chain(self.reply(429, text="slow down"), self.reply(content=""),
+                                                  self.reply(content=""))
+        result = wrapped2(client, {"model": "openrouter/free"})
+        self.assertEqual([call[0] for call in calls2], ["https://api.groq.com/openai/v1",
+                                                         "http://127.0.0.1:11434/v1", "http://127.0.0.1:11434/v1"])
+        self.assertEqual(calls2[1][1], None)  # No key goes to the local model.
+        self.assertEqual([data["reason"] for name, data in events2 if name == "model_switch"],
+                         ["rate_limit", "empty"])
+        self.assertEqual(result.status_code, 200)  # The last answer is returned for upstream to judge.
+        detail = ai_provider.failure_detail()
+        self.assertIn("fallback list exhausted", detail)
+        self.assertRegex(detail, r"reset_epoch=\d{10}")
+        # OpenRouter and Groq rest; the local model answers 404 and leaves the list for this run.
+        wrapped3, _, calls3, _ = self.chain(self.reply(404, text="no such model"))
+        self.assertEqual(wrapped3(client, {"model": "openrouter/free"}).status_code, 404)
+        self.assertEqual(calls3, [("http://127.0.0.1:11434/v1", None, "qwen")])
+        # Every model rests: an answer like a rate limit, without any request.
+        wrapped4, _, calls4, _ = self.chain()
+        self.assertEqual(wrapped4(client, {"model": "openrouter/free"}).status_code, 429)
+        self.assertEqual(calls4, [])
+        self.assertIn("fallback list exhausted", ai_provider.failure_detail())
+
+    def test_unreachable_fallback_moves_on_and_a_total_loss_stays_a_network_failure(self):
+        import ai_provider
+        local = ai_provider.Fallback(ai_provider.parse("http://127.0.0.1:11434/v1"), "qwen")
+        groq = ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "llama", "gsk")
+        ai_provider.activate_fallbacks([local, groq])
+        _, client, calls, events = self.chain()  # Only the client and the event list are reused.
+        # This transport raises when it meets an exception in its queue.
+        replies = [self.reply(503, text="down"), requests.ConnectionError("refused"), self.reply(content="Ок")]
+
+        def original(client_, payload):
+            calls.append((client_.base_url, payload["model"]))
+            item = replies.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        wrapped = ai_provider.tuned_request(original, ai_provider.parse("https://openrouter.ai/api/v1"))
+        self.assertEqual(wrapped(client, {"model": "m"}).json()["choices"][0]["message"]["content"], "Ок")
+        self.assertEqual([data["reason"] for name, data in events if name == "model_switch"],
+                         ["unavailable", "unavailable"])
+        self.assertEqual(client.base_url, "https://openrouter.ai/api/v1")
+        replies[:] = [self.reply(503), requests.ConnectionError("refused"), self.reply(503)]
+        ai_provider._excluded.clear()
+        wrapped(client, {"model": "m"})  # Answers came: the last one is returned, nothing raised.
+        replies[:] = [requests.ConnectionError("a"), requests.ConnectionError("b"), requests.ConnectionError("c")]
+        with self.assertRaises(requests.ConnectionError):
+            wrapped(client, {"model": "m"})
+        self.assertEqual(client.base_url, "https://openrouter.ai/api/v1")
+
+    def test_fallback_switch_reasons_and_what_stays_put(self):
+        import ai_provider
+        cases = ((self.reply(403, text="This model is not available in your region."), "region"),
+                 (self.reply(401, text="bad key"), "key"), (self.reply(404, text="no model"), "unavailable"),
+                 (self.reply(503, text="down"), "unavailable"), (self.reply(content=" "), "empty"),
+                 (self.reply(400, text="Reasoning is mandatory"), "reasoning"),
+                 (self.reply(400, text="bad request"), None), (self.reply(), None))
+        for response, reason in cases:
+            with self.subTest(reason=reason, status=response.status_code):
+                self.assertEqual(ai_provider.switch_reason(response), reason)
+        # Without a fallback list nothing rests: one model, as before (#10 changes nothing there).
+        wrapped, client, calls, events = self.chain(self.reply(429, text="free-models-per-day"))
+        self.assertEqual(wrapped(client, {"model": "m"}).status_code, 429)
+        self.assertEqual(events, [])
+        self.assertEqual(ai_provider._excluded, {})
+
+    def test_guards_admit_fallback_providers_only(self):
+        import ai_provider
+        import preview_hh
+        ai_provider.activate(ai_provider.parse("https://openrouter.ai/api/v1"))
+        ai_provider.activate_fallbacks([ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"),
+                                                             "llama", "gsk")])
+        self.assertTrue(preview_hh.allowed_request("POST", "https://api.groq.com/openai/v1/chat/completions"))
+        self.assertTrue(preview_hh.allowed_request("GET", "https://api.groq.com/openai/v1/models"))
+        self.assertTrue(ai_provider.generation("POST", "https://api.groq.com/openai/v1/chat/completions"))
+        for method, url in (("POST", "https://api.groq.com/openai/v1/other"),
+                            ("POST", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"),
+                            ("POST", "https://api.groq.com/openai/v1/chat/completions?x=1")):
+            with self.subTest(url=url):
+                self.assertFalse(preview_hh.allowed_request(method, url))
+        ai_provider.activate_fallbacks(())
+        self.assertFalse(preview_hh.allowed_request("POST", "https://api.groq.com/openai/v1/chat/completions"))
+
+    def test_fallback_list_is_validated_and_loaded_with_keys(self):
+        good = [{"base_url": "https://api.groq.com/openai/v1/", "model": "llama"},
+                {"base_url": "http://127.0.0.1:11434/v1", "model": "qwen"}]
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            self.assertEqual(gui_profile.read_fallbacks(), [])
+            gui_profile.save_fallbacks(good)
+            self.assertEqual(gui_profile.read_fallbacks()[0]["base_url"], "https://api.groq.com/openai/v1")
+            for bad in ([{"base_url": "http://127.0.0.1:8000/v1", "model": "gpt-5"}],  # ChatMock.
+                        [{"base_url": "https://api.groq.com/openai/v1", "model": "a b"}],
+                        good + [good[0]], [{"base_url": "https://x.example/v1", "model": "m"}] * 11,
+                        [{"base_url": "https://api.hh.ru/v1", "model": "m"}], [{"model": "m"}]):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    gui_profile.save_fallbacks(bad)
+            channel = FakeChannel()
+            with patch("ai_provider.read_key", lambda provider, api=None: None):
+                entries = gui_worker.load_fallbacks(channel)
+            self.assertEqual([entry.model for entry in entries], ["qwen"])  # Groq has no stored key.
+            self.assertEqual(channel.events, [("fallback_check", [{"model": "api.groq.com · llama",
+                                                                    "state": "no_key"}])])
+
+    def test_model_list_also_checks_fallback_models_without_generation(self):
+        import ai_provider
+        ai_provider.activate(ai_provider.parse("https://openrouter.ai/api/v1"))
+        ai_provider.activate_fallbacks([
+            ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "llama", "gsk"),
+            ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "gone", "gsk")])
+        listed = Mock(status_code=200)
+        listed.json.return_value = {"data": [{"id": "openrouter/free"}, {"id": "llama"}]}
+        channel = FakeChannel()
+        with patch("ai_provider.read_key", return_value="sk"), patch("requests.get", return_value=listed) as get:
+            self.assertEqual(gui_worker.dispatch("models", {}, channel), 0)
+        self.assertTrue(all(call.args[0].endswith("/models") for call in get.call_args_list))
+        self.assertEqual(get.call_args_list[1].kwargs["headers"], {"Authorization": "Bearer gsk"})
+        self.assertEqual(channel.events[-1], ("fallback_check", [
+            {"model": "api.groq.com · llama", "state": "ok"}, {"model": "api.groq.com · gone", "state": "missing"}]))
+
+    def test_real_tk_fallback_window_and_journal_lines(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                 patch("ai_provider.read_key", return_value="sk"):
+                gui_profile.set_provider("https://api.groq.com/openai/v1")
+                app = gui.Application(root, tk, ttk, Mock())
+                self.assertIn("Запасных моделей нет", str(app.fallback_hint["text"]))
+                app.edit_fallbacks()
+                controls = app.fallback_controls
+                app.model.set("")
+                controls["add"]()
+                self.assertIn("выбери", controls["error"]["text"])
+                for model in ("llama", "mixtral"):
+                    app.model.set(model)
+                    controls["add"]()
+                controls["add"]()
+                self.assertIn("уже в списке", controls["error"]["text"])
+                controls["listbox"].selection_clear(0, "end")
+                controls["listbox"].selection_set(1)
+                controls["move"](-1)
+                self.assertEqual([item["model"] for item in gui_profile.read_fallbacks()], ["mixtral", "llama"])
+                controls["remove"]()
+                self.assertEqual([item["model"] for item in gui_profile.read_fallbacks()], ["llama"])
+                self.assertIn("Запасных моделей: 1", str(app.fallback_hint["text"]))
+                controls["close"]()
+                app.session = gui_controller.Session("apply", {})
+                app.prepare_run_view("apply", 1)
+                for name, data in (("model_switch", {"model": "openrouter.ai · openrouter/free",
+                                                     "reason": "daily_limit"}),
+                                   ("model_used", "api.groq.com · llama"),
+                                   ("fallback_check", [{"model": "api.groq.com · llama", "state": "http_401"}])):
+                    app.handle_frame(frame(app.session.run, "event", {"name": name, "data": data}))
+                journal = "\n".join(app.log_lines)
+                self.assertIn("пропущена: закончился дневной лимит", journal)
+                self.assertIn("Текст написала запасная модель api.groq.com · llama", journal)
+                self.assertIn("провайдер ответил HTTP 401", journal)
+                app.handle_frame(frame(app.session.run, "review", {"kind": "application", "context": "V",
+                    "text": "Письмо", "options": []}))
+                self.assertIn("Написала модель: api.groq.com · llama", str(app.letter_label["text"]))
+        finally:
+            root.destroy()
 
     def test_base_url_decides_kind_and_rejects_unsafe_addresses(self):
         import ai_provider
