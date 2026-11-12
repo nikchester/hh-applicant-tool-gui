@@ -1789,6 +1789,41 @@ class ProviderChecks(unittest.TestCase):
         self.assertEqual(calls4, [])
         self.assertIn("fallback list exhausted", ai_provider.failure_detail())
 
+    def test_groq_speech_models_are_hidden_and_a_tested_default_is_picked(self):
+        import ai_provider
+        groq = ai_provider.parse("https://api.groq.com/openai/v1")
+        listed = ai_provider.model_ids(groq, [{"id": name} for name in (
+            "canopylabs/orpheus-v1-english", "canopylabs/orpheus-arabic-saudi", "playai-tts", "allam-2-7b",
+            "openai/gpt-oss-120b", "qwen/qwen3.8-27b")])
+        self.assertEqual(listed, ["allam-2-7b", "openai/gpt-oss-120b", "qwen/qwen3.8-27b"])
+        self.assertEqual(ai_provider.preferred_model(groq, listed), "openai/gpt-oss-120b")
+        self.assertEqual(ai_provider.preferred_model(groq, ["allam-2-7b"]), "allam-2-7b")
+        self.assertEqual(ai_provider.preferred_model(ai_provider.parse("https://openrouter.ai/api/v1"),
+                                                     ["x:free", "openrouter/free"]), "openrouter/free")
+        self.assertEqual(ai_provider.preferred_model(ai_provider.parse(self.API), ["b", "a"]), "b")
+        self.assertIsNone(ai_provider.preferred_model(groq, []))
+
+    def test_provider_error_code_is_named_but_never_free_text(self):
+        import ai_provider
+        from gui_steps import readable_reason
+
+        def answer(error):
+            response = Mock(status_code=400, text="", headers={})
+            response.json.return_value = {"error": error}
+            return response
+        self.assertEqual(ai_provider.error_code(answer({"message": "SECRET text", "code": "model_terms_required"})),
+                         "model_terms_required")
+        self.assertEqual(ai_provider.error_code(answer({"type": "invalid_request_error"})), "invalid_request_error")
+        for bad in ({"code": "has space"}, {"code": "x" * 65}, {"code": 400}, "text", None):
+            with self.subTest(bad=bad):
+                self.assertIsNone(ai_provider.error_code(answer(bad)))
+        wrapped, client, _calls, _events = self.chain(answer({"code": "model_terms_required", "message": "SECRET"}))
+        wrapped(client, {"model": "canopylabs/orpheus-v1-english"})
+        detail = ai_provider.failure_detail()
+        self.assertEqual(detail, "openrouter.ai: HTTP 400 (model_terms_required)")
+        self.assertIn("требует принять условия", readable_reason("Stopped: " + detail + "; no automatic replay"))
+        self.assertIn("больше нет", readable_reason("Stopped: api.groq.com: HTTP 404 (model_not_found); x"))
+
     def test_unreachable_fallback_moves_on_and_a_total_loss_stays_a_network_failure(self):
         import ai_provider
         local = ai_provider.Fallback(ai_provider.parse("http://127.0.0.1:11434/v1"), "qwen")

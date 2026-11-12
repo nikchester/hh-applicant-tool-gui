@@ -150,6 +150,11 @@ _REASONS = (
         f"Закончился дневной лимит бесплатных запросов {m['host']}."
         + (f" Он обновится {_reset_time(r)}." if _reset_time(r) else " Он обновится завтра.")
         + " Можно выбрать другого AI-провайдера или модель.")),
+    (r"(?P<host>[\w.-]+): HTTP \d{3} \(model_terms_required\)", lambda m, r:
+        f"AI-провайдер {m['host']} требует принять условия этой модели в своей консоли. "
+        "Выбери другую модель или прими условия у провайдера."),
+    (r"(?P<host>[\w.-]+): HTTP \d{3} \((?:model_not_found|model_decommissioned|model_not_active)\)",
+     lambda m, r: f"Выбранной модели больше нет у {m['host']}. Загрузи список моделей заново и выбери другую."),
     (r"(?P<host>[\w.-]+): rate limit \(HTTP 429\)", lambda m, r:
         f"AI-провайдер {m['host']} ограничил частоту запросов. Подожди минуту и повтори."),
     (r"(?P<host>[\w.-]+): HTTP (?P<code>40[13]); check the API key", lambda m, r:

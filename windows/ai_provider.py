@@ -90,26 +90,37 @@ class FreeApi:
     base_url: str
     key_page: str
     note: str
+    default_model: str = None  # Chosen after a model list load when the current model is not listed.
 
 
 FREE_APIS = (
     FreeApi("OpenRouter", "https://openrouter.ai/api/v1", "https://openrouter.ai/settings/keys",
             "В списке моделей будут только бесплатные (:free). Без пополнения баланса — около 50 "
-            "запросов в день."),
+            "запросов в день.", "openrouter/free"),
     FreeApi("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "https://aistudio.google.com/apikey",
             "Бесплатный уровень Google AI Studio. Google может использовать запросы бесплатного уровня "
             "для улучшения своих продуктов. В некоторых странах Gemini API недоступен."),
     FreeApi("Groq", "https://api.groq.com/openai/v1", "https://console.groq.com/keys",
-            "Бесплатный уровень с лимитами запросов в минуту и в день."),
+            "Бесплатный уровень с лимитами запросов в минуту и в день.", "openai/gpt-oss-120b"),
 )
-# Ids of models that cannot write a letter: speech, images, embeddings, safety classifiers.
-NOT_CHAT = ("embedding", "whisper", "tts", "imagen", "veo", "lyria", "image", "audio", "guard", "aqa")
+# Ids of models that cannot write a letter: speech (Groq's Orpheus and PlayAI voices), images,
+# embeddings, safety classifiers.
+NOT_CHAT = ("embedding", "whisper", "tts", "orpheus", "playai", "imagen", "veo", "lyria", "image", "audio",
+            "guard", "aqa")
 
 
 def free_api(base_url):
     """The FREE_APIS entry with this exact base_url, or None."""
     base_url = str(base_url or "").strip().rstrip("/")
     return next((api for api in FREE_APIS if api.base_url == base_url), None)
+
+
+def preferred_model(provider, ids):
+    """The model to pick after a list load: the free API's tested default, else the first listed."""
+    api = free_api(provider.base_url)
+    if api is not None and api.default_model in ids:
+        return api.default_model
+    return ids[0] if ids else None
 
 
 def model_ids(provider, data):
@@ -461,7 +472,7 @@ def tuned_request(original, provider):
     def record(entry, response):
         global _failure
         _failure = (_host(entry.provider), response.status_code, DAILY_LIMIT_MARK in response.text,
-                    reset_epoch(response), False)
+                    reset_epoch(response), False, error_code(response))
 
     def _request(client, payload):
         if str(getattr(client, "base_url", "")).rstrip("/") != provider.base_url:
@@ -504,7 +515,7 @@ def tuned_request(original, provider):
         finally:
             client.base_url, client.api_key = saved
         resets = [until for until in _excluded.values() if until != float("inf") and until > time.time()]
-        _failure = ("", 429, False, int(min(resets)) if resets else None, True)
+        _failure = ("", 429, False, int(min(resets)) if resets else None, True, None)
         if response is None and lost is not None:
             raise lost  # No model answered at all: upstream handles it as a network failure.
         if response is None:  # Every model rests: answer like a rate limit, without a request.
@@ -534,7 +545,8 @@ def failure_detail():
     """Fixed, secret-free reason of the last failed model answer, or None."""
     if _failure is None:
         return None
-    host, status, daily, reset, exhausted = _failure
+    host, status, daily, reset, exhausted, code = _failure
+    code = f" ({code})" if code else ""
     if exhausted:
         return ("fallback list exhausted: every model failed or rests; "
                 + (f"reset_epoch={reset}; " if reset else "") + "wait or add another free model")
@@ -545,8 +557,23 @@ def failure_detail():
     if status == 429:
         return f"{host}: rate limit (HTTP 429); wait a minute and retry"
     if status in (401, 403):
-        return f"{host}: HTTP {status}; check the API key and model access"
-    return f"{host}: HTTP {status}"
+        return f"{host}: HTTP {status}{code}; check the API key and model access"
+    return f"{host}: HTTP {status}{code}"
+
+
+def error_code(response):
+    """The provider's own short error code, e.g. model_terms_required; never free text."""
+    try:
+        error = response.json().get("error")
+    except (ValueError, AttributeError, TypeError):
+        return None
+    if not isinstance(error, dict):
+        return None
+    for value in (error.get("code"), error.get("type"), error.get("status")):
+        if (isinstance(value, str) and 0 < len(value) <= 64
+                and all(c.isascii() and (c.isalnum() or c in "_.-") for c in value)):
+            return value
+    return None
 
 
 def ready(provider, *, chatgpt_signed_in=False, api=None):

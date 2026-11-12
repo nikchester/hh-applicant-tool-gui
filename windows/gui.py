@@ -2199,7 +2199,9 @@ class Application:
         elif name == "models":
             self.models.configure(values=value)
             if self.model.get() not in value and value:
-                self.models.current(0)
+                import ai_provider
+                # A tested default of a free API, not whatever comes first (e.g. a speech model).
+                self.models.current(value.index(ai_provider.preferred_model(self.provider, value)))
                 self.select_model()
             self.append_log(f"Загружено моделей: {len(value)}")
         elif name == "device":
