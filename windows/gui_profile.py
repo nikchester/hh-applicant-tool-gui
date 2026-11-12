@@ -150,43 +150,6 @@ def save_option(name, value):
     atomic_write(options_path(), json.dumps(data, indent=2))
 
 
-MAX_FALLBACKS = 10
-
-
-def fallbacks_path():
-    return state_dir() / "fallback-models.json"
-
-
-def validate_fallbacks(items):
-    """Ordered [{"base_url", "model"}] of external or local providers (#10); ChatMock is not a fallback."""
-    import ai_provider
-    if not isinstance(items, list) or len(items) > MAX_FALLBACKS:
-        raise ValueError("Invalid fallback list")
-    clean, seen = [], set()
-    for item in items:
-        if not isinstance(item, dict) or set(item) != {"base_url", "model"}:
-            raise ValueError("Invalid fallback model")
-        provider = ai_provider.parse(item["base_url"])
-        model = item["model"]
-        if (provider.kind == ai_provider.CHATMOCK or not isinstance(model, str) or not model.strip()
-                or len(model) > 200 or any(character.isspace() or ord(character) < 32 for character in model)):
-            raise ValueError("Invalid fallback model")
-        if (provider.base_url, model) in seen:
-            raise ValueError("Repeated fallback model")
-        seen.add((provider.base_url, model))
-        clean.append({"base_url": provider.base_url, "model": model})
-    return clean
-
-
-def read_fallbacks():
-    path = fallbacks_path()
-    return validate_fallbacks(json.loads(path.read_text(encoding="utf-8"))) if path.exists() else []
-
-
-def save_fallbacks(items):
-    atomic_write(fallbacks_path(), json.dumps(validate_fallbacks(items), ensure_ascii=False, indent=2))
-
-
 # Placeholders HH 2.3.7 fills in the cover letter prompt (apply_vacancies.py).
 PROMPT_PLACEHOLDERS = ("vacancy_name", "vacancy_url", "employer_name", "first_name", "last_name",
                        "email", "phone", "resume_hash", "resume_title", "resume_url")

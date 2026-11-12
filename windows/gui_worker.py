@@ -131,13 +131,16 @@ def dispatch(action, settings, channel):
         import requests
         import ai_provider
         provider = ai_provider.active()
+        if ai_provider.free_mode(provider):
+            # Free mode: no model to choose; check that the built-in models are still listed.
+            channel.event("models", check_free_models(channel))
+            return 0
         key = ai_provider.read_key(provider) if provider.needs_key else None
         response = requests.get(provider.base_url + "/models", timeout=(5, 20),
                                 headers={"Authorization": "Bearer " + key} if key else {})
         response.raise_for_status()
         models = ai_provider.model_ids(provider, response.json()["data"])
         channel.event("models", models)
-        check_fallbacks(channel)
         return 0
     if action == "resumes":
         import list_resumes
@@ -166,46 +169,29 @@ def dispatch(action, settings, channel):
                     observer=channel.event)
 
 
-def load_fallbacks(channel):
-    """Fallback models with their keys (#10); a model without its key is left out and journaled."""
-    import ai_provider
-    from gui_profile import read_fallbacks
-    try:
-        items = read_fallbacks()
-    except (OSError, ValueError):
-        channel.event("fallback_check", [{"model": "fallback-models.json", "state": "damaged"}])
-        return ()
-    entries = []
-    for item in items:
-        provider = ai_provider.parse(item["base_url"])
-        key = ai_provider.read_key(provider) if provider.needs_key else None
-        entry = ai_provider.Fallback(provider, item["model"], key)
-        if provider.needs_key and not key:
-            channel.event("fallback_check", [{"model": entry.label, "state": "no_key"}])
-            continue
-        entries.append(entry)
-    return tuple(entries)
-
-
-def check_fallbacks(channel):
-    """With the model list, check that each fallback model exists at its provider. No generation."""
+def check_free_models(channel):
+    """Free mode: which built-in models each keyed provider still lists. No generation, no quota."""
     import requests
     import ai_provider
-    results = []
+    results, listed, available = [], {}, []
     for entry in ai_provider.fallbacks():
-        try:
-            response = requests.get(entry.provider.base_url + "/models", timeout=(5, 20),
-                                    headers={"Authorization": "Bearer " + entry.key} if entry.key else {})
-            if response.status_code != 200:
-                state = f"http_{response.status_code}"
-            else:
-                listed = ai_provider.model_ids(entry.provider, response.json()["data"])
-                state = "ok" if entry.model in listed else "missing"
-        except (requests.RequestException, ValueError, KeyError, TypeError):
-            state = "network"
+        base = entry.provider.base_url
+        if base not in listed:
+            try:
+                response = requests.get(base + "/models", timeout=(5, 20),
+                                        headers={"Authorization": "Bearer " + entry.key} if entry.key else {})
+                listed[base] = (ai_provider.model_ids(entry.provider, response.json()["data"])
+                                if response.status_code == 200 else f"http_{response.status_code}")
+            except (requests.RequestException, ValueError, KeyError, TypeError):
+                listed[base] = "network"
+        state = listed[base] if isinstance(listed[base], str) else (
+            "ok" if entry.model in listed[base] else "missing")
         results.append({"model": entry.label, "state": state})
+        if state == "ok":
+            available.append(entry.label)
     if results:
         channel.event("fallback_check", results)
+    return available
 
 
 def own_stop_reason(error):
@@ -297,20 +283,24 @@ def worker_main(reader=None, writer=None):
                 provider = ai_provider.from_config(config)
                 ai_provider.activate(provider)
                 key = ai_provider.read_key(provider) if provider.needs_key else None
+                free = ai_provider.free_mode(provider)
+                # Free mode: the built-in models of every free API with a key, switched by the app.
+                chain = ai_provider.free_chain() if free else ()
                 # #9: applications without a letter never call the model.
-                if provider.needs_key and not key and not settings.get("no_letter"):
+                if (not chain if free else provider.needs_key and not key) and not settings.get("no_letter"):
                     raise ProtocolError("AI provider key is missing")
                 # The key stays in this process's memory: never argv, environment or files.
                 stack.enter_context(patch.object(HHApplicantTool, "get_openai_config", ai_provider.keyed_config(
                     HHApplicantTool.get_openai_config, provider, key)))
                 if provider.kind != ai_provider.CHATMOCK:
                     from hh_applicant_tool.ai.openai import OpenAIClient
-                    ai_provider.activate_fallbacks(load_fallbacks(channel))
+                    ai_provider.activate_fallbacks(chain, auto=free)
                     ai_provider.on_event = channel.event
                     stack.callback(setattr, ai_provider, "on_event", None)
                     stack.enter_context(patch.object(OpenAIClient, "_request", ai_provider.tuned_request(
                         OpenAIClient._request, provider)))
-            if action in {"preview", "apply", "auto", "chats"} and not settings.get("no_letter"):
+            if (action in {"preview", "apply", "auto", "chats"} and not settings.get("no_letter")
+                    and not ai_provider.free_mode(ai_provider.active())):  # Free mode picks models itself.
                 model = config.get("openai", {}).get("default", {}).get("model")
                 if not isinstance(model, str) or not model.strip() or model == "CHOOSE_AFTER_LOGIN":
                     raise ProtocolError("Choose an account model before generation")

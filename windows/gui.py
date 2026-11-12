@@ -41,7 +41,7 @@ def write_log_file(path, line):
         pass
 
 
-# Fixed texts of the fallback list (#10): the worker sends only these codes.
+# Fixed texts of the automatic model chain (#10): the worker sends only these codes.
 MODEL_SWITCHES = {
     "daily_limit": "закончился дневной лимит бесплатных запросов",
     "rate_limit": "провайдер ограничил частоту запросов",
@@ -54,7 +54,6 @@ MODEL_SWITCHES = {
 FALLBACK_STATES = {
     "ok": "доступна", "missing": "нет в списке моделей провайдера",
     "no_key": "нет сохранённого ключа, модель пропущена", "network": "провайдер не ответил",
-    "damaged": "файл списка повреждён, запасные модели не используются",
 }
 
 
@@ -218,12 +217,11 @@ def describe_vacancy(item):
 # First-run setup (#5): one step per screen; the same pages serve the Settings menu.
 WIZARD_PAGES = (
     ("hh", "Вход в HH", "Войди в аккаунт hh.ru. Приложение ищет вакансии и отправляет отклики от твоего имени."),
-    ("ai", "AI-провайдер", "Кто пишет сопроводительные письма и ответы в чатах. Для откликов без письма AI не нужен."),
-    ("model", "Модель", "Загрузи список моделей выбранного провайдера и выбери модель. "
-                        "Стиль письма и запасные модели можно настроить сейчас или позже."),
+    ("ai", "AI-провайдер", "Кто пишет сопроводительные письма и ответы в чатах. С ключами OpenRouter, Gemini "
+                           "или Groq модели выбираются и меняются сами, когда у одной кончается лимит."),
     ("resume", "Резюме и поиск", "Выбери резюме и какие вакансии искать. Резюме загружаются сами после входа в HH."),
     ("done", "Всё готово", "Настройка завершена. Начни с предпросмотра: он показывает письма и ничего не отправляет. "
-                           "Вход, AI-провайдер, модель и стили потом — в меню «Настройки» вверху справа."),
+                           "Вход, AI-провайдер и стили письма потом — в меню «Настройки» вверху справа."),
 )
 
 
@@ -236,10 +234,10 @@ WELCOME = (
                "• аккаунт ChatGPT, ключ OpenAI-совместимого API (есть бесплатные: OpenRouter,\n"
                "  Gemini, Groq) или локальная модель."),
     ("Subheading.TLabel", "Порядок работы"),
-    ("TLabel", "1. Пройди настройку: вход в HH, AI-провайдер, модель, резюме и поиск.\n"
+    ("TLabel", "1. Пройди настройку: вход в HH, AI-провайдер, резюме и поиск.\n"
                "2. Запусти предпросмотр: он показывает письма и ничего не отправляет.\n"
                "3. Нажми «Откликнуться с проверкой писем» и подтверди каждое письмо.\n"
-               "Вход, AI-провайдер, модель и стили письма — в меню «Настройки» вверху справа."),
+               "Вход, AI-провайдер и стили письма — в меню «Настройки» вверху справа."),
     ("Warn.TLabel", "HH может заблокировать аккаунт за автоматизацию. Капчу вводи только сам."),
 )
 
@@ -306,7 +304,6 @@ class Application:
         self.build_wizard(self.wizard)
         self.build_main(main)
         self.load_styles()
-        self.show_fallback_count()
         self.update_search_mode()
         self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
         self.clear_review()
@@ -613,26 +610,16 @@ class Application:
         self.chatgpt_button.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(6, 0))
         self.chatgpt_state = ttk.Label(ai, style="Hint.TLabel")
         self.chatgpt_state.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        self.action_button(ai, "Проверить подключение", "models").grid(
+            row=2, column=0, sticky="ew", padx=(0, 10), pady=(6, 0))
+        self.model_state = ttk.Label(ai, style="Hint.TLabel", wraplength=420, justify="left")
+        self.model_state.grid(row=2, column=1, sticky="w", pady=(6, 0))
+        self.free_hint = self.hint(ai, "", 3, pady=(10, 0))
+        self.free_hint.configure(wraplength=640)
         ttk.Checkbutton(ai, text="Откликаться без сопроводительного письма: AI не нужен",
-                        variable=self.no_letter).grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 0))
-        self.hint(ai, "Тогда шаг «Модель» пропускается. Предпросмотр и ответы в чатах всё равно "
-                      "используют AI: его можно подключить позже в меню «Настройки».", 3, pady=(2, 0))
-
-        model = self.wizard_pages["model"]
-        self.action_button(model, "Загрузить список моделей", "models").grid(row=0, column=0, sticky="w")
-        self.models = ttk.Combobox(model, textvariable=self.model, state="readonly", width=44)
-        self.models.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.models.bind("<<ComboboxSelected>>", self.select_model)
-        self.hint(model, "Выбранная модель сохраняется сама.", 2)
-        self.style_button = ttk.Button(model, text="Стили письма…", command=self.edit_letter_style)
-        self.style_button.grid(row=3, column=0, sticky="w", pady=(14, 0))
-        self.buttons.append(self.style_button)
-        self.hint(model, "Каким AI пишет письмо: тон, длина, обращение. Стиль выбирается и на главном экране.",
-                  4, pady=(2, 0))
-        self.fallback_button = ttk.Button(model, text="Запасные модели…", command=self.edit_fallbacks)
-        self.fallback_button.grid(row=5, column=0, sticky="w", pady=(14, 0))
-        self.buttons.append(self.fallback_button)
-        self.fallback_hint = self.hint(model, "", 6, pady=(2, 0))
+                        variable=self.no_letter).grid(row=4, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        self.hint(ai, "Предпросмотр и ответы в чатах всё равно используют AI: его можно подключить позже "
+                      "в меню «Настройки».", 5, pady=(2, 0))
 
         resume = self.wizard_pages["resume"]
         self.action_button(resume, "Обновить список резюме", "resumes").grid(row=0, column=0, sticky="w")
@@ -664,9 +651,8 @@ class Application:
                                                  disabledforeground=DISABLED, borderwidth=0)
         self.settings_items = (
             ("Аккаунт HH…", lambda: self.show_wizard("hh", settings=True), True),
-            ("AI-провайдер и модель…", lambda: self.show_wizard("ai", settings=True), True),
+            ("AI-провайдер…", lambda: self.show_wizard("ai", settings=True), True),
             ("Стили письма…", self.edit_letter_style, True),
-            ("Запасные модели…", self.edit_fallbacks, True),
             ("Журнал…", self.open_log, False),
             ("Пройти настройку заново", lambda: self.show_wizard("hh"), True),
         )
@@ -696,15 +682,11 @@ class Application:
     # ---- wizard -----------------------------------------------------------------
 
     def wizard_sequence(self):
-        names = [name for name, _title, _note in WIZARD_PAGES]
-        if self.no_letter.get():
-            names.remove("model")  # No letter, no model (#9).
-        return names
+        return [name for name, _title, _note in WIZARD_PAGES]
 
     def page_done(self, name, progress=None):
         progress = progress or self.progress_state()
-        return {"hh": progress.hh, "ai": progress.chatgpt or progress.no_letter,
-                "model": progress.model or progress.no_letter,
+        return {"hh": progress.hh, "ai": progress.no_letter or (progress.chatgpt and progress.model),
                 "resume": progress.resume and progress.search, "done": True}[name]
 
     def setup_complete(self):
@@ -736,7 +718,7 @@ class Application:
 
     def show_page(self, name):
         if name not in self.wizard_sequence():
-            name = "ai" if name == "model" else "hh"
+            name = "hh"
         self.wizard_page = name
         for key, frame in self.wizard_pages.items():
             if key == name:
@@ -756,9 +738,9 @@ class Application:
         if self.page_done(name):
             return "Шаг выполнен. Нажми «Далее»." if not self.wizard_settings else "Готово. Можно закрыть настройки."
         return {"hh": "Нажми «Войти в HH» и введи email или телефон, затем код.",
-                "ai": ("Нажми «Войти в ChatGPT»." if self.provider.kind == "chatmock"
+                "ai": ("Нажми «Войти в ChatGPT»." if self.provider.kind == "chatmock" and not self.ai_ready
+                       else "Нажми «Проверить подключение»: модель выберется сама." if self.ai_ready
                        else "Нажми «AI-провайдер…» и сохрани ключ API."),
-                "model": "Нажми «Загрузить список моделей» и выбери модель.",
                 "resume": "Выбери резюме и введи запрос или выбери «Все подходящие для резюме»."}[name]
 
     def refresh_wizard(self):
@@ -1055,7 +1037,7 @@ class Application:
         return Progress(hh=self.signed_hh, chatgpt=self.ai_ready, ai_kind=self.provider.kind,
                         resume=0 <= index < len(self.resumes),
                         search=self.search_mode.get() == "all" or bool(self.search.get().strip()),
-                        model=self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"},
+                        model=self.free_mode() or self.model.get() not in {"", "CHOOSE_AFTER_LOGIN"},
                         no_letter=self.no_letter.get())
 
     def next_hint(self):
@@ -1073,7 +1055,7 @@ class Application:
         if not progress.search:
             return "search", "Ввести поисковый запрос"
         if not progress.model:
-            return "models", "Загрузить список моделей"
+            return "models", "Проверить подключение"
         return "preview", "Запустить предпросмотр писем"
 
     def auto_load_resumes(self):
@@ -1087,7 +1069,7 @@ class Application:
 
     def do_next(self):
         action, _text = self.next_action(self.progress_state())
-        pages = {"hh_login": "hh", "chatgpt_login": "ai", "provider": "ai", "models": "model"}
+        pages = {"hh_login": "hh", "chatgpt_login": "ai", "provider": "ai", "models": "ai"}
         if action in pages:  # Setup actions live on the setup pages (#5).
             self.show_wizard(pages[action], settings=True)
         elif action == "search":
@@ -1119,8 +1101,22 @@ class Application:
         from urllib.parse import urlsplit
         provider = ("ChatGPT" if chatmock else "локальная модель" if self.provider.kind == "local"
                     else urlsplit(self.provider.base_url).hostname or "API")
-        parts = ["HH " + ("✓" if progress.hh else "✗"), provider + " " + ("✓" if progress.chatgpt else "✗"),
-                 self.model.get() or "модель не выбрана"]
+        free = self.free_mode()
+        parts = ["HH " + ("✓" if progress.hh else "✗"),
+                 ("бесплатные модели" if free else provider) + " " + ("✓" if progress.chatgpt else "✗")]
+        if not free:
+            parts.append(self.model.get() or "модель не выбрана")
+        keys = getattr(self, "free_keys", [])
+        self.model_state.configure(
+            text=("Модели выбирает приложение: ключи — " + (", ".join(keys) if keys else "нет") + "." if free
+                  else f"Модель: {self.model.get()} (выбрана автоматически)." if self.model.get()
+                  else "Модель выберется сама после проверки подключения."),
+            style="Done.TLabel" if progress.model and progress.chatgpt else "Hint.TLabel")
+        self.free_hint.configure(text=(
+            "Письмо пишет первая доступная модель из списка проверенных бесплатных моделей Groq, Gemini и "
+            "OpenRouter. Когда у модели кончается лимит или она недоступна, приложение берёт следующую. "
+            "Ключ ещё одного бесплатного провайдера удлиняет список." if free else
+            "Ключ OpenRouter, Gemini или Groq включает бесплатные модели, которые меняются сами."))
         if progress.no_letter:
             parts.append("отклики без письма")
         self.setup_status.configure(text=" · ".join(parts))
@@ -1387,9 +1383,11 @@ class Application:
             if action in MUTATING_ACTIONS and not self.check_recovery():
                 return
             resume, search = "", ""
-            if action in REVIEW_ACTIONS:
+            # The free mode picks models itself; applications without a letter need none (#9).
+            needs_model = not self.free_mode() and not (action in {"apply", "auto"} and self.no_letter.get())
+            if action in REVIEW_ACTIONS and needs_model:
                 if self.model.get() == "CHOOSE_AFTER_LOGIN" or not self.model.get():
-                    raise ValueError("Подключи AI и выбери модель: меню «Настройки» → «AI-провайдер и модель…».")
+                    raise ValueError("Подключи AI: «Настройки» → «AI-провайдер…» → «Проверить подключение».")
                 set_model(self.model.get())
             if action in {"preview", "apply", "auto"}:
                 resume, search = self.selected_id(), self.search_value()
@@ -1455,117 +1453,6 @@ class Application:
                                         "Сопроводительное письмо (предпросмотр, не отправляется)"
                                         if action == "preview" else "Сопроводительное письмо")
         self.update_counter()
-
-    def show_fallback_count(self):
-        from gui_profile import read_fallbacks
-        try:
-            count = len(read_fallbacks())
-        except (OSError, ValueError):
-            count = 0
-        self.fallback_hint.configure(
-            text=f"Запасных моделей: {count}. Когда у модели кончается лимит, письмо пишет следующая."
-            if count else "Запасных моделей нет. Добавь их, чтобы при исчерпании лимита письмо писала другая модель.")
-
-    def edit_fallbacks(self):
-        """The ordered fallback list (#10): add the current model, reorder, remove. Saved at once."""
-        import ai_provider
-        from gui_profile import read_fallbacks, save_fallbacks
-        tk, ttk = self.tk, self.ttk
-        window = getattr(self, "fallback_window", None)
-        if window is not None and window.winfo_exists():
-            window.lift()
-            return
-        try:
-            items = read_fallbacks()
-        except (OSError, ValueError):
-            items = []
-        window = self.fallback_window = tk.Toplevel(self.root, background=CARD)
-        window.title("Запасные модели")
-        window.transient(self.root)
-        window.resizable(False, False)
-        dark_title_bar(window)
-        frame = ttk.Frame(window, padding=18)
-        frame.pack(fill="both", expand=True)
-        frame.columnconfigure(0, weight=1)
-        ttk.Label(frame, text="Запасные модели", style="Heading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
-        ttk.Label(frame, style="Hint.TLabel", wraplength=520, justify="left", text=(
-            "Когда у основной модели кончается лимит или она недоступна, письмо пишет следующая модель "
-            "из списка, сверху вниз. Чтобы добавить модель: выбери её провайдера в «AI-провайдер…», "
-            "загрузи список моделей, выбери модель и нажми «Добавить текущую модель». Ключ каждого "
-            "провайдера хранится в диспетчере учётных данных Windows. ChatGPT через ChatMock в список "
-            "не входит. «Загрузить список моделей» заодно проверяет запасные модели.")).grid(
-            row=1, column=0, columnspan=2, sticky="w", pady=(2, 10))
-        listbox = tk.Listbox(frame, height=8, width=60, activestyle="none", background=FIELD, foreground=TEXT,
-                             selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1,
-                             highlightbackground=CONTROL_BORDER, borderwidth=0, font=self.text_font)
-        listbox.grid(row=2, column=0, sticky="nsew")
-        side = ttk.Frame(frame)
-        side.grid(row=2, column=1, sticky="n", padx=(8, 0))
-        error = ttk.Label(frame, style="Error.TLabel", wraplength=520, justify="left")
-        error.grid(row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
-
-        def label(item):
-            return ai_provider.Fallback(ai_provider.parse(item["base_url"]), item["model"]).label
-
-        def show(selected=None):
-            listbox.delete(0, "end")
-            for item in items:
-                listbox.insert("end", label(item))
-            if selected is not None and items:
-                listbox.selection_set(min(selected, len(items) - 1))
-
-        def store(selected=None):
-            try:
-                save_fallbacks(items)
-            except (OSError, ValueError) as problem:
-                error.configure(text=str(problem))
-                return False
-            error.configure(text="")
-            show(selected)
-            self.show_fallback_count()
-            return True
-
-        def chosen():
-            selection = listbox.curselection()
-            return selection[0] if selection else None
-
-        def add():
-            model = self.model.get()
-            if self.provider.kind == ai_provider.CHATMOCK or model in {"", "CHOOSE_AFTER_LOGIN"}:
-                error.configure(text="Сначала выбери провайдера (не ChatMock) и модель: «Настройки» → «AI-провайдер и модель…».")
-                return
-            item = {"base_url": self.provider.base_url, "model": model}
-            if item in items:
-                error.configure(text="Эта модель уже в списке.")
-                return
-            items.append(item)
-            if not store(len(items) - 1):
-                items.pop()
-
-        def move(step):
-            index = chosen()
-            if index is None or not 0 <= index + step < len(items):
-                return
-            items[index], items[index + step] = items[index + step], items[index]
-            store(index + step)
-
-        def remove():
-            index = chosen()
-            if index is not None:
-                items.pop(index)
-                store(index)
-
-        def close():
-            self.fallback_window = None
-            window.destroy()
-        for row, (text, command) in enumerate((("Добавить текущую модель", add), ("Вверх", lambda: move(-1)),
-                                               ("Вниз", lambda: move(1)), ("Удалить", remove),
-                                               ("Закрыть", close))):
-            ttk.Button(side, text=text, command=command).grid(row=row, column=0, sticky="ew", pady=(0, 6))
-        window.protocol("WM_DELETE_WINDOW", close)
-        show()
-        self.fallback_controls = {"listbox": listbox, "add": add, "move": move, "remove": remove,
-                                  "error": error, "items": items, "close": close}
 
     def save_no_letter(self):
         from gui_profile import save_option
@@ -1711,6 +1598,11 @@ class Application:
 
     # ---- AI provider ------------------------------------------------------------
 
+    def free_mode(self):
+        import ai_provider
+        provider = getattr(self, "provider", None)
+        return provider is not None and ai_provider.free_mode(provider)
+
     def load_provider(self):
         """Current provider and whether it can generate letters (login, stored key or local)."""
         import ai_provider
@@ -1720,6 +1612,9 @@ class Application:
         except (OSError, ValueError, KeyError):
             self.provider = ai_provider.Provider(ai_provider.CHATMOCK, ai_provider.CHATMOCK_URL)
         self.ai_ready = ai_provider.ready(self.provider, chatgpt_signed_in=self.signed_chatgpt)
+        # Which free APIs have a key: their built-in models make up the automatic chain.
+        self.free_keys = [api.title for api in ai_provider.FREE_APIS
+                          if ai_provider.read_key(ai_provider.parse(api.base_url)) is not None]
 
     def edit_provider(self):
         """Choose ChatMock, an OpenAI-compatible API (key in Windows Credential Manager) or a local model."""
@@ -1846,7 +1741,6 @@ class Application:
                 if provider != self.provider:
                     set_provider(provider.base_url)
                     self.model.set("")
-                    self.models.configure(values=())
             except (OSError, ValueError) as problem:
                 error.configure(text=str(problem))
                 return
@@ -2197,13 +2091,20 @@ class Application:
                 self.select_resume()
             self.append_log(f"Загружено резюме: {len(value)}")
         elif name == "models":
-            self.models.configure(values=value)
-            if self.model.get() not in value and value:
-                import ai_provider
-                # A tested default of a free API, not whatever comes first (e.g. a speech model).
-                self.models.current(value.index(ai_provider.preferred_model(self.provider, value)))
-                self.select_model()
-            self.append_log(f"Загружено моделей: {len(value)}")
+            if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+                raise ProtocolError("Invalid model list")
+            import ai_provider
+            if self.free_mode():
+                self.append_log(f"Подключение проверено. Доступно бесплатных моделей: {len(value)}. "
+                                "Модель выбирается сама для каждого письма.")
+            else:
+                # No choice to make: a tested default, else the first listed model.
+                if value and self.model.get() not in value:
+                    self.model.set(ai_provider.preferred_model(self.provider, value))
+                    self.select_model()
+                self.append_log("Подключение проверено. Модель выбрана автоматически: "
+                                + (self.model.get() or "нет подходящей модели") + ".")
+            self.refresh_steps()
         elif name == "device":
             self.show_device_code(value["url"], value["code"])
             self.say("Окно «Вход в ChatGPT»: открой страницу входа и введи код.")
@@ -2266,12 +2167,12 @@ class Application:
         elif (name == "model_switch" and isinstance(value, dict) and value.get("reason") in MODEL_SWITCHES
               and isinstance(value.get("model"), str) and len(value["model"]) <= 300):
             self.append_log(f"Модель {value['model']} пропущена: {MODEL_SWITCHES[value['reason']]}. "
-                            "Пробую следующую из списка запасных.")
+                            "Пробую следующую.")
             self.model_switched = True
         elif name == "model_used" and isinstance(value, str) and len(value) <= 300:
             self.letter_model = value
             if getattr(self, "model_switched", False):
-                self.append_log("Текст написала запасная модель " + value + ".")
+                self.append_log("Текст написала модель " + value + ".")
             self.model_switched = False
         elif name == "fallback_check" and isinstance(value, list):
             for item in value[:20]:
@@ -2281,7 +2182,7 @@ class Application:
                     text = FALLBACK_STATES.get(state) or (
                         f"провайдер ответил HTTP {state[5:]}" if state.startswith("http_") and state[5:].isdecimal()
                         else "состояние неизвестно")
-                    self.append_log(f"Запасная модель {item['model']}: {text}.")
+                    self.append_log(f"Бесплатная модель {item['model']}: {text}.")
         elif name == "letter_revision" and value in LETTER_REVISION_FAILURES:
             self.review_note = f"Письмо не переписано: {value}. Осталось прежнее письмо."
             self.append_log(self.review_note)

@@ -17,7 +17,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import requests
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import gui
 import gui_controller
@@ -542,6 +542,7 @@ class ConstructionChecks(unittest.TestCase):
                 app.all_resumes = SimpleNamespace(get=lambda: True)
                 app.resumes = [{"id": "r", "title": "First"}, {"id": "s", "title": "Second"}]
                 app.searches = {"r": "Python"}
+                app.no_letter = SimpleNamespace(get=lambda: False)
                 app.dialogs = Mock()
                 app.check_recovery = Mock(return_value=True)
                 with patch("gui_profile.set_model"), patch("gui_controller.Session") as session:
@@ -1083,7 +1084,7 @@ class StepChecks(unittest.TestCase):
         self.assertIn("войди в HH", blocker("preview", fresh))
         hh_only = Progress(hh=True)
         self.assertEqual(step_states(hh_only), [CURRENT, "open", LOCKED, LOCKED])
-        self.assertIn("«AI-провайдер и модель…»", blocker("models", hh_only))  # #5: the menu, not a step.
+        self.assertIn("«AI-провайдер…»", blocker("models", hh_only))  # #5: the menu, not a step.
         ready = Progress(hh=True, chatgpt=True, resume=True, search=True, model=True)
         self.assertEqual(step_states(ready), [DONE, DONE, DONE, CURRENT])
         for action in ("preview", "apply", "auto", "chats", "resumes", "models"):
@@ -1249,7 +1250,7 @@ class StepChecks(unittest.TestCase):
                 self.assertEqual(app.wizard.winfo_manager(), "pack")
                 self.assertEqual(app.body.winfo_manager(), "")
                 self.assertEqual(app.wizard_page, "hh")
-                self.assertEqual(str(app.wizard_step["text"]), "Настройка · Шаг 1 из 4")
+                self.assertEqual(str(app.wizard_step["text"]), "Настройка · Шаг 1 из 3")
                 self.assertEqual(str(app.wizard_next["state"]), "disabled")  # «Далее» waits for the login.
                 self.assertEqual(app.wizard_close.winfo_manager(), "")  # No way around the first setup.
                 self.assertEqual(str(app.action_buttons["hh_login"]["state"]), "normal")
@@ -1320,16 +1321,18 @@ class WizardChecks(unittest.TestCase):
             self.assertEqual(str(app.wizard_next["state"]), "normal")
             app.wizard_next.invoke()
             self.assertEqual(app.wizard_page, "ai")
-            self.assertTrue(app.page_done("ai"))  # A local model needs no login or key.
-            app.wizard_next.invoke()
-            self.assertEqual(app.wizard_page, "model")
-            self.assertEqual(str(app.wizard_next["state"]), "disabled")  # No model yet.
+            self.assertEqual(str(app.wizard_next["state"]), "disabled")  # No model checked yet.
             app.wizard_move(1)
-            self.assertEqual(app.wizard_page, "model")  # «Далее» cannot be forced past the step.
-            app.model.set("qwen")
+            self.assertEqual(app.wizard_page, "ai")  # «Далее» cannot be forced past the step.
+            app.session = gui_controller.Session("models", {})
+            # «Проверить подключение» picks the model by itself: there is no list to choose from.
+            app.handle_frame(frame(app.session.run, "event", {"name": "models", "data": ["qwen", "llama"]}))
+            app.session = None
+            self.assertEqual(app.model.get(), "qwen")
+            self.assertIn("qwen (выбрана автоматически)", str(app.model_state["text"]))
             app.refresh_steps()
             app.wizard_next.invoke()
-            self.assertEqual((app.wizard_page, str(app.wizard_step["text"])), ("resume", "Настройка · Шаг 4 из 4"))
+            self.assertEqual((app.wizard_page, str(app.wizard_step["text"])), ("resume", "Настройка · Шаг 3 из 3"))
             app.search.set("Python разработчик")
             app.wizard_back.invoke()
             app.wizard_next.invoke()
@@ -1351,22 +1354,27 @@ class WizardChecks(unittest.TestCase):
         self.run_app(test, prepare=lambda: gui_profile.set_provider("http://127.0.0.1:11434/v1"))
 
     def test_ai_step_for_each_provider_and_the_no_letter_shortcut(self):
-        cases = (("http://127.0.0.1:8000/v1", {"signed_chatgpt": True}, "ChatGPT"),
-                 ("https://openrouter.ai/api/v1", {}, "openrouter.ai"),
-                 ("http://127.0.0.1:11434/v1", {}, "локальная модель"))
-        for base_url, extra, label in cases:
+        cases = (("http://127.0.0.1:8000/v1", "gpt-5", "ChatGPT ✓ · gpt-5"),
+                 ("https://openrouter.ai/api/v1", None, "бесплатные модели ✓"),
+                 ("http://127.0.0.1:11434/v1", "qwen", "локальная модель ✓ · qwen"))
+        for base_url, model, label in cases:
             with self.subTest(provider=base_url):
-                def test(app, _root, extra=extra, label=label):
-                    self.assertIs(app.page_done("ai"), True)
-                    self.assertIn(label + " ✓", str(app.setup_status["text"]))
-                self.run_app(test, prepare=lambda base_url=base_url: gui_profile.set_provider(base_url),
+                def prepare(base_url=base_url, model=model):
+                    gui_profile.set_provider(base_url)
+                    if model:
+                        gui_profile.set_model(model)
+
+                def test(app, _root, label=label):
+                    self.assertIs(app.page_done("ai"), True)  # The free mode needs no model at all.
+                    self.assertIn(label, str(app.setup_status["text"]))
+                self.run_app(test, prepare=prepare,
                              patches=(patch("ai_provider.read_key", return_value="sk-test"),
                                       patch("gui_steps.chatgpt_signed_in", return_value=True)))
         def chatmock_without_login(app, _root):
             self.assertIs(app.page_done("ai"), False)
             app.no_letter.set(True)  # Applications without a letter need no AI (#9).
             self.assertIs(app.page_done("ai"), True)
-            self.assertNotIn("model", app.wizard_sequence())
+            self.assertEqual(app.wizard_sequence(), ["hh", "ai", "resume", "done"])
             self.assertEqual(str(app.wizard_step["text"]), "Настройка · Шаг 1 из 3")
         self.run_app(chatmock_without_login, patches=(patch("gui_steps.chatgpt_signed_in", return_value=False),))
 
@@ -1411,12 +1419,12 @@ class WizardChecks(unittest.TestCase):
             menu = app.settings_menu
             labels = [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)
                       if menu.type(index) == "command"]
-            self.assertEqual(labels, ["Аккаунт HH…", "AI-провайдер и модель…", "Стили письма…",
-                                      "Запасные модели…", "Журнал…", "Пройти настройку заново"])
-            menu.invoke("AI-провайдер и модель…")
+            self.assertEqual(labels, ["Аккаунт HH…", "AI-провайдер…", "Стили письма…", "Журнал…",
+                                      "Пройти настройку заново"])
+            menu.invoke("AI-провайдер…")
             self.assertEqual((app.wizard_page, app.wizard_settings), ("ai", True))
             app.wizard_next.invoke()
-            self.assertEqual(app.wizard_page, "model")
+            self.assertEqual(app.wizard_page, "resume")
             app.close_wizard()
             menu.invoke("Журнал…")
             self.assertIsNotNone(app.log_view)
@@ -1885,43 +1893,79 @@ class ProviderChecks(unittest.TestCase):
         ai_provider.activate_fallbacks(())
         self.assertFalse(preview_hh.allowed_request("POST", "https://api.groq.com/openai/v1/chat/completions"))
 
-    def test_fallback_list_is_validated_and_loaded_with_keys(self):
-        good = [{"base_url": "https://api.groq.com/openai/v1/", "model": "llama"},
-                {"base_url": "http://127.0.0.1:11434/v1", "model": "qwen"}]
-        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
-            self.assertEqual(gui_profile.read_fallbacks(), [])
-            gui_profile.save_fallbacks(good)
-            self.assertEqual(gui_profile.read_fallbacks()[0]["base_url"], "https://api.groq.com/openai/v1")
-            for bad in ([{"base_url": "http://127.0.0.1:8000/v1", "model": "gpt-5"}],  # ChatMock.
-                        [{"base_url": "https://api.groq.com/openai/v1", "model": "a b"}],
-                        good + [good[0]], [{"base_url": "https://x.example/v1", "model": "m"}] * 11,
-                        [{"base_url": "https://api.hh.ru/v1", "model": "m"}], [{"model": "m"}]):
-                with self.subTest(bad=bad), self.assertRaises(ValueError):
-                    gui_profile.save_fallbacks(bad)
-            channel = FakeChannel()
-            with patch("ai_provider.read_key", lambda provider, api=None: None):
-                entries = gui_worker.load_fallbacks(channel)
-            self.assertEqual([entry.model for entry in entries], ["qwen"])  # Groq has no stored key.
-            self.assertEqual(channel.events, [("fallback_check", [{"model": "api.groq.com · llama",
-                                                                    "state": "no_key"}])])
-
-    def test_model_list_also_checks_fallback_models_without_generation(self):
+    def test_free_chain_uses_every_keyed_free_api_in_catalog_order(self):
         import ai_provider
-        ai_provider.activate(ai_provider.parse("https://openrouter.ai/api/v1"))
-        ai_provider.activate_fallbacks([
-            ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "llama", "gsk"),
-            ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "gone", "gsk")])
-        listed = Mock(status_code=200)
-        listed.json.return_value = {"data": [{"id": "openrouter/free"}, {"id": "llama"}]}
-        channel = FakeChannel()
-        with patch("ai_provider.read_key", return_value="sk"), patch("requests.get", return_value=listed) as get:
-            self.assertEqual(gui_worker.dispatch("models", {}, channel), 0)
-        self.assertTrue(all(call.args[0].endswith("/models") for call in get.call_args_list))
-        self.assertEqual(get.call_args_list[1].kwargs["headers"], {"Authorization": "Bearer gsk"})
-        self.assertEqual(channel.events[-1], ("fallback_check", [
-            {"model": "api.groq.com · llama", "state": "ok"}, {"model": "api.groq.com · gone", "state": "missing"}]))
+        keys = {"api.groq.com": "gsk", "openrouter.ai": "sk-or"}  # No Gemini key.
+        chain = ai_provider.free_chain(lambda provider: keys.get(urlsplit(provider.base_url).hostname))
+        expected = [(base, model) for base, model in ai_provider.FREE_MODELS
+                    if urlsplit(base).hostname in keys]
+        self.assertEqual([(entry.provider.base_url, entry.model) for entry in chain], expected)
+        self.assertEqual(chain[0].model, "openai/gpt-oss-120b")
+        self.assertTrue(all(entry.key == keys[urlsplit(entry.provider.base_url).hostname] for entry in chain))
+        self.assertEqual(ai_provider.free_chain(lambda _provider: None), ())
+        # Every catalog model is a chat model the list filter keeps.
+        for base, model in ai_provider.FREE_MODELS:
+            with self.subTest(model=model):
+                provider = ai_provider.parse(base)
+                self.assertEqual(ai_provider.model_ids(provider, [{"id": ("models/" if "googleapis" in base
+                                                                          else "") + model}]), [model])
+        gemini = ai_provider.parse("https://generativelanguage.googleapis.com/v1beta/openai")
+        with patch("ai_provider.read_key", side_effect=lambda provider, api=None: "k" if provider.base_url.endswith(
+                "/v1") and "groq" in provider.base_url else None):
+            self.assertTrue(ai_provider.ready(gemini))  # Any free key will do in the free mode.
+        with patch("ai_provider.read_key", return_value=None):
+            self.assertFalse(ai_provider.ready(gemini))
 
-    def test_real_tk_fallback_window_and_journal_lines(self):
+    def test_auto_chain_ignores_the_configured_model(self):
+        import ai_provider
+        groq = ai_provider.Fallback(ai_provider.parse("https://api.groq.com/openai/v1"), "openai/gpt-oss-120b", "gsk")
+        gemini = ai_provider.Fallback(ai_provider.parse(
+            "https://generativelanguage.googleapis.com/v1beta/openai"), "gemini-3.5-flash", "gem")
+        ai_provider.activate_fallbacks([groq, gemini], auto=True)
+        wrapped, client, calls, events = self.chain(self.reply(429, text="slow"), self.reply(content="Письмо"))
+        result = wrapped(client, {"model": "CHOOSE_AFTER_LOGIN"})
+        self.assertEqual(result.json()["choices"][0]["message"]["content"], "Письмо")
+        self.assertEqual(calls, [("https://api.groq.com/openai/v1", "gsk", "openai/gpt-oss-120b"),
+                                 ("https://generativelanguage.googleapis.com/v1beta/openai", "gem", "gemini-3.5-flash")])
+        self.assertEqual(events[-1], ("model_used", "generativelanguage.googleapis.com · gemini-3.5-flash"))
+        ai_provider.activate_fallbacks([groq], auto=True)  # One model is still swapped in, not the config one.
+        wrapped, client, calls, _ = self.chain(self.reply(content="Ок"))
+        wrapped(client, {"model": "CHOOSE_AFTER_LOGIN"})
+        self.assertEqual(calls, [("https://api.groq.com/openai/v1", "gsk", "openai/gpt-oss-120b")])
+
+    def test_worker_free_mode_needs_no_model_and_checks_the_catalog(self):
+        import ai_provider
+        reader, writer = Reader(), Writer()
+        settings = gui_controller.action_settings("preview", resume="r", search="Python")
+        reader.put(frame(uuid4().hex, "start", {"action": "preview", "settings": settings}))
+        seen = {}
+
+        def dispatch(_action, _settings, _channel):
+            seen.update(auto=ai_provider._auto, chain=[entry.model for entry in ai_provider.fallbacks()])
+            return 0
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+             patch("ai_provider.read_key", side_effect=lambda provider, api=None: "gsk" if "groq" in provider.base_url
+                   else None), patch("gui_worker.dispatch", dispatch):
+            gui_profile.set_provider("https://openrouter.ai/api/v1")  # No OpenRouter key, no model: still fine.
+            self.assertEqual(gui_worker.worker_main(reader, writer), 0)
+        reader.put("")
+        self.assertEqual(seen, {"auto": True, "chain": ["openai/gpt-oss-120b", "qwen/qwen3.8-27b"]})
+        # «Проверить подключение» in the free mode lists which built-in models are still there.
+        ai_provider.activate(ai_provider.parse("https://api.groq.com/openai/v1"))
+        ai_provider.activate_fallbacks(ai_provider.free_chain(lambda provider: "gsk" if "groq" in provider.base_url
+                                                              else None), auto=True)
+        listed = Mock(status_code=200)
+        listed.json.return_value = {"data": [{"id": "openai/gpt-oss-120b"}, {"id": "canopylabs/orpheus-v1-english"}]}
+        channel = FakeChannel()
+        with patch("requests.get", return_value=listed) as get:
+            self.assertEqual(gui_worker.dispatch("models", {}, channel), 0)
+        get.assert_called_once()  # One list per provider, not per model; no generation.
+        self.assertEqual(channel.events, [
+            ("fallback_check", [{"model": "api.groq.com · openai/gpt-oss-120b", "state": "ok"},
+                                {"model": "api.groq.com · qwen/qwen3.8-27b", "state": "missing"}]),
+            ("models", ["api.groq.com · openai/gpt-oss-120b"])])
+
+    def test_real_tk_free_mode_has_no_model_choice_and_journals_switches(self):
         import tkinter as tk
         from tkinter import ttk
         try:
@@ -1934,39 +1978,41 @@ class ProviderChecks(unittest.TestCase):
                  patch("ai_provider.read_key", return_value="sk"):
                 gui_profile.set_provider("https://api.groq.com/openai/v1")
                 app = gui.Application(root, tk, ttk, Mock())
-                self.assertIn("Запасных моделей нет", str(app.fallback_hint["text"]))
-                app.edit_fallbacks()
-                controls = app.fallback_controls
-                app.model.set("")
-                controls["add"]()
-                self.assertIn("выбери", controls["error"]["text"])
-                for model in ("llama", "mixtral"):
-                    app.model.set(model)
-                    controls["add"]()
-                controls["add"]()
-                self.assertIn("уже в списке", controls["error"]["text"])
-                controls["listbox"].selection_clear(0, "end")
-                controls["listbox"].selection_set(1)
-                controls["move"](-1)
-                self.assertEqual([item["model"] for item in gui_profile.read_fallbacks()], ["mixtral", "llama"])
-                controls["remove"]()
-                self.assertEqual([item["model"] for item in gui_profile.read_fallbacks()], ["llama"])
-                self.assertIn("Запасных моделей: 1", str(app.fallback_hint["text"]))
-                controls["close"]()
+                self.assertFalse(hasattr(app, "models"))  # No model list to choose from.
+                self.assertFalse(hasattr(app, "edit_fallbacks"))
+                self.assertTrue(app.progress_state().model)
+                self.assertIn("Модели выбирает приложение: ключи — OpenRouter, Gemini, Groq",
+                              str(app.model_state["text"]))
+                app.session = gui_controller.Session("models", {})
+                app.handle_frame(frame(app.session.run, "event", {"name": "models", "data": ["a", "b"]}))
+                self.assertEqual(app.model.get(), "")  # The free mode stores no model.
+                self.assertIn("Доступно бесплатных моделей: 2", "\n".join(app.log_lines))
                 app.session = gui_controller.Session("apply", {})
                 app.prepare_run_view("apply", 1)
-                for name, data in (("model_switch", {"model": "openrouter.ai · openrouter/free",
-                                                     "reason": "daily_limit"}),
-                                   ("model_used", "api.groq.com · llama"),
-                                   ("fallback_check", [{"model": "api.groq.com · llama", "state": "http_401"}])):
+                for name, data in (("model_switch", {"model": "api.groq.com · openai/gpt-oss-120b",
+                                                     "reason": "rate_limit"}),
+                                   ("model_used", "api.groq.com · qwen/qwen3.8-27b"),
+                                   ("fallback_check", [{"model": "api.groq.com · x", "state": "http_401"}])):
                     app.handle_frame(frame(app.session.run, "event", {"name": name, "data": data}))
                 journal = "\n".join(app.log_lines)
-                self.assertIn("пропущена: закончился дневной лимит", journal)
-                self.assertIn("Текст написала запасная модель api.groq.com · llama", journal)
-                self.assertIn("провайдер ответил HTTP 401", journal)
+                self.assertIn("пропущена: провайдер ограничил частоту запросов. Пробую следующую", journal)
+                self.assertIn("Текст написала модель api.groq.com · qwen/qwen3.8-27b", journal)
+                self.assertIn("Бесплатная модель api.groq.com · x: провайдер ответил HTTP 401", journal)
                 app.handle_frame(frame(app.session.run, "review", {"kind": "application", "context": "V",
                     "text": "Письмо", "options": []}))
-                self.assertIn("Написала модель: api.groq.com · llama", str(app.letter_label["text"]))
+                self.assertIn("Написала модель: api.groq.com · qwen/qwen3.8-27b", str(app.letter_label["text"]))
+                # A run starts without any stored model.
+                app.session = None
+                with patch("gui_controller.Session") as session:
+                    app.resumes, app.searches = [{"id": "r", "title": "R"}], {"r": "Python"}
+                    for box in (app.resume_box, app.resume_box_main):
+                        box.configure(values=["R"])
+                    app.resume_box.current(0)
+                    app.search.set("Python")
+                    app.dialogs = Mock()
+                    app.launch("preview")
+                    app.dialogs.showerror.assert_not_called()
+                    session.return_value.start.assert_called_once()
         finally:
             root.destroy()
 

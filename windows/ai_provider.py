@@ -109,6 +109,44 @@ NOT_CHAT = ("embedding", "whisper", "tts", "orpheus", "playai", "imagen", "veo",
             "guard", "aqa")
 
 
+# Verified free models, best first. Each was asked for a real Russian cover letter on 2026-11-12 with
+# the app's own settings and answered with a clean letter. OpenRouter was checked earlier that day,
+# before its daily free limit ran out. Left out: speech, live and transcribe models, models with an
+# empty answer, a leaked <thought> block or no free quota, models closed to new users, and ones that
+# stayed overloaded (503). A model that later disappears answers 404 and rests for the run.
+FREE_MODELS = (
+    ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b"),
+    ("https://api.groq.com/openai/v1", "qwen/qwen3.8-27b"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.5-flash"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.1-flash-lite"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.5-flash-lite"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-flash-lite-latest"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.1-flash-lite-preview"),
+    ("https://generativelanguage.googleapis.com/v1beta/openai", "gemini-3.6-flash"),
+    ("https://openrouter.ai/api/v1", "nvidia/nemotron-3-ultra-550b-a55b:free"),
+    ("https://openrouter.ai/api/v1", "nvidia/nemotron-3.5-super-vl:free"),
+    ("https://openrouter.ai/api/v1", "dots-studio/dots-3-note-preview:free"),
+    ("https://openrouter.ai/api/v1", "openrouter/free"),
+)
+
+
+def free_mode(provider):
+    """Free mode: the provider is one of FREE_APIS, so models are chosen and switched by the app."""
+    return free_api(provider.base_url) is not None
+
+
+def free_chain(read=None):
+    """FREE_MODELS of every free API with a stored key, in order; each entry carries its own key."""
+    read = read or read_key
+    keys, chain = {}, []
+    for base_url, model in FREE_MODELS:
+        if base_url not in keys:
+            keys[base_url] = read(parse(base_url))
+        if keys[base_url]:
+            chain.append(Fallback(parse(base_url), model, keys[base_url]))
+    return tuple(chain)
+
+
 def free_api(base_url):
     """The FREE_APIS entry with this exact base_url, or None."""
     base_url = str(base_url or "").strip().rstrip("/")
@@ -174,11 +212,17 @@ class Fallback:
 _fallbacks = ()
 
 
-def activate_fallbacks(entries):
-    """Fallback models of this run. The network guards admit their providers too."""
-    global _fallbacks
-    _fallbacks = tuple(entries)
+def activate_fallbacks(entries, *, auto=False):
+    """Models of this run beyond the configured one; the network guards admit their providers too.
+
+    auto: the free mode, where these entries are the whole chain and the configured model is unused.
+    """
+    global _fallbacks, _auto
+    _fallbacks, _auto = tuple(entries), bool(auto and entries)
     _excluded.clear()
+
+
+_auto = False
 
 
 def fallbacks():
@@ -480,9 +524,9 @@ def tuned_request(original, provider):
         global _failure
         _failure = None  # A timeout leaves no answer: the detail must not be stale.
         primary = Fallback(provider, payload.get("model"), getattr(client, "api_key", None))
-        chain = [primary] + [entry for entry in _fallbacks
-                             if (entry.provider.base_url, entry.model) != (provider.base_url, primary.model)]
-        if len(chain) == 1:  # No fallback list: one model, as before.
+        chain = list(_fallbacks) if _auto else [primary] + [
+            entry for entry in _fallbacks if (entry.provider.base_url, entry.model) != (provider.base_url, primary.model)]
+        if len(chain) == 1 and not _auto:  # No fallback list: one model, as before.
             response = attempt(client, payload, primary)
             if response.status_code >= 400:
                 record(primary, response)
@@ -580,6 +624,8 @@ def ready(provider, *, chatgpt_signed_in=False, api=None):
     """Whether letters can be generated: ChatMock needs a login, an API needs a stored key."""
     if provider.kind == CHATMOCK:
         return chatgpt_signed_in
+    if free_mode(provider):  # Any free API key will do: the app switches between them.
+        return any(read_key(parse(free.base_url), api) is not None for free in FREE_APIS)
     if provider.kind == OPENAI:
         return read_key(provider, api) is not None
     return True
