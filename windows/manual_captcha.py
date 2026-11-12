@@ -55,6 +55,17 @@ def form_captcha_state(response):
     return None
 
 
+def form_captcha_error(response):
+    """HH's own verdict on the previous captcha text of a form: True wrong, False accepted, None unknown."""
+    try:
+        data = response.json() if callable(getattr(response, "json", None)) else None
+    except ValueError:
+        return None
+    captcha = data.get("hhcaptcha") if isinstance(data, dict) else None
+    error = captcha.get("captchaError") if isinstance(captcha, dict) else None
+    return error if isinstance(error, bool) else None
+
+
 def token_refresh_request(method, url, body=None):
     """Only the two HH OAuth endpoints and the refresh-token grant."""
     if method != "POST" or url not in ("https://api.hh.ru/token", "https://hh.ru/oauth/token"):

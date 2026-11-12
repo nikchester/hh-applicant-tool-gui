@@ -338,11 +338,15 @@ class SendChecks(unittest.TestCase):
         self.assertFalse(self.gate.captcha_active)
 
     def test_test_send_repeated_or_cancelled_in_form_captcha_stops(self):
+        # #7: a repeated captcha skips this vacancy only; nothing was created in HH.
         self.form_captcha_gate(self.form_captcha(), self.form_captcha("STATE-2"))
         with redirect_stdout(StringIO()), redirect_stderr(StringIO()), \
-                self.assertRaisesRegex(SystemExit, "Repeated HH captcha"):
+                self.assertRaisesRegex(SkippedTest, "Repeated HH captcha"):
             self.gate.send(None, test_response())
         self.assertEqual(self.sender.call_count, 2)
+        self.assertEqual(self.gate.counts, self.gate.counts | {
+            "attempts": 2, "captcha_rejections": 2, "http_success": 0, "skipped": 1})
+        self.gate.captcha_skips = 0
 
         self.gate.letter = LETTER
         self.sender.reset_mock()
@@ -1213,13 +1217,69 @@ class SendChecks(unittest.TestCase):
                 gate.operation = SimpleNamespace(tool=SimpleNamespace(
                     captcha_manual=False, _can_use_tkinter=lambda: True, handle_captcha=handler
                 ))
-                with redirect_stdout(StringIO()), self.assertRaises(SystemExit):
+                # #7: a second captcha skips the vacancy (Redirect); a lost answer still stops.
+                with redirect_stdout(StringIO()), self.assertRaises(
+                        Redirect if second is challenge else SystemExit):
                     gate.send(None, negotiation())
                 # A lost answer adds one status read that fails here; no third POST.
                 self.assertEqual(sender.call_count, 2 if second is challenge else 3)
                 handler.assert_called_once()
                 self.assertEqual(gate.counts["attempts"], 2)
                 self.assertEqual(gate.counts["http_success"], 0)
+
+    def test_repeated_captcha_skips_vacancies_until_a_series_stops_the_run(self):
+        """#7: one repeated captcha skips one vacancy; CAPTCHA_SKIP_LIMIT in a row stop the run."""
+        from send import CAPTCHA_SKIP_LIMIT
+        from gui_protocol import RETRY_NOTICES
+        challenge = SimpleNamespace(status_code=403, json=lambda: {
+            "errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]})
+        accepted = SimpleNamespace(status_code=201)
+        observer = Mock()
+        sender = Mock(side_effect=[challenge, challenge, challenge, accepted]
+                      + [challenge] * 2 * CAPTCHA_SKIP_LIMIT)
+        gate = ApprovalGate(RESUME, sender, approve=lambda _: "yes", sleep=Mock())
+        gate.observer = observer
+        gate.operation = SimpleNamespace(tool=SimpleNamespace(
+            captcha_manual=False, _can_use_tkinter=lambda: True, handle_captcha=Mock(return_value=True)))
+
+        def send(vacancy_id):
+            gate.current, gate.letter = VACANCY | {"id": vacancy_id}, LETTER
+            with redirect_stdout(StringIO()):
+                return gate.send(None, negotiation(vacancy_id))
+        with self.assertRaises(Redirect):
+            send("1")
+        observer.assert_any_call("retry", "captcha_skip_api")
+        self.assertIn("captcha_skip_api", RETRY_NOTICES)
+        self.assertEqual(send("2").status_code, 201)  # The next vacancy goes on and resets the series.
+        self.assertEqual(gate.captcha_skips, 0)
+        for number in range(CAPTCHA_SKIP_LIMIT - 1):
+            with self.assertRaises(Redirect):
+                send(str(10 + number))
+        with self.assertRaises(SystemExit) as caught:
+            send("99")
+        self.assertIn(f"HH повторно запросил капчу на {CAPTCHA_SKIP_LIMIT} вакансиях подряд",
+                      str(caught.exception))
+        self.assertEqual(gate.counts["http_success"], 1)
+        self.assertEqual(gate.counts["skipped"], CAPTCHA_SKIP_LIMIT + 1)
+        self.assertEqual(gate.counts["attempts"] - gate.counts["captcha_rejections"], gate.counts["http_success"])
+
+    def test_repeated_form_captcha_names_hh_verdict_on_the_text(self):
+        from gui_protocol import RETRY_NOTICES
+        for error, code in ((True, "captcha_skip_form_wrong"), (False, "captcha_skip_form_new"),
+                            (None, "captcha_skip_form")):
+            with self.subTest(error=error):
+                self.gate.letter, self.gate.captcha_skips = LETTER, 0
+                data = {"hhcaptcha": {"isBot": False, "captchaState": "STATE-2"}}
+                if error is not None:
+                    data["hhcaptcha"]["captchaError"] = error
+                again = SimpleNamespace(status_code=403, headers={"Content-Type": "application/json"},
+                                        content=b"{}", json=lambda data=data: data)
+                self.form_captcha_gate(self.form_captcha(), again)
+                self.gate.observer = Mock()
+                with redirect_stdout(StringIO()), redirect_stderr(StringIO()), self.assertRaises(SkippedTest):
+                    self.gate.send(None, test_response())
+                self.gate.observer.assert_any_call("retry", code)
+                self.assertIn(code, RETRY_NOTICES)
 
     def test_only_valid_hh_captcha_challenge_starts_manual_flow(self):
         tool = SimpleNamespace(_can_use_tkinter=Mock(return_value=True),

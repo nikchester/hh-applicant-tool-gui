@@ -27,7 +27,7 @@ from resume_context import selected_resume_context
 from vacancy_level import senior_title_reason
 from vacancy_salary import salary_rejection_reason
 from send_all import apply_round_robin, load_searches, single_round_vacancy
-from manual_captcha import (ManualCaptcha, captcha_url, form_captcha_state, hh_url,
+from manual_captcha import (ManualCaptcha, captcha_url, form_captcha_error, form_captcha_state, hh_url,
                             permits_token_refresh)
 from gui_protocol import LETTER_REVISION_EMPTY, LETTER_REVISION_FAILED, RETRY_NOTICES
 
@@ -52,6 +52,9 @@ GENERATION_RETRY_DELAY = 30
 GENERATION_SKIP_LIMIT = 2
 # Three rejected letters in a row point to the prompt or the model, not one vacancy: stop.
 LETTER_REJECTION_LIMIT = 3
+# A repeated HH captcha skips one vacancy; this many vacancies in a row mean HH's anti-bot is
+# on alert, so the run stops instead of asking for more captchas.
+CAPTCHA_SKIP_LIMIT = 2
 # HH may show a fresh application in the vacancy relations only after a delay.
 SEND_CHECK_DELAY = 15
 # Trusted framing of an AI letter rewrite; the user's request travels only as JSON data.
@@ -294,6 +297,7 @@ class ApprovalGate:
         self._generating = False
         self.generation_skips = 0
         self.letter_rejections = 0
+        self.captcha_skips = 0
         self.captcha = ManualCaptcha()
         self.counts = {"vacancies": 0, "letters": 0, "skipped": 0,
                        "attempts": 0, "captcha_rejections": 0, "http_success": 0}
@@ -595,7 +599,12 @@ class ApprovalGate:
                 ) from None
             state = form_captcha_state(response)
             if state and attempt:
-                raise SystemExit("Repeated HH captcha on the test application; stopped without another retry")
+                # HH rejected the form again before accepting it: nothing was created (#7).
+                self.counts["captcha_rejections"] += 1
+                wrong = form_captcha_error(response)
+                self._skip_after_captcha("captcha_skip_form" if wrong is None else
+                                         "captcha_skip_form_wrong" if wrong else "captcha_skip_form_new")
+                raise SkippedTest("Repeated HH captcha; vacancy skipped")
             if state:
                 # 403 with hhcaptcha: HH rejected the form before accepting it.
                 self.counts["captcha_rejections"] += 1
@@ -623,6 +632,7 @@ class ApprovalGate:
                     and all(c.isascii() and (c.isalnum() or c in "-_") for c in error) else "unknown")
             raise SystemExit(f"HH did not accept the test application: error={safe}; check HH manually")
         self.counts["http_success"] += 1
+        self.captcha_skips = 0
         print(f"HH принял отклик с тестом на вакансию {self.current['id']}", flush=True)
         return response
 
@@ -716,8 +726,14 @@ class ApprovalGate:
             self.counts["attempts"] += 1  # Count before network: a lost answer needs a check.
             self.letter = None  # The original approval cannot authorize a second attempt.
             response = self._post_negotiation(session, request, kwargs)
-            if response.status_code == 403 and not attempt:
+            if response.status_code == 403:
                 captcha_url = self._captcha_url(response)
+                if captcha_url and attempt:
+                    # HH accepted the captcha text, then asked again; nothing was created (#7).
+                    self.counts["captcha_rejections"] += 1
+                    self._skip_after_captcha("captcha_skip_api")
+                    # HH 2.3.7 treats Redirect as "not sent" and goes on to the next vacancy.
+                    raise Redirect(None, {"description": "Repeated HH captcha; vacancy skipped"})
                 if captcha_url:
                     self.counts["captcha_rejections"] += 1
                     self.captcha.solve(captcha_url, self.operation.tool)
@@ -728,6 +744,7 @@ class ApprovalGate:
                     "check HH manually before any retry"
                 )
             self.counts["http_success"] += 1
+            self.captcha_skips = 0
             print(f"HH вернул HTTP {response.status_code} для вакансии {self.current['id']}", flush=True)
             return response
         raise SystemExit("No confirmed send result; check HH manually")
@@ -761,6 +778,16 @@ class ApprovalGate:
             if isinstance(session, requests.Session):
                 session.close()
             self.counts["attempts"] += 1
+
+    def _skip_after_captcha(self, code):
+        """Skip one vacancy after a repeated captcha; a series of them stops the run."""
+        self.letter = None
+        self.counts["skipped"] += 1
+        self.captcha_skips += 1
+        self._notice(code)
+        if self.captcha_skips >= CAPTCHA_SKIP_LIMIT:
+            raise SystemExit(f"HH повторно запросил капчу на {self.captcha_skips} вакансиях подряд. "
+                             "Запуск остановлен, чтобы не раздражать антибот HH. Попробуй позже.")
 
     def _resolved(self, kind):
         hook = type(self).on_send_resolved  # Read from the class: a plain function, not a method.
