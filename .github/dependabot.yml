@@ -1,0 +1,11 @@
+version: 2
+updates:
+  # Только github-actions. Версии Python-пакетов (hh-applicant-tool, chatmock, PyInstaller)
+  # заморожены намеренно, см. windows/packaging/README.md, поэтому pip-экосистема здесь не включена.
+  # Actions закреплены по SHA коммита: Dependabot обновляет SHA и комментарий с версией.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    target-branch: "dev"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
