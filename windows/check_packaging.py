@@ -146,6 +146,17 @@ class PackagingChecks(unittest.TestCase):
         self.assertIn("packaging/compiler-version.iss", builder)
         self.assertIn("'--packaging-gateway-smoke'", builder)
 
+    def test_a_beta_build_is_a_pre_release_never_latest(self):
+        workflow = (WINDOWS.parent / ".github/workflows/release.yml").read_text(encoding="utf-8")
+        self.assertIn("if ($env:VERSION -match '-') { @('--prerelease', '--latest=false') }", workflow)
+        self.assertIn("--verify-tag @channel", workflow)
+        builder = (WINDOWS / "build-installer.ps1").read_text(encoding="utf-8")
+        self.assertIn(r"'^\d+\.\d+\.\d+(-beta\.\d+)?$'", builder)
+        self.assertIn('"/DAppNumericVersion=$numeric"', builder)
+        installer = (PACKAGING / "installer.iss").read_text(encoding="utf-8-sig")
+        self.assertIn("VersionInfoVersion={#AppNumericVersion}", installer)
+        self.assertEqual((PACKAGING / "installer.iss").read_bytes()[:3], b"\xef\xbb\xbf")  # Inno needs the BOM.
+
     def test_pinned_tools_and_frozen_discovery_mode(self):
         lines = (PACKAGING / "requirements-build.txt").read_text(encoding="utf-8").splitlines()
         pins = {line.split("==")[0].lower(): line.split("==")[1] for line in lines if line and not line.startswith("#")}

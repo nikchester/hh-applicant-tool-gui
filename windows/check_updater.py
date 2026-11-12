@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import sys
 import tempfile
@@ -102,6 +103,25 @@ class UpdaterChecks(unittest.TestCase):
         for version in ("1.0.0", "0.9.9"):
             release = Release(self.key, version=version)
             self.assertIsNone(updater.check(opener=release.open, public_key=self.public))
+
+    def test_a_beta_never_reaches_a_stable_install(self):
+        """A beta is offered only to a beta install, even if it became GitHub's "latest" by mistake."""
+        self.assertLess(updater.version_key("0.6.0-beta.1"), updater.version_key("0.6.0"))
+        self.assertLess(updater.version_key("0.6.0-beta.1"), updater.version_key("0.6.0-beta.2"))
+        self.assertLess(updater.version_key("0.5.0"), updater.version_key("0.6.0-beta.1"))
+        for bad in ("0.6.0-rc.1", "0.6.0-beta", "0.6.0beta.1", "0.6"):
+            with self.subTest(bad=bad):
+                self.assertIsNone(updater.VERSION.match(bad))
+        beta = Release(self.key, version="9.9.9-beta.1")
+        self.assertIsNone(updater.check(opener=beta.open, public_key=self.public))  # Running 1.0.0.
+        with patch.dict(os.environ, {"HH_APP_VERSION": "1.0.0-beta.1"}):
+            self.assertEqual(updater.current(), ("1.0.0-beta.1", RUNTIME))  # A beta keeps self-update.
+            found = updater.check(opener=Release(self.key, version="1.0.0").open, public_key=self.public)
+            self.assertEqual(found["version"], "1.0.0")  # The release replaces its beta.
+            later = updater.check(opener=Release(self.key, version="1.0.0-beta.2").open, public_key=self.public)
+            self.assertEqual(later["version"], "1.0.0-beta.2")
+            self.assertIsNone(updater.check(opener=Release(self.key, version="0.9.9").open,
+                                            public_key=self.public))
 
     def test_foreign_signature_is_rejected(self):
         release = Release(Ed25519PrivateKey.generate())
@@ -202,6 +222,16 @@ class EntrypointChecks(unittest.TestCase):
 
     def choose(self, window=True):
         return entrypoint.choose_code(self.bundled, self.updates, window=window)[0]
+
+    def test_a_beta_install_runs_a_downloaded_release_and_ignores_older_code(self):
+        (self.bundled / "version.json").write_text(json.dumps({"version": "1.0.0-beta.1", "runtime": RUNTIME}))
+        release = self.downloaded("1.0.0")
+        self.assertEqual(self.choose(), release)
+        for older in ("0.9.0", "1.0.0-beta.1"):
+            with self.subTest(older=older):
+                shutil.rmtree(self.updates)
+                self.downloaded(older)
+                self.assertEqual(self.choose(), self.bundled)
 
     def test_bundled_without_updates(self):
         self.assertEqual(self.choose(), self.bundled)

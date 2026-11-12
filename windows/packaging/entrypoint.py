@@ -20,7 +20,9 @@ MAX_FAILED_STARTS = 2
 
 
 def _version_key(version):
-    return tuple(int(part) for part in version.split("."))
+    """Same order as updater.version_key: a beta sorts below its release (0.6.0-beta.1 < 0.6.0)."""
+    number, _, beta = version.partition("-beta.")
+    return tuple(int(part) for part in number.split(".")) + ((0, int(beta)) if beta else (1, 0))
 
 
 def _read_json(path):

@@ -38,7 +38,8 @@ ALLOWED_HOSTS = frozenset({"github.com", "objects.githubusercontent.com",
 MAX_METADATA = 64 * 1024
 MAX_CODE = 20 * 1024 * 1024
 MAX_INSTALLER = 400 * 1024 * 1024
-VERSION = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}$")
+# A release "0.6.0" or a beta "0.6.0-beta.1"; a beta sorts below its release.
+VERSION = re.compile(r"^\d{1,4}\.\d{1,4}\.\d{1,4}(?:-beta\.\d{1,3})?$")
 ASSET = re.compile(r"^[A-Za-z0-9._-]{1,200}$")
 HEX64 = re.compile(r"^[0-9a-f]{64}$")
 CODE_FILE = re.compile(r"^(?:[a-z_][a-z0-9_]{0,60}\.py|config\.example\.toml|version\.json)$")
@@ -64,7 +65,13 @@ def enabled():
 
 
 def version_key(version):
-    return tuple(int(part) for part in version.split("."))
+    """(major, minor, patch, 1 for a release or 0 for a beta, beta number): 0.6.0-beta.1 < 0.6.0."""
+    number, _, beta = version.partition("-beta.")
+    return tuple(int(part) for part in number.split(".")) + ((0, int(beta)) if beta else (1, 0))
+
+
+def prerelease(version):
+    return "-" in version
 
 
 def _download(name, limit, opener=urlopen):
@@ -119,6 +126,10 @@ def check(opener=urlopen, public_key=PUBLIC_KEY):
     signature = _download("update.json.sig", 1024, opener)
     verify(metadata, signature, public_key)
     release = parse(metadata)
+    # A beta reaches only installs that already run a beta: a stable install never gets one,
+    # even if a beta became GitHub's "latest" release by mistake.
+    if prerelease(release["version"]) and not prerelease(running[0]):
+        return None
     return release if version_key(release["version"]) > version_key(running[0]) else None
 
 

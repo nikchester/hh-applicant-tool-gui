@@ -11,10 +11,14 @@
 #ifndef AppVersion
   #define AppVersion "0.5.0"
 #endif
+#ifndef AppNumericVersion
+  #define AppNumericVersion "0.5.0"
+#endif
 [Setup]
 AppId={{CA2072D5-592B-4A8D-98AB-596909B98D40}
 AppName=Автоотклики HH
 AppVersion={#AppVersion}
+VersionInfoVersion={#AppNumericVersion}
 DefaultDirName={localappdata}\Programs\Автоотклики HH
 DefaultGroupName=Автоотклики HH
 PrivilegesRequired=lowest

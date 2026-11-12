@@ -55,8 +55,10 @@ try {
         New-Item -ItemType Directory -Path $installer | Out-Null
         # Single source of the release version: packaging/manifest.py.
         $version = (& $Python -I -c "import sys; sys.path.insert(0, sys.argv[1]); import manifest; print(manifest.APP_VERSION)" $packaging).Trim()
-        if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$') { throw 'Cannot read APP_VERSION from packaging/manifest.py' }
-        & $Iscc "/DAppSource=$app" "/DOutputPath=$installer" "/DAppVersion=$version" (Join-Path $packaging 'installer.iss')
+        if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+(-beta\.\d+)?$') { throw 'Cannot read APP_VERSION from packaging/manifest.py' }
+        # Windows file properties take only numbers: 0.6.0-beta.1 is shown as 0.6.0 there.
+        $numeric = $version -replace '-.*$', ''
+        & $Iscc "/DAppSource=$app" "/DOutputPath=$installer" "/DAppVersion=$version" "/DAppNumericVersion=$numeric" (Join-Path $packaging 'installer.iss')
         if ($LASTEXITCODE -ne 0) { throw "Inno compilation failed (exit $LASTEXITCODE)" }
         $setup = Join-Path $installer "hh-applicant-tool-gui-$version-windows-x64-setup.exe"
         if (-not (Test-Path -LiteralPath $setup -PathType Leaf)) { throw 'Compiler did not produce the expected installer' }

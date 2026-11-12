@@ -97,5 +97,8 @@ jobs:
           foreach ($file in $setup, $sums, $code, $update, $signature) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing release file $file" }
           }
-          gh release create $env:GITHUB_REF_NAME $setup $sums $code $update $signature --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag
+          # A beta (0.6.0-beta.1) is a pre-release and never "latest": self-update reads
+          # releases/latest, so no installed copy is offered a beta.
+          $channel = if ($env:VERSION -match '-') { @('--prerelease', '--latest=false') } else { @() }
+          gh release create $env:GITHUB_REF_NAME $setup $sums $code $update $signature --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag @channel
           if ($LASTEXITCODE) { throw 'GitHub release creation failed' }
