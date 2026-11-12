@@ -9,7 +9,7 @@
   #error OutputPath is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.4.0"
+  #define AppVersion "0.5.0"
 #endif
 [Setup]
 AppId={{CA2072D5-592B-4A8D-98AB-596909B98D40}

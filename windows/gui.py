@@ -488,10 +488,16 @@ class Application:
         self.models.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.models.bind("<<ComboboxSelected>>", self.select_model)
         self.hint(model, "Выбранная модель сохраняется сама.", 3)
+        self.style_name = self.tk.StringVar()
+        self.style_box = ttk.Combobox(model, textvariable=self.style_name, state="readonly", width=30)
+        self.style_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.style_box.bind("<<ComboboxSelected>>", self.select_style)
         self.style_button = ttk.Button(model, text="Стиль письма…", command=self.edit_letter_style)
-        self.style_button.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.style_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
         self.buttons.append(self.style_button)
-        self.hint(model, "Каким ChatGPT пишет письмо: тон, длина, обращение.", 5, pady=(2, 0))
+        self.hint(model, "Каким ChatGPT пишет письмо: тон, длина, обращение. Выбранный стиль действует сразу.",
+                  6, pady=(2, 0))
+        self.load_styles()
 
         run = self.step(side, 4, "Отклики")
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
@@ -889,6 +895,9 @@ class Application:
     def set_busy(self, running):
         for button in self.buttons:
             button.configure(state="disabled" if running else "normal")
+        style_box = getattr(self, "style_box", None)
+        if style_box is not None:
+            style_box.configure(state="disabled" if running else "readonly")
         self.stop_button.configure(state="normal" if running else "disabled", text="Остановить")
         if running:
             self.stop_button.grid()
@@ -1380,49 +1389,144 @@ class Application:
 
     # ---- letter style -----------------------------------------------------------
 
+    def load_styles(self, select=None):
+        """Fill the step 3 selector; a damaged styles file falls back to "Исходный" with a warning."""
+        from gui_profile import read_styles
+        try:
+            styles, active, warning = read_styles()
+        except (OSError, ValueError):
+            styles, active, warning = {}, "", "Не удалось прочитать стили письма."
+        self.style_box.configure(values=list(styles))
+        self.style_name.set(select or active)
+        if warning:
+            self.style_warning = warning
+            self.root.after_idle(lambda: self.say(warning, "warning"))
+        return styles, active
+
+    def select_style(self, _event=None):
+        from gui_profile import activate_style
+        name = self.style_name.get()
+        try:
+            activate_style(name)
+        except (OSError, ValueError, KeyError) as problem:
+            self.dialogs.showerror("Стиль письма", str(problem) or "Не удалось выбрать стиль.")
+            self.load_styles()
+            return
+        self.say(f"Стиль письма «{name}» выбран. Он действует на следующем предпросмотре.", "success")
+        self.append_log("Стиль письма: " + name)
+
+    def ask_style_name(self, title, initial=""):
+        """Modal name prompt built from ttk only: no new frozen modules for code-only updates."""
+        tk, ttk = self.tk, self.ttk
+        parent = getattr(self, "style_window", None) or self.root
+        window = tk.Toplevel(parent, background=CARD)
+        window.title(title)
+        window.transient(parent)
+        window.resizable(False, False)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Название стиля (до 60 символов):").pack(anchor="w")
+        value = tk.StringVar(value=initial)
+        entry = ttk.Entry(frame, textvariable=value, width=44)
+        entry.pack(fill="x", pady=(6, 10))
+        result = {"name": None}
+
+        def finish(accepted):
+            result["name"] = value.get() if accepted else None
+            window.destroy()
+        buttons = ttk.Frame(frame)
+        buttons.pack(anchor="w")
+        ttk.Button(buttons, text="OK", style="Accent.TButton", command=lambda: finish(True)).pack(side="left")
+        ttk.Button(buttons, text="Отмена", command=lambda: finish(False)).pack(side="left", padx=6)
+        entry.bind("<Return>", lambda _event: finish(True))
+        window.bind("<Escape>", lambda _event: finish(False))
+        window.protocol("WM_DELETE_WINDOW", lambda: finish(False))
+        entry.select_range(0, "end")
+        entry.focus_set()
+        window.grab_set()
+        window.wait_window()
+        return result["name"]
+
     def edit_letter_style(self):
-        """Edit [general].cover_letter_prompt: the instruction ChatGPT gets for every letter."""
-        from gui_profile import PROMPT_PLACEHOLDERS, default_prompt, read_prompt, set_prompt, validate_prompt
+        """Letter styles: list, edit, create, duplicate, rename, delete. The active one is used."""
+        import gui_profile
+        from gui_profile import BUILTIN_STYLE, MIGRATED_STYLE, validate_prompt
         tk, ttk = self.tk, self.ttk
         if getattr(self, "style_window", None) is not None and self.style_window.winfo_exists():
             self.style_window.lift()
             return
         try:
-            current = read_prompt()
+            styles, active = self.load_styles()
         except (OSError, ValueError):
-            self.dialogs.showerror("Стиль письма", "Не удалось прочитать стиль письма из профиля.")
+            self.dialogs.showerror("Стиль письма", "Не удалось прочитать стили письма из профиля.")
             return
         window = self.style_window = tk.Toplevel(self.root, background=CARD)
         window.title("Стиль письма")
         window.transient(self.root)
-        window.geometry("760x600")
-        window.minsize(560, 420)
+        window.geometry("780x640")
+        window.minsize(580, 460)
         dark_title_bar(window)
         frame = ttk.Frame(window, padding=18)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
-        frame.rowconfigure(2, weight=1)
+        frame.rowconfigure(3, weight=1)
         ttk.Label(frame, text="Стиль письма", style="Heading.TLabel").grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, wraplength=700, justify="left", text=(
+        ttk.Label(frame, wraplength=720, justify="left", text=(
             "ChatGPT получает этот текст как инструкцию для каждого письма. Опиши тон, длину, обращение "
             "и чего избегать. Данные резюме и вакансии приложение добавляет само.")).grid(
             row=1, column=0, sticky="w", pady=(6, 10))
+        bar = ttk.Frame(frame)
+        bar.grid(row=2, column=0, sticky="ew", pady=(0, 8))
+        bar.columnconfigure(0, weight=1)
+        chosen = tk.StringVar(value=active)
+        box = ttk.Combobox(bar, textvariable=chosen, state="readonly", values=list(styles))
+        box.grid(row=0, column=0, sticky="ew")
         editor_frame, editor = self.text_box(frame, 14, readonly=False)
-        editor_frame.grid(row=2, column=0, sticky="nsew")
-        editor.insert("1.0", current)
-        editor.edit_reset()  # Ctrl+Z must not undo the loaded style into an empty field.
-        ttk.Label(frame, style="Hint.TLabel", wraplength=700, justify="left", text=(
+        editor_frame.grid(row=3, column=0, sticky="nsew")
+        ttk.Label(frame, style="Hint.TLabel", wraplength=720, justify="left", text=(
             "Подстановки: %(vacancy_name)s — вакансия, %(employer_name)s — компания, "
             "%(resume_title)s — резюме, %(first_name)s — имя. Знак % пиши как %%. "
             "%(email)s и %(phone)s добавят твои контакты в каждое письмо.")).grid(
-            row=3, column=0, sticky="w", pady=(8, 0))
-        error = ttk.Label(frame, style="Error.TLabel", wraplength=700, justify="left")
-        error.grid(row=4, column=0, sticky="w", pady=(4, 0))
+            row=4, column=0, sticky="w", pady=(8, 0))
+        note = ttk.Label(frame, style="Hint.TLabel", wraplength=720, justify="left")
+        note.grid(row=5, column=0, sticky="w", pady=(4, 0))
+        error = ttk.Label(frame, style="Error.TLabel", wraplength=720, justify="left")
+        error.grid(row=6, column=0, sticky="w", pady=(4, 0))
         buttons = ttk.Frame(frame)
-        buttons.grid(row=5, column=0, sticky="ew", pady=(10, 0))
+        buttons.grid(row=7, column=0, sticky="ew", pady=(10, 0))
+        state = {"styles": styles}
 
         def text():
             return editor.get("1.0", "end-1c").strip()
+
+        def show(name):
+            chosen.set(name)
+            box.configure(values=list(state["styles"]))
+            editor.delete("1.0", "end")
+            editor.insert("1.0", state["styles"][name])
+            editor.edit_reset()  # Ctrl+Z must not undo the loaded style into an empty field.
+            builtin = name == BUILTIN_STYLE
+            for button in (rename_button, delete_button):
+                button.configure(state="disabled" if builtin else "normal")
+            note.configure(text="Стиль «Исходный» не меняется. «Сохранить» создаст из правок новый стиль."
+                           if builtin else "")
+            check()
+
+        def reload(name=None):
+            styles, active = self.load_styles(select=name)
+            state["styles"] = styles
+            show(name if name in styles else active)
+
+        def run(action, success):
+            try:
+                result = action()
+            except (OSError, ValueError, KeyError) as problem:
+                error.configure(text=str(problem) or "Операция со стилем не удалась.")
+                return None
+            reload(result if isinstance(result, str) else None)
+            self.say(success, "success")
+            return result
 
         def check(_event=None):
             try:
@@ -1433,34 +1537,66 @@ class Application:
                 error.configure(text=str(problem))
                 save_button.configure(state="disabled")
 
-        def reset():
-            editor.delete("1.0", "end")
-            editor.insert("1.0", default_prompt())
-            check()
-
         def save():
-            try:
-                set_prompt(text())
-            except (OSError, ValueError) as problem:
-                error.configure(text=str(problem))
-                return
-            close()
-            self.say("Стиль письма сохранён. Проверь его на предпросмотре писем (шаг 4).", "success")
-            self.append_log("Стиль письма изменён.")
+            name = chosen.get()
+            if name == BUILTIN_STYLE:
+                if text() == state["styles"][BUILTIN_STYLE]:
+                    run(lambda: gui_profile.activate_style(BUILTIN_STYLE) or BUILTIN_STYLE,
+                        "Выбран стиль «Исходный».")
+                    close()
+                    return
+                name = gui_profile.free_style_name(MIGRATED_STYLE, state["styles"])
+            saved = run(lambda: gui_profile.save_style(name, text()),
+                        f"Стиль письма «{name}» сохранён и выбран. Проверь его на предпросмотре писем (шаг 4).")
+            if saved:
+                self.append_log("Стиль письма сохранён: " + saved)
+                close()
+
+        def create():
+            name = self.ask_style_name("Новый стиль")
+            if name:
+                run(lambda: gui_profile.duplicate_style(BUILTIN_STYLE, name), f"Создан стиль «{name.strip()}».")
+
+        def duplicate():
+            source = chosen.get()
+            name = self.ask_style_name("Дублировать стиль",
+                                       gui_profile.free_style_name(source + " (копия)", state["styles"]))
+            if name:
+                run(lambda: gui_profile.duplicate_style(source, name), f"Создана копия «{name.strip()}».")
+
+        def rename():
+            source = chosen.get()
+            name = self.ask_style_name("Переименовать стиль", source)
+            if name and name.strip() != source:
+                run(lambda: gui_profile.rename_style(source, name), f"Стиль переименован: «{name.strip()}».")
+
+        def delete():
+            source = chosen.get()
+            if self.dialogs.askyesno("Удалить стиль", f"Удалить стиль «{source}»? Текст стиля пропадёт."):
+                run(lambda: gui_profile.delete_style(source), f"Стиль «{source}» удалён.")
 
         def close():
             self.style_window = None
             window.destroy()
-        save_button = ttk.Button(buttons, text="Сохранить", style="Accent.TButton", command=save)
+        for title, command in (("Новый", create), ("Дублировать", duplicate)):
+            ttk.Button(bar, text=title, command=command).grid(row=0, column=bar.grid_size()[0], padx=(6, 0))
+        rename_button = ttk.Button(bar, text="Переименовать", command=rename)
+        rename_button.grid(row=0, column=bar.grid_size()[0], padx=(6, 0))
+        delete_button = ttk.Button(bar, text="Удалить", command=delete)
+        delete_button.grid(row=0, column=bar.grid_size()[0], padx=(6, 0))
+        save_button = ttk.Button(buttons, text="Сохранить и выбрать", style="Accent.TButton", command=save)
         save_button.pack(side="left")
-        ttk.Button(buttons, text="Отмена", command=close).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Вернуть исходный стиль", command=reset).pack(side="right")
+        ttk.Button(buttons, text="Закрыть", command=close).pack(side="left", padx=6)
+        box.bind("<<ComboboxSelected>>", lambda _event: show(chosen.get()))
         window.protocol("WM_DELETE_WINDOW", close)
         editor.bind("<KeyRelease>", check)
         editor.bind("<<Edited>>", check)  # Menu paste and cut send no KeyRelease.
+        show(chosen.get() if chosen.get() in styles else BUILTIN_STYLE)
         editor.focus_set()
-        check()
         self.style_controls = (editor, save_button, error, check)
+        self.style_dialog = {"box": box, "chosen": chosen, "show": show, "create": create,
+                             "duplicate": duplicate, "rename": rename, "delete": delete,
+                             "rename_button": rename_button, "delete_button": delete_button, "note": note}
 
     # ---- ChatGPT device login ---------------------------------------------------
 

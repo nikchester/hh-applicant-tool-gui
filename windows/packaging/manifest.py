@@ -1,7 +1,7 @@
 """Closed source allowlist. Never walk the repository to assemble a release."""
 
 APP_NAME = "hh-applicant-tool-gui"
-APP_VERSION = "0.4.0"
+APP_VERSION = "0.5.0"
 APP_MODULES = (
     "gui", "gui_chatmock_auth", "gui_controller", "gui_owned_process", "gui_profile", "gui_protocol",
     "gui_recovery", "gui_runtime", "gui_steps", "gui_worker",
@@ -18,7 +18,7 @@ BUILD_PINS = {
 }
 PRIVATE_NAMES = frozenset({
     "config.toml", "resume-search.json", "searches.json", "auth.json", "token.json",
-    "cookies.txt", "candidate-facts.json", "direct_url.json", "mutation-state.json",
+    "cookies.txt", "candidate-facts.json", "direct_url.json", "mutation-state.json", "letter-styles.json",
 })
 # Profile folder names under ~/.config and ~/.local/state, current and pre-rename.
 PROFILE_NAMES = frozenset({

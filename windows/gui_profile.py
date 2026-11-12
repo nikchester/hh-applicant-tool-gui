@@ -188,3 +188,148 @@ def set_prompt(prompt):
     if tomllib.loads(text).get("general", {}).get("cover_letter_prompt") != prompt:
         raise ValueError("Не удалось записать стиль письма")
     atomic_write(path, text)
+
+
+# ---- letter styles (issue #4) ---------------------------------------------------------------
+# Several named styles; the active one is written to [general].cover_letter_prompt, so
+# letter generation itself does not change. "Исходный" comes from the shipped template:
+# it is never stored and can be duplicated, but not changed or deleted.
+
+BUILTIN_STYLE = "Исходный"
+MIGRATED_STYLE = "Мой стиль"
+MAX_STYLE_NAME = 60
+MAX_STYLES = 50
+
+
+def styles_path():
+    return state_dir() / "letter-styles.json"
+
+
+def validate_style_name(name, taken=()):
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("Введи название стиля.")
+    name = name.strip()
+    if len(name) > MAX_STYLE_NAME:
+        raise ValueError(f"Название стиля слишком длинное: максимум {MAX_STYLE_NAME} символов.")
+    if name.casefold() in {item.casefold() for item in (BUILTIN_STYLE, *taken)}:
+        raise ValueError(f"Стиль «{name}» уже есть. Выбери другое название.")
+    return name
+
+
+def _valid_store(data):
+    styles = data.get("styles") if isinstance(data, dict) else None
+    if (data.get("v") != 1 or not isinstance(styles, dict) or len(styles) > MAX_STYLES
+            or not isinstance(data.get("active"), str)):
+        raise ValueError("Invalid letter styles")
+    names = []
+    for name, prompt in styles.items():
+        validate_style_name(name, names)
+        validate_prompt(prompt)
+        names.append(name)
+    if data["active"] != BUILTIN_STYLE and data["active"] not in styles:
+        raise ValueError("Invalid active letter style")
+    return data
+
+
+def _write_styles(styles, active):
+    data = _valid_store({"v": 1, "active": active, "styles": dict(styles)})
+    path = styles_path()
+    if path.exists():
+        try:
+            _valid_store(json.loads(path.read_text(encoding="utf-8")))
+        except (OSError, ValueError, AttributeError):
+            # Keep a damaged file for the person to inspect; never silently drop it.
+            os.replace(path, path.with_name(path.name + ".damaged"))
+    atomic_write(path, json.dumps(data, ensure_ascii=False, indent=2))
+    set_prompt(default_prompt() if active == BUILTIN_STYLE else styles[active])
+
+
+def read_styles():
+    """(styles, active, warning). styles: ordered {name: prompt}, "Исходный" first.
+
+    A missing file migrates the profile's single style; a damaged file falls back to
+    "Исходный" with a warning and stays untouched until the next save.
+    """
+    builtin = {BUILTIN_STYLE: default_prompt()}
+    path = styles_path()
+    if not path.exists():
+        current = read_prompt()
+        if current == default_prompt():
+            _write_styles({}, BUILTIN_STYLE)
+            return builtin, BUILTIN_STYLE, None
+        _write_styles({MIGRATED_STYLE: current}, MIGRATED_STYLE)
+        return {**builtin, MIGRATED_STYLE: current}, MIGRATED_STYLE, None
+    try:
+        data = _valid_store(json.loads(path.read_text(encoding="utf-8")))
+    except (OSError, ValueError, AttributeError):
+        return builtin, BUILTIN_STYLE, ("Файл стилей письма повреждён. Сейчас действует стиль «Исходный». "
+                                        "Сохрани стиль заново; старый файл останется рядом с именем .damaged.")
+    return {**builtin, **data["styles"]}, data["active"], None
+
+
+def _stored():
+    styles, active, _warning = read_styles()
+    styles.pop(BUILTIN_STYLE)
+    return styles, active
+
+
+def save_style(name, prompt):
+    """Create or change a style and make it active. Returns the saved name."""
+    validate_prompt(prompt)
+    styles, _active = _stored()
+    if name == BUILTIN_STYLE:
+        raise ValueError("Стиль «Исходный» нельзя изменить. Нажми «Дублировать» и измени копию.")
+    if name not in styles:
+        name = validate_style_name(name, styles)
+        if len(styles) >= MAX_STYLES:
+            raise ValueError(f"Стилей уже {MAX_STYLES}. Удали ненужный стиль.")
+    styles[name] = prompt
+    _write_styles(styles, name)
+    return name
+
+
+def free_style_name(base, taken):
+    taken = {item.casefold() for item in (BUILTIN_STYLE, *taken)}
+    if base.casefold() not in taken:
+        return base
+    number = 2
+    while f"{base} {number}".casefold() in taken:
+        number += 1
+    return f"{base} {number}"
+
+
+def duplicate_style(name, new_name=None):
+    styles, _active = _stored()
+    source = default_prompt() if name == BUILTIN_STYLE else styles[name]
+    new_name = validate_style_name(new_name or free_style_name(name + " (копия)", styles), styles)
+    if len(styles) >= MAX_STYLES:
+        raise ValueError(f"Стилей уже {MAX_STYLES}. Удали ненужный стиль.")
+    styles[new_name] = source
+    _write_styles(styles, new_name)
+    return new_name
+
+
+def rename_style(name, new_name):
+    styles, active = _stored()
+    if name == BUILTIN_STYLE or name not in styles:
+        raise ValueError("Стиль «Исходный» нельзя переименовать." if name == BUILTIN_STYLE
+                         else "Такого стиля нет.")
+    new_name = validate_style_name(new_name, [item for item in styles if item != name])
+    renamed = {(new_name if item == name else item): prompt for item, prompt in styles.items()}
+    _write_styles(renamed, new_name if active == name else active)
+    return new_name
+
+
+def delete_style(name):
+    styles, active = _stored()
+    if name == BUILTIN_STYLE:
+        raise ValueError("Стиль «Исходный» нельзя удалить.")
+    styles.pop(name)
+    _write_styles(styles, BUILTIN_STYLE if active == name else active)
+
+
+def activate_style(name):
+    styles, _active = _stored()
+    if name != BUILTIN_STYLE and name not in styles:
+        raise ValueError("Такого стиля нет.")
+    _write_styles(styles, name)

@@ -1082,6 +1082,99 @@ class LetterStyleChecks(unittest.TestCase):
         self.assertTrue(gui_profile.default_prompt())
         gui_profile.validate_prompt(gui_profile.default_prompt())
 
+    def profile(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        home = patch("pathlib.Path.home", return_value=Path(temp.name))
+        home.start()
+        self.addCleanup(home.stop)
+        gui_profile.initialize()
+
+    def test_fresh_profile_uses_the_builtin_style(self):
+        self.profile()
+        styles, active, warning = gui_profile.read_styles()
+        self.assertEqual((list(styles), active, warning), (["Исходный"], "Исходный", None))
+        self.assertEqual(styles["Исходный"], gui_profile.default_prompt())
+
+    def test_old_single_style_profile_migrates_without_losing_text(self):
+        self.profile()
+        old = "Мой старый стиль для %(vacancy_name)s."
+        gui_profile.set_prompt(old)
+        styles, active, warning = gui_profile.read_styles()
+        self.assertEqual(active, "Мой стиль")
+        self.assertEqual(styles["Мой стиль"], old)
+        self.assertIsNone(warning)
+        self.assertEqual(gui_profile.read_prompt(), old)
+        self.assertTrue(gui_profile.styles_path().is_file())  # Migrated once, not on every start.
+        gui_profile.activate_style("Исходный")
+        self.assertEqual(gui_profile.read_styles()[0]["Мой стиль"], old)
+
+    def test_create_rename_duplicate_delete_and_activate(self):
+        self.profile()
+        self.assertEqual(gui_profile.save_style("Официальный", "Вы, коротко, %(employer_name)s."), "Официальный")
+        self.assertEqual(gui_profile.read_prompt(), "Вы, коротко, %(employer_name)s.")  # Active = used.
+        copy = gui_profile.duplicate_style("Официальный")
+        self.assertEqual(copy, "Официальный (копия)")
+        self.assertEqual(gui_profile.duplicate_style("Официальный"), "Официальный (копия) 2")
+        self.assertEqual(gui_profile.rename_style(copy, "English"), "English")
+        styles, active, _ = gui_profile.read_styles()
+        self.assertEqual(list(styles), ["Исходный", "Официальный", "English", "Официальный (копия) 2"])
+        self.assertEqual(active, "Официальный (копия) 2")
+        gui_profile.activate_style("English")
+        self.assertEqual(gui_profile.read_prompt(), "Вы, коротко, %(employer_name)s.")
+        gui_profile.save_style("English", "Write in English for %(vacancy_name)s.")
+        self.assertEqual(gui_profile.read_prompt(), "Write in English for %(vacancy_name)s.")
+        gui_profile.delete_style("English")  # The active style: "Исходный" takes over.
+        styles, active, _ = gui_profile.read_styles()
+        self.assertNotIn("English", styles)
+        self.assertEqual(active, "Исходный")
+        self.assertEqual(gui_profile.read_prompt(), gui_profile.default_prompt())
+
+    def test_builtin_style_cannot_be_changed_renamed_or_deleted_but_can_be_duplicated(self):
+        self.profile()
+        for action in (lambda: gui_profile.save_style("Исходный", "x"),
+                       lambda: gui_profile.rename_style("Исходный", "Другой"),
+                       lambda: gui_profile.delete_style("Исходный")):
+            with self.assertRaisesRegex(ValueError, "Исходный"):
+                action()
+        name = gui_profile.duplicate_style("Исходный")
+        self.assertEqual(gui_profile.read_styles()[0][name], gui_profile.default_prompt())
+
+    def test_names_and_bad_placeholders_are_rejected_without_changes(self):
+        self.profile()
+        gui_profile.save_style("Один", "Текст.")
+        before = gui_profile.styles_path().read_text(encoding="utf-8")
+        for name in ("", "   ", "x" * 61, "один", "ИСХОДНЫЙ"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                gui_profile.save_style(name, "Текст.")
+        with self.assertRaisesRegex(ValueError, "Неизвестная подстановка"):
+            gui_profile.save_style("Два", "%(nope)s")
+        with self.assertRaisesRegex(ValueError, "%%"):
+            gui_profile.save_style("Один", "100%")
+        self.assertEqual(gui_profile.styles_path().read_text(encoding="utf-8"), before)
+        self.assertEqual(gui_profile.read_prompt(), "Текст.")
+
+    def test_style_limit(self):
+        self.profile()
+        for number in range(gui_profile.MAX_STYLES):
+            gui_profile.save_style(f"Стиль {number}", "Текст.")
+        with self.assertRaisesRegex(ValueError, "Удали"):
+            gui_profile.save_style("Ещё один", "Текст.")
+
+    def test_damaged_styles_file_falls_back_to_builtin_and_is_kept(self):
+        self.profile()
+        gui_profile.save_style("Один", "Текст.")
+        for damaged in ("{not json", '{"v": 1, "active": "Нет такого", "styles": {}}',
+                        '{"v": 1, "active": "Один", "styles": {"Один": "%(nope)s"}}', "[]"):
+            with self.subTest(damaged=damaged):
+                gui_profile.styles_path().write_text(damaged, encoding="utf-8")
+                styles, active, warning = gui_profile.read_styles()
+                self.assertEqual((list(styles), active), (["Исходный"], "Исходный"))
+                self.assertIn("повреждён", warning)
+        gui_profile.save_style("Новый", "Снова работает.")
+        self.assertEqual(gui_profile.read_styles()[1], "Новый")
+        self.assertTrue(gui_profile.styles_path().with_name("letter-styles.json.damaged").is_file())
+
     def test_real_tk_search_mode_and_letter_style_dialog(self):
         import tkinter as tk
         from tkinter import ttk
@@ -1138,6 +1231,39 @@ class LetterStyleChecks(unittest.TestCase):
                 save_button.invoke()
                 self.assertEqual(gui_profile.read_prompt(), "Коротко и на «ты» для %(vacancy_name)s.")
                 self.assertIsNone(app.style_window)
+                # Editing "Исходный" saved a new style; step 3 shows and selects it.
+                self.assertEqual(gui_profile.read_styles()[1], "Мой стиль")
+                self.assertEqual(app.style_name.get(), "Мой стиль")
+                self.assertEqual(list(app.style_box["values"]), ["Исходный", "Мой стиль"])
+
+                app.edit_letter_style()
+                dialog = app.style_dialog
+                editor = app.style_controls[0]
+                answers = iter(["Официальный", "Formal"])
+                app.ask_style_name = lambda _title, _initial="": next(answers)
+                dialog["duplicate"]()
+                self.assertEqual(dialog["chosen"].get(), "Официальный")
+                self.assertEqual(editor.get("1.0", "end-1c"), "Коротко и на «ты» для %(vacancy_name)s.")
+                dialog["rename"]()
+                self.assertEqual(dialog["chosen"].get(), "Formal")
+                app.dialogs.askyesno.return_value = True
+                dialog["delete"]()
+                self.assertNotIn("Formal", gui_profile.read_styles()[0])
+                dialog["show"]("Исходный")
+                self.assertEqual(str(dialog["delete_button"]["state"]), "disabled")
+                self.assertEqual(str(dialog["rename_button"]["state"]), "disabled")
+                self.assertIn("не меняется", dialog["note"]["text"])
+                app.style_window.destroy()
+                app.style_window = None
+
+                # Step 3 selector switches the style used by the next preview.
+                app.style_name.set("Исходный")
+                app.select_style()
+                self.assertEqual(gui_profile.read_prompt(), gui_profile.default_prompt())
+                app.set_busy(True)
+                self.assertEqual(str(app.style_box["state"]), "disabled")
+                app.set_busy(False)
+                self.assertEqual(str(app.style_box["state"]), "readonly")
         finally:
             root.destroy()
 
