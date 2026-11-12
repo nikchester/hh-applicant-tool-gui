@@ -155,7 +155,7 @@ if ($script:stops -ne 1) { throw 'Unowned process was touched' }
         self.assertIn('--no-handle-captcha', argv)
         self.assertIn('REMOTE', argv)
         self.assertIn('80000', argv)
-        self.assertIn('3', argv)
+        self.assertEqual(argv[argv.index('--per-page') + 1], '10')  # Up to 10 vacancies for 3 letters.
         self.assertIn('1', argv)
 
     def test_authorization_selects_dedicated_profile(self):

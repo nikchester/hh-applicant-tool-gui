@@ -13,7 +13,7 @@ def arguments(config, resume_id, search):
     return [
         "--config-dir", config, "--profile-id", ".", "--no-handle-captcha",
         "apply", "--dry-run", "--no-send-email", "--no-ai-filter", "--no-skip-tests",
-        "--per-page", "3", "--total-pages", "1", "--max-responses", "1",
+        "--per-page", "10", "--total-pages", "1", "--max-responses", "1",
         "--work-format", "REMOTE", "--currency", "RUR", "--salary", "80000",
         "--no-only-with-salary", "--search-field", "name",
         "--order-by", "publication_time",

@@ -1322,6 +1322,13 @@ class Application:
             self.dialogs.showerror("Модель", "Не удалось сохранить модель. Выбери её снова.")
         self.refresh_steps()
 
+    def show_first_letter(self):
+        """After a preview the view shows a ready letter, not the last skipped vacancy."""
+        letters = [index for index, item in enumerate(getattr(self, "previews", [])) if "reason" not in item]
+        if letters and getattr(self, "preview_box", None) is not None:
+            self.preview_box.current(letters[0])
+            self.select_preview()
+
     def select_preview(self, _event=None):
         if self.session is not None and self.session.state.pending is not None:
             return  # Never replace the displayed text underneath an approval.
@@ -2232,6 +2239,10 @@ class Application:
                     "Дождись его завершения или останови его.")
         if data["success"]:
             message = SUCCESS_TITLES.get(action, "Готово.")
+            previews = getattr(self, "previews", [])
+            if action == "preview" and previews and all("reason" in item for item in previews):
+                message = ("Предпросмотр готов, но писем нет: все найденные вакансии пропущены. "
+                           "Причины — в списке «Готовые письма». Попробуй другой запрос.")
         elif data["cancelled"] or (done is not None and done.get("cancelled")):
             message = "Остановлено. Уже отправленные отклики не отменяются."
         elif done is not None and done.get("network"):
@@ -2297,6 +2308,8 @@ class Application:
             attention(self.root, severity)
         if session.action == "hh_login" and data["success"]:
             self.root.after_idle(self.auto_load_resumes)
+        if session.action == "preview":
+            self.show_first_letter()
         # A failure no longer swaps the work view for the journal (#11): «Подробнее» opens it.
 
     def poll(self):

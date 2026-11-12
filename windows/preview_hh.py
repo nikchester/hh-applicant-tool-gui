@@ -147,6 +147,11 @@ def check_letter_language(letter, vacancy):
             raise LetterRejected(LETTER_LANGUAGE_REJECTED)
 
 
+# A preview reads up to PREVIEW_VACANCIES vacancies of one page and stops after PREVIEW_LETTERS
+# letters: skipped vacancies (Senior, salary, a response already sent) do not use up the letters.
+PREVIEW_VACANCIES, PREVIEW_LETTERS = 10, 3
+
+
 def letter_kwargs(kwargs, vacancy):
     if vacancy_is_english(vacancy):
         return kwargs | {"system_prompt": ENGLISH_SYSTEM}
@@ -179,7 +184,7 @@ def run(argv, *, profile=None, observer=None):
     if not (
         args.dry_run and not args.send_email and not args.ai_filter
         and args.skip_tests is False and not args.captcha_handling
-        and args.total_pages == 1 and args.per_page <= 3
+        and args.total_pages == 1 and args.per_page <= PREVIEW_VACANCIES
         and args.resume_id and args.verbosity == 0
         and args.work_format == ["REMOTE"] and args.currency == "RUR"
         and args.salary == 80000 and args.only_with_salary is False
@@ -212,8 +217,10 @@ def run(argv, *, profile=None, observer=None):
 
     def visible_vacancies(operation, *a, **kw):
         for vacancy in get_vacancies(operation, *a, **kw):
+            if counts["letters"] >= PREVIEW_LETTERS:
+                return  # Enough letters: the preview ends without reading further vacancies.
             counts["vacancies"] += 1
-            if counts["vacancies"] > 3:
+            if counts["vacancies"] > PREVIEW_VACANCIES:
                 raise SystemExit("Preview vacancy limit exceeded")
             print("VACANCY " + json.dumps({
                 "number": counts["vacancies"], "id": vacancy["id"],
@@ -247,7 +254,7 @@ def run(argv, *, profile=None, observer=None):
             yield vacancy
 
     def visible_letter(client, *a, **kw):
-        if counts["letters"] >= 3:
+        if counts["letters"] >= PREVIEW_LETTERS:
             raise SystemExit("Preview letter limit exceeded")
         try:
             vacancy = context["operation"].api_client.get(

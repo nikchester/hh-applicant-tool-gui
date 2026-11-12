@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from hh_applicant_tool.api.client import ApiClient
@@ -160,6 +161,41 @@ class PreviewTests(unittest.TestCase):
                 self.assertEqual(run(arguments(str(profile), "resume", "DevOps")), 0)
             self.assertIn("SKIPPED", output.getvalue())
             self.assertIn('"letters": 0', output.getvalue())
+
+    def test_skipped_vacancies_do_not_use_up_the_three_letters(self):
+        from hh_applicant_tool.ai.openai import OpenAIClient
+        from preview_hh import PREVIEW_LETTERS, PREVIEW_VACANCIES
+        self.assertIn(str(PREVIEW_VACANCIES), arguments("config", "resume", "Linux"))
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            profile = home / ".config/hh-applicant-tool-cli"
+            profile.mkdir(parents=True)
+            shutil.copyfile(Path(__file__).with_name("config.toml"), profile / "config.toml")
+            vacancies = ([{"id": str(n), "name": "Senior DevOps"} for n in (1, 2)]
+                         + [{"id": str(n), "name": "DevOps-инженер"} for n in range(3, 11)])
+            seen = []
+
+            def fake_main(_argv):
+                operation = SimpleNamespace(api_client=Mock(
+                    get=lambda path: {"id": path.rsplit("/", 1)[-1], "name": "DevOps"}))
+                for vacancy in Operation._get_vacancies(operation, resume_id="any"):
+                    seen.append(vacancy["id"])
+                    OpenAIClient.complete(Mock(), "Напиши письмо")
+                return 0
+
+            output = StringIO()
+            with patch.dict(os.environ, {"CONFIG_DIR": str(profile), "HH_PROFILE_ID": "."}), \
+                 patch("preview_hh.Path.home", return_value=home), \
+                 patch("preview_hh.selected_resume_context", return_value=nullcontext()), \
+                 patch.object(Operation, "_get_vacancies", return_value=iter(vacancies)), \
+                 patch.object(OpenAIClient, "complete", Mock(return_value="Здравствуйте! Готов обсудить вакансию.")), \
+                 patch("preview_hh.main", side_effect=fake_main), \
+                 redirect_stdout(output):
+                self.assertEqual(run(arguments(str(profile), "resume", "DevOps")), 0)
+            # Two Senior vacancies are skipped; three letters come from the next ones, and no more is read.
+            self.assertEqual(seen, ["3", "4", "5"])
+            self.assertEqual(output.getvalue().count("LETTER "), PREVIEW_LETTERS)
+            self.assertIn('"vacancies": 5, "letters": 3', output.getvalue())
 
     def test_exclude_explicit_senior_titles_only(self):
         for title in (

@@ -1123,6 +1123,26 @@ class StepChecks(unittest.TestCase):
         self.assertNotIn("неизвестен", app.finish_message(data, "hh_login"))
         self.assertIn("неизвестен", app.finish_message(data, "apply"))
 
+    def test_preview_shows_a_ready_letter_and_says_when_there_is_none(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending, app.session = False, None
+        app.previews = [{"vacancy": {"name": "Senior"}, "reason": "Senior", "text": "Пропущена: Senior"},
+                        {"vacancy": {"name": "DevOps"}, "text": "Письмо"},
+                        {"vacancy": {"name": "Lead"}, "reason": "Lead", "text": "Пропущена: Lead"}]
+        app.preview_box, app.context, app.letter = Mock(), Mock(), Mock()
+        app.preview_box.current.side_effect = lambda index=None: 1 if index is None else None
+        app.replace_text = Mock()
+        app.show_first_letter()
+        app.preview_box.current.assert_any_call(1)
+        app.replace_text.assert_called_with(app.letter, "Письмо")
+        data = {"done": None, "success": True, "cancelled": False, "forced": False}
+        self.assertIn("Письма — в списке", app.finish_message(data, "preview"))
+        app.previews = [app.previews[0], app.previews[2]]
+        app.replace_text.reset_mock()
+        app.show_first_letter()
+        app.replace_text.assert_not_called()  # Only skipped vacancies: nothing to show as a letter.
+        self.assertIn("писем нет: все найденные вакансии пропущены", app.finish_message(data, "preview"))
+
     def test_own_stop_reason_replaces_the_login_hint(self):
         app = gui.Application.__new__(gui.Application)
         app.sending = False
