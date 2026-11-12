@@ -132,8 +132,7 @@ def dispatch(action, settings, channel):
         response = requests.get(provider.base_url + "/models", timeout=(5, 20),
                                 headers={"Authorization": "Bearer " + key} if key else {})
         response.raise_for_status()
-        models = [item["id"] for item in response.json()["data"]
-                  if isinstance(item.get("id"), str) and len(item["id"]) <= 200]
+        models = ai_provider.model_ids(provider, response.json()["data"])
         channel.event("models", models)
         return 0
     if action == "resumes":
@@ -254,6 +253,10 @@ def worker_main(reader=None, writer=None):
                 # The key stays in this process's memory: never argv, environment or files.
                 stack.enter_context(patch.object(HHApplicantTool, "get_openai_config", ai_provider.keyed_config(
                     HHApplicantTool.get_openai_config, provider, key)))
+                if provider.kind != ai_provider.CHATMOCK:
+                    from hh_applicant_tool.ai.openai import OpenAIClient
+                    stack.enter_context(patch.object(OpenAIClient, "_request", ai_provider.tuned_request(
+                        OpenAIClient._request, provider)))
             if action in {"preview", "apply", "auto", "chats"}:
                 model = config.get("openai", {}).get("default", {}).get("model")
                 if not isinstance(model, str) or not model.strip() or model == "CHOOSE_AFTER_LOGIN":

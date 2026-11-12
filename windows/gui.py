@@ -2,7 +2,7 @@
 
 import sys
 
-from gui_protocol import LETTER_REJECTIONS, RETRY_NOTICES
+from gui_protocol import LETTER_REJECTIONS, LETTER_REVISION_FAILURES, RETRY_NOTICES
 
 
 APP_TITLE = "Автоотклики HH"
@@ -180,7 +180,8 @@ WELCOME = (
                "и отправляет отклики. Письмо уходит только после твоего решения."),
     ("Subheading.TLabel", "Что нужно"),
     ("TLabel", "• аккаунт на hh.ru и хотя бы одно опубликованное резюме;\n"
-               "• аккаунт ChatGPT, ключ OpenAI-совместимого API или локальная модель."),
+               "• аккаунт ChatGPT, ключ OpenAI-совместимого API (есть бесплатные: OpenRouter,\n"
+               "  Gemini, Groq) или локальная модель."),
     ("Subheading.TLabel", "Порядок работы"),
     ("TLabel", "1. Войди в HH и подключи AI: ChatGPT или другого провайдера.\n"
                "2. Загрузи резюме и выбери, какие вакансии искать.\n"
@@ -716,15 +717,15 @@ class Application:
 
         self.chat_frame = self.card(work)
         self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(12, 0))
-        ttk.Label(self.chat_frame, text="Попроси ChatGPT переписать ответ (работодатель не увидит просьбу):",
-                  style="Subheading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
+        self.refine_label = ttk.Label(self.chat_frame, style="Subheading.TLabel")
+        self.refine_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
         self.instruction = ttk.Entry(self.chat_frame)
         self.instruction.grid(row=1, column=0, sticky="ew")
         self.instruction.bind("<Return>", lambda _e: self.refine())
         self.edit = ttk.Button(self.chat_frame, text="Переписать", command=self.refine)
         self.edit.grid(row=1, column=1, sticky="ew", padx=(6, 0))
-        ttk.Label(self.chat_frame, text="Или напиши ответ сам:").grid(
-            row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.manual_label = ttk.Label(self.chat_frame)
+        self.manual_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
                                    relief="flat", borderwidth=0, padx=10, pady=8, background=CONTROL,
                                    foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
@@ -734,8 +735,8 @@ class Application:
         self.manual_button.grid(row=3, column=1, sticky="new", padx=(6, 0))
         self.option = ttk.Combobox(self.chat_frame, state="readonly")
         self.option.grid(row=4, column=0, sticky="ew", pady=(4, 0))
-        ttk.Label(self.chat_frame, text="После правки ответ снова придёт на проверку.",
-                  style="Hint.TLabel").grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.edit_hint = ttk.Label(self.chat_frame, style="Hint.TLabel")
+        self.edit_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         work.rowconfigure(1, weight=1, minsize=110)
         work.rowconfigure(3, weight=2, minsize=130)
@@ -1105,6 +1106,7 @@ class Application:
 
     def prepare_run_view(self, action, limit):
         self.run_counts = {"vacancies": 0, "sent": 0, "limit": limit if action == "auto" else None}
+        self.review_note = None
         self.stop_reason = None
         if getattr(self, "heading", None) is None:
             return
@@ -1258,6 +1260,7 @@ class Application:
 
     def edit_provider(self):
         """Choose ChatMock, an OpenAI-compatible API (key in Windows Credential Manager) or a local model."""
+        import webbrowser
         import ai_provider
         from gui_profile import set_provider
         tk, ttk = self.tk, self.ttk
@@ -1289,6 +1292,15 @@ class Application:
         presets.grid(row=6, column=1, columnspan=2, sticky="w", pady=(4, 0))
         for title, url in (("Ollama", "http://127.0.0.1:11434/v1"), ("LM Studio", "http://127.0.0.1:1234/v1")):
             ttk.Button(presets, text=title, command=lambda value=url: address.set(value)).pack(side="left", padx=(0, 6))
+        free_presets = ttk.Frame(frame)
+        free_presets.grid(row=6, column=1, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Label(free_presets, text="Бесплатно:", style="Hint.TLabel").pack(side="left", padx=(0, 6))
+        for api in ai_provider.FREE_APIS:
+            ttk.Button(free_presets, text=api.title,
+                       command=lambda value=api.base_url: address.set(value)).pack(side="left", padx=(0, 6))
+        key_page = ttk.Button(free_presets, text="Получить ключ",
+                              command=lambda: webbrowser.open(ai_provider.free_api(address.get()).key_page))
+        key_page.pack(side="left", padx=(6, 0))
         key_label = ttk.Label(frame, text="Ключ API")
         key_label.grid(row=7, column=0, sticky="w", pady=(10, 0), padx=(0, 8))
         key_entry = ttk.Entry(frame, textvariable=key, show="•", width=44)
@@ -1321,6 +1333,20 @@ class Application:
                 return None
             return ai_provider.read_key(provider) if provider.needs_key else None
 
+        def describe_key(*_args):
+            """Key hint and buttons follow the address: a free API gets its terms and key page."""
+            if kind.get() != ai_provider.OPENAI:
+                return
+            api = ai_provider.free_api(address.get())
+            saved = stored_key() is not None
+            key_hint.configure(text=("Ключ сохранён. Оставь поле пустым, чтобы не менять его. " if saved else "")
+                               + (f"{api.title}: {api.note} " if api else "")
+                               + "Ключ хранится в диспетчере учётных данных Windows, не в файлах.")
+            forget.configure(state="normal" if saved else "disabled")
+            key_page.configure(state="normal" if api else "disabled")
+
+        address.trace_add("write", describe_key)
+
         def update(*_args):
             current = kind.get()
             address_entry.configure(state="disabled" if current == ai_provider.CHATMOCK else "normal")
@@ -1328,18 +1354,11 @@ class Application:
                 address.set(ai_provider.PRESETS[ai_provider.LOCAL])
             if current == ai_provider.OPENAI and ai_provider.kind_of(address.get()) != ai_provider.OPENAI:
                 address.set(ai_provider.PRESETS[ai_provider.OPENAI])
-            if current == ai_provider.CHATMOCK:
-                presets.grid_remove()
-            else:
-                presets.grid() if current == ai_provider.LOCAL else presets.grid_remove()
+            presets.grid() if current == ai_provider.LOCAL else presets.grid_remove()
             uses_key = current == ai_provider.OPENAI
-            for widget in (key_label, key_entry, forget, key_hint):
+            for widget in (key_label, key_entry, forget, key_hint, free_presets):
                 widget.grid() if uses_key else widget.grid_remove()
-            if uses_key:
-                saved = stored_key() is not None
-                key_hint.configure(text=("Ключ сохранён. Оставь поле пустым, чтобы не менять его. " if saved else "")
-                                   + "Ключ хранится в диспетчере учётных данных Windows, не в файлах.")
-                forget.configure(state="normal" if saved else "disabled")
+            describe_key()
             warning.configure(text="" if current == ai_provider.CHATMOCK else
                               "Тексты резюме и вакансий будут уходить выбранному провайдеру. "
                               "Его условия обработки данных — на твоей ответственности.")
@@ -1677,17 +1696,27 @@ class Application:
             self.decision.grid()
             self.yes.configure(state="normal")
             self.no.configure(state="normal")
-            if chat:
-                self.chat_frame.grid()
-                self.edit.configure(state="normal")
-                self.manual_button.configure(state="normal")
-                self.option.configure(values=payload["options"])
-                if payload["options"]:
-                    self.option.grid()
-                    self.option.current(0)
-                else:
-                    self.option.grid_remove()
-            self.say("Прочитай текст. Нажми «" + str(self.yes["text"]) + "» или «Пропустить».")
+            # Both an answer in a chat and a letter can be rewritten by AI or replaced by own text.
+            what = "ответ" if chat else "письмо"
+            self.refine_label.configure(text=f"Попроси AI переписать {what} (работодатель не увидит просьбу):")
+            self.manual_label.configure(text="Или напиши ответ сам:" if chat else
+                                        "Или исправь письмо сам и нажми «Взять мой текст»:")
+            self.edit_hint.configure(text=f"После правки {what} снова придёт на проверку и сам не отправится.")
+            self.chat_frame.grid()
+            self.edit.configure(state="normal")
+            self.manual_button.configure(state="normal")
+            self.manual.configure(height=2 if chat else 5)
+            if not chat:
+                self.manual.insert("1.0", payload["text"])  # Fix a word without retyping the letter.
+            self.option.configure(values=payload["options"])
+            if payload["options"]:
+                self.option.grid()
+                self.option.current(0)
+            else:
+                self.option.grid_remove()
+            note, self.review_note = getattr(self, "review_note", None), None
+            self.say((note + " " if note else "") + "Прочитай текст. Нажми «" + str(self.yes["text"])
+                     + "», «Пропустить» или исправь его ниже.", "warning" if note else "info")
             return
         payload = data["payload"]
         name, value = payload.get("name"), payload.get("data")
@@ -1756,6 +1785,9 @@ class Application:
                             "Вакансия пропущена, отклик не отправлен.")
             self.append_log("Вакансия: " + title + (f" — {employer}" if employer else ""))
             self.append_log("Отклонённое письмо: " + value["text"][:2000])
+        elif name == "letter_revision" and value in LETTER_REVISION_FAILURES:
+            self.review_note = f"Письмо не переписано: {value}. Осталось прежнее письмо."
+            self.append_log(self.review_note)
         elif name == "stopped" and isinstance(value, str):
             self.stop_reason = value
             self.append_log("Причина остановки: " + value)

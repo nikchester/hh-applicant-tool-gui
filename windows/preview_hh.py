@@ -258,7 +258,8 @@ def run(argv, *, profile=None, observer=None):
             letter = complete(client, enrich_prompt(a[0], vacancy), *a[1:],
                               **letter_kwargs(kw, vacancy))
         except Exception:
-            raise SystemExit("Preview stopped after model failure") from None
+            detail = ai_provider.failure_detail()
+            raise SystemExit("Preview stopped after model failure" + (f": {detail}" if detail else "")) from None
         if not isinstance(letter, str) or not letter.strip():
             raise SystemExit("Preview stopped: empty model response")
         check_letter_level(letter, context["vacancy"])

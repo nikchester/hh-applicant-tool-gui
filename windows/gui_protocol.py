@@ -20,6 +20,10 @@ RETRY_NOTICES = {
 LETTER_LEVEL_REJECTED = "Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead"
 LETTER_LANGUAGE_REJECTED = "Письмо для англоязычной вакансии должно быть на английском"
 LETTER_REJECTIONS = frozenset({LETTER_LEVEL_REJECTED, LETTER_LANGUAGE_REJECTED})
+# Fixed reasons of the "letter_revision" event: the AI rewrite failed and the letter stays as it was.
+LETTER_REVISION_FAILED = "AI-провайдер не смог переписать письмо"
+LETTER_REVISION_EMPTY = "AI-провайдер вернул пустое письмо"
+LETTER_REVISION_FAILURES = frozenset({LETTER_REVISION_FAILED, LETTER_REVISION_EMPTY} | LETTER_REJECTIONS)
 
 
 class Cancelled(BaseException):
@@ -198,7 +202,7 @@ class ReviewAdapter:
     def decision(self, kind, text, context, options=()):
         result = self.channel.ask({"kind": kind, "text": text,
                                    "context": context, "options": list(options)})
-        allowed = {"yes", "no", "stop"} if kind == "application" else {"yes", "no", "stop", "edit", "manual"}
+        allowed = {"yes", "no", "stop", "edit", "manual"}
         if (set(result) != {"action", "text"} or result["action"] not in allowed
                 or not isinstance(result["text"], str) or len(result["text"]) > 50000):
             raise ProtocolError("Invalid decision")
@@ -207,12 +211,13 @@ class ReviewAdapter:
         return result
 
     def application(self, gate, text, *, retry=False):
+        """The decision on one letter: yes, no, edit (AI instruction) or manual (own text)."""
         from send import vacancy_lines
         context = "\n".join(vacancy_lines(gate.current, gate.counts["vacancies"]))
         context += "\nРезюме: " + gate.resume_id
         if retry:
             context += "\nПосле капчи нужно новое подтверждение."
-        return self.decision("application", text, context)["action"]
+        return self.decision("application", text, context)
 
     def chat(self, gate, text, options):
         chat = gate.current

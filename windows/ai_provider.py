@@ -82,6 +82,50 @@ def parse(base_url, *, allow_external=True):
     return Provider(OPENAI, base_url)
 
 
+@dataclass(frozen=True)
+class FreeApi:
+    """An OpenAI-compatible API with a free tier; it is an ordinary OPENAI provider with a key."""
+    title: str
+    base_url: str
+    key_page: str
+    note: str
+
+
+FREE_APIS = (
+    FreeApi("OpenRouter", "https://openrouter.ai/api/v1", "https://openrouter.ai/settings/keys",
+            "В списке моделей будут только бесплатные (:free). Без пополнения баланса — около 50 "
+            "запросов в день."),
+    FreeApi("Gemini", "https://generativelanguage.googleapis.com/v1beta/openai", "https://aistudio.google.com/apikey",
+            "Бесплатный уровень Google AI Studio. Google может использовать запросы бесплатного уровня "
+            "для улучшения своих продуктов. В некоторых странах Gemini API недоступен."),
+    FreeApi("Groq", "https://api.groq.com/openai/v1", "https://console.groq.com/keys",
+            "Бесплатный уровень с лимитами запросов в минуту и в день."),
+)
+# Ids of models that cannot write a letter: speech, images, embeddings, safety classifiers.
+NOT_CHAT = ("embedding", "whisper", "tts", "imagen", "veo", "lyria", "image", "audio", "guard", "aqa")
+
+
+def free_api(base_url):
+    """The FREE_APIS entry with this exact base_url, or None."""
+    base_url = str(base_url or "").strip().rstrip("/")
+    return next((api for api in FREE_APIS if api.base_url == base_url), None)
+
+
+def model_ids(provider, data):
+    """Model ids of a /models response; the free APIs keep only free chat models."""
+    ids = [item["id"] for item in data
+           if isinstance(item, dict) and isinstance(item.get("id"), str) and len(item["id"]) <= 200]
+    api = free_api(provider.base_url)
+    if api is None:
+        return ids
+    if api.title == "OpenRouter":
+        return [name for name in ids if name.endswith(":free") or name == "openrouter/free"]
+    if api.title == "Gemini":
+        # The compatibility layer lists "models/<id>"; chat completions take the bare id.
+        ids = [name.removeprefix("models/") for name in ids]
+    return [name for name in ids if not any(word in name.lower() for word in NOT_CHAT)]
+
+
 def from_config(config, *, allow_external=True):
     """Provider of a parsed config.toml; SystemExit keeps the existing refusal style."""
     try:
@@ -267,14 +311,95 @@ def migrate_legacy_keys(api=None):
     return moved
 
 
+# Reasoning models count their hidden reasoning against max_completion_tokens. With the
+# profile's 500 they often spend it all and return an empty letter (finish_reason "length").
+# The letter length is set by the prompt; this is only a ceiling.
+REASONING_MIN_TOKENS = 4000
+
+
 def keyed_config(original, provider, key):
-    """Wrap HHApplicantTool.get_openai_config: add the key only for the provider's own base_url."""
+    """Wrap HHApplicantTool.get_openai_config for the provider's own base_url.
+
+    Adds the key and, for every provider except ChatMock, room for reasoning tokens.
+    """
     def get_openai_config(tool, *args, **kwargs):
         config = original(tool, *args, **kwargs)
-        if key and str(config.get("base_url", "")).rstrip("/") == provider.base_url:
+        if str(config.get("base_url", "")).rstrip("/") != provider.base_url:
+            return config
+        if key:
             config["api_key"] = key
+        if provider.kind != CHATMOCK:
+            limit = config.get("max_completion_tokens")
+            if type(limit) is not int or limit < REASONING_MIN_TOKENS:
+                config["max_completion_tokens"] = REASONING_MIN_TOKENS
         return config
     return get_openai_config
+
+
+REASONING_OFF = {"enabled": False}
+REASONING_MANDATORY = "Reasoning is mandatory"
+
+
+def empty_reply(response):
+    """True for a 200 answer without text: a reasoning model spent its turn thinking."""
+    if response.status_code != 200:
+        return False
+    try:
+        content = response.json()["choices"][0]["message"].get("content")
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return False
+    return not isinstance(content, str) or not content.strip()
+
+
+def tuned_request(original, provider):
+    """Wrap OpenAIClient._request for the provider's own base_url.
+
+    OpenRouter: ask for no hidden reasoning. A letter needs none, and free reasoning models
+    sometimes think until the token limit and return no text. A model that cannot turn
+    reasoning off answers 400; the same request then goes once more without the field.
+    Every provider: an empty answer gets one more attempt.
+    """
+    openrouter = (urlsplit(provider.base_url).hostname or "").lower() == "openrouter.ai"
+
+    def send(client, payload):
+        if openrouter and "reasoning" not in payload:
+            response = original(client, {**payload, "reasoning": REASONING_OFF})
+            if not (response.status_code == 400 and REASONING_MANDATORY in response.text):
+                return response
+        return original(client, payload)
+
+    def _request(client, payload):
+        if str(getattr(client, "base_url", "")).rstrip("/") != provider.base_url:
+            return original(client, payload)
+        global _failure
+        _failure = None  # A timeout leaves no answer: the detail must not be stale.
+        response = send(client, payload)
+        if empty_reply(response):
+            response = send(client, payload)
+        if response.status_code >= 400:
+            host = (urlsplit(provider.base_url).hostname or "").lower()
+            _failure = (host, response.status_code, DAILY_LIMIT_MARK in response.text)
+        return response
+    return _request
+
+
+DAILY_LIMIT_MARK = "free-models-per-day"  # OpenRouter's 429 when the free daily quota is spent.
+_failure = None  # (host, status, daily limit) of the last failed model answer; never its body.
+
+
+def failure_detail():
+    """Fixed, secret-free reason of the last failed model answer, or None."""
+    if _failure is None:
+        return None
+    host, status, daily = _failure
+    if status == 429 and daily:
+        return (f"{host}: daily limit of free model requests reached (HTTP 429); "
+                "wait for the daily reset, add credits or choose another provider")
+    if status == 429:
+        return f"{host}: rate limit (HTTP 429); wait a minute and retry"
+    if status in (401, 403):
+        return f"{host}: HTTP {status}; check the API key and model access"
+    return f"{host}: HTTP {status}"
 
 
 def ready(provider, *, chatgpt_signed_in=False, api=None):

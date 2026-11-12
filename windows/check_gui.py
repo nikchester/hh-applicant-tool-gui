@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 import requests
+from urllib.parse import parse_qs
 
 import gui
 import gui_controller
@@ -376,6 +377,33 @@ class GateChecks(unittest.TestCase):
         self.assertEqual(sender.call_count, 1)
         with self.assertRaises(SystemExit), redirect_stdout(StringIO()):
             gate.send(None, request)
+
+    def test_application_review_offers_ai_rewrite_and_own_text(self):
+        text = "Исходное письмо"
+        channel = FakeChannel([{"action": "edit", "text": "короче"}, {"action": "manual", "text": "Своё  "},
+                               {"action": "yes", "text": ""}])
+        sender = Mock(return_value=SimpleNamespace(status_code=201))
+        gate = ApprovalGate("r", sender, approve=Mock(side_effect=AssertionError("No terminal")),
+                            review=ReviewAdapter(channel))
+        gate.current = {"id": "123", "name": "Python", "salary": {"from": 100000, "currency": "RUR"}}
+        gate.letter, gate.observer = text, channel.event
+        gate.letter_source = (Mock(system_prompt=None), "Prompt", (), {}, gate.current)
+        gate.original_complete = Mock(return_value="Короткое письмо")
+        request = requests.Request("POST", "https://api.hh.ru/negotiations",
+                                   data={"resume_id": "r", "vacancy_id": "123", "message": text}).prepare()
+        with redirect_stdout(StringIO()):
+            gate.send(None, request)
+        self.assertEqual([review["kind"] for review in channel.reviews], ["application"] * 3)
+        self.assertEqual([review["text"] for review in channel.reviews], [text, "Короткое письмо", "Своё  "])
+        sent = sender.call_args.args[1]
+        self.assertEqual(parse_qs(sent.body)["message"], ["Своё  "])
+        # The "application" event counts a vacancy in the GUI: an edit does not repeat it.
+        self.assertEqual([name for name, _ in channel.events], ["application"])
+
+    def test_application_review_still_rejects_unknown_actions(self):
+        for decision in ({"action": "submit", "text": ""}, {"action": "edit"}, {"action": "manual", "text": 5}):
+            with self.subTest(decision=decision), self.assertRaises(ProtocolError):
+                ReviewAdapter(FakeChannel([decision])).decision("application", "Letter", "Context")
 
     def make_chat(self, decisions, *, options=()):
         chat = SimpleNamespace(chat_id=123, reply_options=list(options), employer_name="Test", vacancy_name="Python",
@@ -773,6 +801,53 @@ class ConstructionChecks(unittest.TestCase):
                 response = session.outgoing.get_nowait()
                 self.assertEqual(response["id"], fresh["id"])
                 self.assertEqual(response["payload"]["action"], "yes")
+        finally:
+            root.destroy()
+
+    def test_real_tk_application_review_edits_the_letter_like_a_chat_answer(self):
+        import tkinter as tk
+        from tkinter import ttk
+        from gui_protocol import LETTER_REVISION_FAILED
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                session = gui_controller.Session("apply", {})
+                app.session = session
+                review = frame(session.run, "review", {"kind": "application", "context": "Vacancy",
+                    "text": "Исходное письмо", "options": []})
+                app.handle_frame(review)
+                self.assertTrue(app.chat_frame.winfo_manager())  # The edit controls are shown.
+                self.assertEqual(str(app.edit["state"]), "normal")
+                self.assertIn("письмо", str(app.refine_label["text"]))
+                self.assertEqual(app.manual.get("1.0", "end-1c"), "Исходное письмо")  # Prefilled for a fix.
+                self.assertFalse(app.option.winfo_manager())
+                app.instruction.insert(0, "короче")
+                app.refine()
+                response = session.outgoing.get_nowait()
+                self.assertEqual((response["id"], response["payload"]), (review["id"], {"action": "edit", "text": "короче"}))
+                self.assertEqual(str(app.yes["state"]), "disabled")
+                app.handle_frame(frame(session.run, "event", {"name": "letter_revision", "data": LETTER_REVISION_FAILED}))
+                fresh = frame(session.run, "review", {"kind": "application", "context": "Vacancy",
+                    "text": "Исходное письмо", "options": []})
+                app.handle_frame(fresh)
+                self.assertTrue(session.outgoing.empty())  # The edit did not also approve.
+                self.assertIn(LETTER_REVISION_FAILED, app.status.get())
+                app.manual.delete("1.0", "end")
+                app.manual.insert("1.0", "Исправленное письмо")
+                app.manual_edit()
+                response = session.outgoing.get_nowait()
+                self.assertEqual((response["id"], response["payload"]),
+                                 (fresh["id"], {"action": "manual", "text": "Исправленное письмо"}))
+                chat = frame(session.run, "review", {"kind": "chat", "context": "Question",
+                    "text": "Ответ", "options": []})
+                app.handle_frame(chat)
+                self.assertEqual(app.manual.get("1.0", "end-1c"), "")  # A chat answer box starts empty.
+                self.assertIn("ответ", str(app.refine_label["text"]))
         finally:
             root.destroy()
 
@@ -1320,6 +1395,93 @@ class ProviderChecks(unittest.TestCase):
         self.assertNotIn("api_key", wrapped(None, "other"))
         self.assertNotIn("api_key", ai_provider.keyed_config(original, provider, None)(None))
 
+    def test_openrouter_turns_reasoning_off_and_falls_back_when_mandatory(self):
+        import ai_provider
+
+        def reply(status=200, content="Письмо", text=""):
+            response = Mock(status_code=status, text=text)
+            response.json.return_value = {"choices": [{"message": {"content": content}}]}
+            return response
+        provider = ai_provider.parse("https://openrouter.ai/api/v1")
+        client = SimpleNamespace(base_url="https://openrouter.ai/api/v1/")
+        sent = []
+
+        def run(*replies):
+            sent.clear()
+            queue_ = list(replies)
+            original = lambda _client, payload: (sent.append(payload), queue_.pop(0))[1]
+            return ai_provider.tuned_request(original, provider)(client, {"model": "m"})
+        self.assertEqual(run(reply()).json()["choices"][0]["message"]["content"], "Письмо")
+        self.assertEqual(sent, [{"model": "m", "reasoning": {"enabled": False}}])
+        run(reply(400, text='{"error":{"message":"Reasoning is mandatory for this endpoint"}}'), reply())
+        self.assertEqual(sent, [{"model": "m", "reasoning": {"enabled": False}}, {"model": "m"}])
+        self.assertEqual(run(reply(400, text="other")).status_code, 400)
+        self.assertEqual(len(sent), 1)  # Other errors are not resent.
+        # An empty answer (reasoning ate the turn) gets exactly one more attempt.
+        self.assertEqual(run(reply(content=""), reply(content=None)).json()["choices"][0]["message"]["content"], None)
+        self.assertEqual(len(sent), 2)
+        run(reply(content="  "), reply())
+        self.assertEqual(len(sent), 2)
+
+    def test_provider_failure_is_named_without_its_body_or_chatmock(self):
+        import ai_provider
+        import send
+        provider = ai_provider.parse("https://openrouter.ai/api/v1")
+        client = SimpleNamespace(base_url=provider.base_url)
+        daily = Mock(status_code=429, text='{"error":{"message":"Rate limit exceeded: free-models-per-day. sk-or-x"}}')
+        mandatory = Mock(status_code=400, text="Reasoning is mandatory for this endpoint")
+        replies = [mandatory, daily]
+        wrapped = ai_provider.tuned_request(lambda _client, _payload: replies.pop(0), provider)
+        wrapped(client, {"model": "openrouter/free"})
+        detail = ai_provider.failure_detail()
+        self.assertIn("openrouter.ai: daily limit of free model requests reached (HTTP 429)", detail)
+        self.assertNotIn("sk-or-x", detail)
+        ai_provider.activate(provider)
+        reason = send.generation_failure_detail(RuntimeError("upstream text sk-or-x"))
+        self.assertTrue(reason.startswith("openrouter.ai: daily limit"))
+        self.assertNotIn("ChatMock", reason)
+        for status, text, expected in ((429, "busy", "rate limit (HTTP 429)"), (401, "", "check the API key"),
+                                       (500, "", "openrouter.ai: HTTP 500")):
+            replies[:] = [Mock(status_code=status, text=text)] * 2
+            wrapped(client, {"model": "m", "reasoning": {"effort": "low"}})
+            with self.subTest(status=status):
+                self.assertIn(expected, ai_provider.failure_detail())
+        replies[:] = [Mock(status_code=200, text="", json=lambda: {"choices": [{"message": {"content": "ok"}}]})]
+        wrapped(client, {"model": "m"})
+        self.assertIsNone(ai_provider.failure_detail())  # A success clears the last failure.
+        self.assertEqual(send.generation_failure_detail(RuntimeError()), "AI provider request failed; no automatic replay")
+
+    def test_tuned_request_leaves_other_clients_and_providers_alone(self):
+        import ai_provider
+        sent = []
+        original = lambda client, payload: (sent.append(payload), Mock(status_code=200, json=lambda: {
+            "choices": [{"message": {"content": ""}}]}))[1]
+        wrapped = ai_provider.tuned_request(original, ai_provider.parse("https://openrouter.ai/api/v1"))
+        wrapped(SimpleNamespace(base_url="http://127.0.0.1:8000/v1"), {"model": "m"})  # Captcha or other client.
+        self.assertEqual(sent, [{"model": "m"}])
+        sent.clear()
+        api = ai_provider.tuned_request(original, ai_provider.parse(self.API))
+        api(SimpleNamespace(base_url=self.API), {"model": "m"})
+        self.assertEqual(sent, [{"model": "m"}, {"model": "m"}])  # No reasoning field; one retry on empty.
+
+    def test_external_providers_get_room_for_reasoning_tokens(self):
+        import ai_provider
+        minimum = ai_provider.REASONING_MIN_TOKENS
+        for base_url, expected in ((self.API, minimum), ("http://127.0.0.1:11434/v1", minimum),
+                                   (ai_provider.CHATMOCK_URL, 500)):
+            with self.subTest(base_url=base_url):
+                provider = ai_provider.parse(base_url)
+                wrapped = ai_provider.keyed_config(
+                    lambda _tool, section=None: {"base_url": base_url, "max_completion_tokens": 500}, provider, None)
+                self.assertEqual(wrapped(None)["max_completion_tokens"], expected)
+        provider = ai_provider.parse(self.API)
+        larger = ai_provider.keyed_config(
+            lambda _tool: {"base_url": self.API, "max_completion_tokens": minimum * 2}, provider, None)
+        self.assertEqual(larger(None)["max_completion_tokens"], minimum * 2)  # A larger limit stays.
+        other = ai_provider.keyed_config(
+            lambda _tool: {"base_url": "https://x.example/v1", "max_completion_tokens": 500}, provider, None)
+        self.assertEqual(other(None)["max_completion_tokens"], 500)  # Not the provider's own config.
+
     def test_send_validation_accepts_provider_only_in_the_gui_profile(self):
         import send
         with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
@@ -1437,6 +1599,79 @@ class ProviderChecks(unittest.TestCase):
                         self.assertNotIn("sk-from-dialog", path.read_text(encoding="utf-8", errors="ignore"))
         finally:
             root.destroy()
+
+    def test_free_apis_are_ordinary_external_providers(self):
+        import ai_provider
+        for api in ai_provider.FREE_APIS:
+            with self.subTest(api=api.title):
+                provider = ai_provider.parse(api.base_url + "/")
+                self.assertEqual(provider, ai_provider.Provider(ai_provider.OPENAI, api.base_url))
+                self.assertIs(ai_provider.free_api(provider.base_url), api)
+                self.assertTrue(api.key_page.startswith("https://"))
+                self.assertTrue(ai_provider.model_endpoint("POST", api.base_url + "/chat/completions", provider))
+        self.assertIsNone(ai_provider.free_api(self.API))
+
+    def test_free_apis_list_only_free_chat_models(self):
+        import ai_provider
+
+        def ids(base_url, names):
+            return ai_provider.model_ids(ai_provider.parse(base_url), [{"id": name} for name in names] + ["junk"])
+        self.assertEqual(ids("https://openrouter.ai/api/v1", ["google/gemma-4-31b-it:free", "openai/gpt-5",
+                                                              "openrouter/free", "google/lyria-3-pro-preview"]),
+                         ["google/gemma-4-31b-it:free", "openrouter/free"])
+        self.assertEqual(ids("https://generativelanguage.googleapis.com/v1beta/openai",
+                             ["models/gemini-2.5-flash", "models/gemini-embedding-001", "models/imagen-4.0",
+                              "models/gemini-2.5-flash-preview-tts"]),
+                         ["gemini-2.5-flash"])
+        self.assertEqual(ids("https://api.groq.com/openai/v1",
+                             ["llama-3.3-70b-versatile", "whisper-large-v3", "meta-llama/llama-guard-4-12b"]),
+                         ["llama-3.3-70b-versatile"])
+        # Other providers keep every model.
+        self.assertEqual(ids(self.API, ["gpt-5", "whisper-1"]), ["gpt-5", "whisper-1"])
+
+    def test_real_tk_provider_dialog_offers_free_api_presets(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        store = {}
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                 patch("ai_provider.save_key", lambda provider, key, api=None: store.update({provider.base_url: key.strip()})), \
+                 patch("ai_provider.read_key", lambda provider, api=None: store.get(provider.base_url)), \
+                 patch("webbrowser.open") as browser:
+                app = gui.Application(root, tk, ttk, Mock())
+                app.edit_provider()
+                controls = app.provider_controls
+                controls["kind"].set("openai")
+                controls["update"]()
+                window = app.provider_window
+                buttons = {widget["text"]: widget for widget in self.walk(window) if isinstance(widget, ttk.Button)}
+                self.assertEqual(str(buttons["Получить ключ"]["state"]), "disabled")  # api.openai.com is not free.
+                buttons["OpenRouter"].invoke()
+                self.assertEqual(controls["address"].get(), "https://openrouter.ai/api/v1")
+                self.assertEqual(str(buttons["Получить ключ"]["state"]), "normal")
+                buttons["Получить ключ"].invoke()
+                browser.assert_called_once_with("https://openrouter.ai/settings/keys")
+                hint = [widget for widget in self.walk(window)
+                        if isinstance(widget, ttk.Label) and "OpenRouter:" in str(widget["text"])]
+                self.assertEqual(len(hint), 1)
+                controls["key"].set("sk-or-free")
+                controls["save"]()
+                self.assertIsNone(app.provider_window)
+                self.assertEqual(store, {"https://openrouter.ai/api/v1": "sk-or-free"})
+                self.assertTrue(app.ai_ready)
+        finally:
+            root.destroy()
+
+    @staticmethod
+    def walk(widget):
+        for child in widget.winfo_children():
+            yield child
+            yield from ProviderChecks.walk(child)
 
 
 class LifecycleChecks(unittest.TestCase):

@@ -1,5 +1,6 @@
 """Offline safety tests: no HH or model network traffic is possible here."""
 
+import json
 import os
 from contextlib import contextmanager
 from contextlib import redirect_stderr, redirect_stdout
@@ -46,6 +47,114 @@ def test_response(vacancy_id="123", letter=LETTER, resume_id=RESUME,
         "withoutTest": "no", "letter": letter, "task_1_text": "Да, Ansible и Docker.",
         "task_2": "7", **extra,
     }).prepare()
+
+
+class ScriptedReview:
+    """The GUI review seam: returns scripted decisions and records each reviewed text."""
+    def __init__(self, *decisions):
+        self.decisions, self.texts = list(decisions), []
+
+    def application(self, _gate, text, *, retry=False):
+        self.texts.append(text)
+        action, _, value = self.decisions.pop(0).partition(":")
+        return {"action": action, "text": value}
+
+
+class LetterEditChecks(unittest.TestCase):
+    """Edits in the reviewed apply mode: every changed letter needs a fresh "yes"."""
+
+    def make_gate(self, *decisions, revised="Новый вариант письма про Linux.", vacancy=VACANCY):
+        sender = Mock(return_value=SimpleNamespace(status_code=201))
+        review = ScriptedReview(*decisions)
+        gate = ApprovalGate(RESUME, sender, approve=Mock(side_effect=AssertionError("No terminal")),
+                            review=review, sleep=Mock())
+        gate.current, gate.letter, gate.observer = vacancy.copy(), LETTER, Mock()
+        self.client = Mock(system_prompt="System prompt")
+        gate.letter_source = (self.client, "Prompt: Linux vacancy", (), {}, vacancy)
+        gate.original_complete = Mock(return_value=revised)
+        return gate, sender, review
+
+    @staticmethod
+    def sent_fields(sender):
+        request = sender.call_args.args[1]
+        return parse_qs(request.body, keep_blank_values=True), request
+
+    def test_ai_rewrite_needs_a_fresh_yes_and_sends_the_rewritten_letter(self):
+        gate, sender, review = self.make_gate("edit:сделай короче", "yes")
+        with redirect_stdout(StringIO()):
+            gate.send(None, negotiation())
+        self.assertEqual(review.texts, [LETTER, "Новый вариант письма про Linux."])
+        fields, request = self.sent_fields(sender)
+        self.assertEqual(fields, {"resume_id": [RESUME], "vacancy_id": ["123"],
+                                  "message": ["Новый вариант письма про Linux."]})
+        self.assertEqual(request.headers["Content-Length"], str(len(request.body)))
+        client, prompt = gate.original_complete.call_args.args
+        self.assertIs(client, self.client)
+        data = json.loads(prompt)
+        self.assertEqual((data["current_letter"], data["user_feedback"]), (LETTER, "сделай короче"))
+        self.assertTrue(gate.original_complete.call_args.kwargs["system_prompt"].startswith("System prompt\n\n"))
+        self.assertNotIn("сделай короче", request.body)  # The instruction never reaches HH.
+        self.assertEqual(gate.letter_feedback, ["сделай короче"])
+        self.assertEqual(gate.counts["http_success"], 1)
+
+    def test_own_text_is_sent_exactly_after_a_fresh_yes(self):
+        gate, sender, review = self.make_gate("manual:Мой текст\nс отступом  ", "yes")
+        with redirect_stdout(StringIO()):
+            gate.send(None, negotiation())
+        gate.original_complete.assert_not_called()
+        self.assertEqual(review.texts, [LETTER, "Мой текст\nс отступом  "])
+        self.assertEqual(self.sent_fields(sender)[0]["message"], ["Мой текст\nс отступом  "])
+
+    def test_an_edit_never_sends_by_itself(self):
+        for answer, error in (("no", Redirect), ("stop", StopReview)):
+            gate, sender, review = self.make_gate("edit:короче", "manual:Свой", answer)
+            with self.subTest(answer=answer), redirect_stdout(StringIO()), self.assertRaises(error):
+                gate.send(None, negotiation())
+            sender.assert_not_called()
+            self.assertEqual(len(review.texts), 3)
+
+    def test_empty_own_text_stops_without_a_send(self):
+        gate, sender, _ = self.make_gate("manual:  \n ")
+        with redirect_stdout(StringIO()), self.assertRaisesRegex(SystemExit, "Invalid manual letter"):
+            gate.send(None, negotiation())
+        sender.assert_not_called()
+
+    def test_failed_or_rejected_rewrite_keeps_the_letter_and_says_why(self):
+        from gui_protocol import LETTER_LEVEL_REJECTED, LETTER_REVISION_EMPTY, LETTER_REVISION_FAILED
+        for outcome, reason in ((OpenAIError("rate limit"), LETTER_REVISION_FAILED),
+                                ("   ", LETTER_REVISION_EMPTY),
+                                ("Готов рассмотреть позицию джун.", LETTER_LEVEL_REJECTED)):
+            gate, sender, review = self.make_gate("edit:иначе", "yes")
+            if isinstance(outcome, Exception):
+                gate.original_complete.side_effect = outcome
+            else:
+                gate.original_complete.return_value = outcome
+            with self.subTest(reason=reason), redirect_stdout(StringIO()):
+                gate.send(None, negotiation())
+            self.assertEqual(review.texts, [LETTER, LETTER])
+            gate.observer.assert_any_call("letter_revision", reason)
+            self.assertEqual(self.sent_fields(sender)[0]["message"], [LETTER])
+            self.assertEqual(gate.letter_feedback, [])
+            self.assertFalse(gate._generating)
+
+    def test_test_application_replaces_only_the_letter_field(self):
+        gate, sender, review = self.make_gate("manual:Своё письмо", "yes", vacancy=VACANCY | {"has_test": True})
+        sender.return_value = Mock(status_code=200, json=Mock(return_value={"success": "true"}))
+        with redirect_stdout(StringIO()):
+            gate.send(None, test_response())
+        fields, _ = self.sent_fields(sender)
+        expected = parse_qs(test_response().body, keep_blank_values=True) | {"letter": ["Своё письмо"]}
+        self.assertEqual(fields, expected)
+        self.assertEqual(gate.counts["http_success"], 1)
+
+    def test_a_new_vacancy_forgets_the_old_letter_context(self):
+        gate, _, _ = self.make_gate()
+        gate.letter_feedback = ["короче"]
+        gate.original_vacancies = lambda _operation: iter([VACANCY | {"id": "456"}])
+        with redirect_stdout(StringIO()):
+            list(gate.vacancies(SimpleNamespace()))
+        self.assertIsNone(gate.letter_source)
+        self.assertEqual(gate.letter_feedback, [])
 
 
 class SendChecks(unittest.TestCase):
