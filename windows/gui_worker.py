@@ -225,6 +225,8 @@ def worker_main(reader=None, writer=None):
             finally:
                 if sending:
                     channel.event("sending", False)
+                    # The GUI counts what HH accepted, never the attempts (#8).
+                    channel.event("counts", dict(counts))
 
         # Suppress all upstream stdout/stderr, including credentials, prompts,
         # traceback/URL logging. Structured events are the only UI output.
@@ -270,6 +272,7 @@ def worker_main(reader=None, writer=None):
                         counts["http_success"] += 1
                     elif kind == "absent" and counts["attempts"] > 0:
                         counts["attempts"] -= 1  # It provably created nothing in HH.
+                    channel.event("counts", dict(counts))
                 send.ApprovalGate.on_send_resolved = staticmethod(resolved)
             channel.check()
             result = dispatch(action, settings, channel)

@@ -25,7 +25,7 @@ CHAT_WAIT_ENDS = {
     "stopped": "Ожидание следующего вопроса прервано.",
 }
 COUNT_TITLES = {
-    "attempts": "попыток отправки", "http_success": "отправлено", "captcha_rejections": "остановлено капчей",
+    "attempts": "попыток отправки", "http_success": "принято HH", "captcha_rejections": "отклонено капчей",
     "chats": "чатов", "inspected": "просмотрено", "drafts": "черновиков", "skipped": "пропущено",
     "failures": "ошибок",
 }
@@ -517,16 +517,18 @@ class Application:
                   "Warn.TLabel", pady=(0, 8))
         fields = ttk.Frame(auto)
         fields.grid(row=1, column=0, sticky="ew")
-        ttk.Label(fields, text="Сколько откликов отправить").grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(fields, text="Сколько успешных откликов отправить").grid(row=0, column=0, columnspan=4, sticky="w")
         ttk.Spinbox(fields, textvariable=self.limit, from_=1, to=1000, width=6).grid(
             row=1, column=0, sticky="w")
+        ttk.Label(fields, text="Считаются только отклики, которые принял HH.", style="Hint.TLabel",
+                  wraplength=300, justify="left").grid(row=2, column=0, columnspan=4, sticky="w", pady=(2, 0))
         ttk.Label(fields, text="Пауза между откликами, секунд: от").grid(
-            row=2, column=0, columnspan=4, sticky="w", pady=(6, 0))
+            row=3, column=0, columnspan=4, sticky="w", pady=(6, 0))
         ttk.Spinbox(fields, textvariable=self.minimum, from_=1, to=86400, increment=10, width=6).grid(
-            row=3, column=0, sticky="w")
-        ttk.Label(fields, text="до").grid(row=3, column=1, padx=6)
+            row=4, column=0, sticky="w")
+        ttk.Label(fields, text="до").grid(row=4, column=1, padx=6)
         ttk.Spinbox(fields, textvariable=self.maximum, from_=1, to=86400, increment=10, width=6).grid(
-            row=3, column=2, sticky="w")
+            row=4, column=2, sticky="w")
         self.auto_error = ttk.Label(auto, style="Error.TLabel", wraplength=300, justify="left")
         self.auto_error.grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.action_button(auto, "Запустить автоотклики…", "auto").grid(row=3, column=0, sticky="ew", pady=(6, 0))
@@ -1079,7 +1081,9 @@ class Application:
                 limit, minimum, maximum = values
                 validate_settings(limit, minimum, maximum)
                 consent = self.dialogs.askyesno("Автоотклики без проверки",
-                    f"Отправить до {limit} откликов без проверки каждого письма?\n\n"
+                    f"Отправить до {limit} успешных откликов без проверки каждого письма?\n\n"
+                    "Лимит считает только отклики, которые принял HH. Пропущенные вакансии, "
+                    "неудачные отправки и повторы после капчи в лимит не входят.\n\n"
                     f"Пауза между откликами: от {minimum:g} до {maximum:g} секунд.\n"
                     "Пауза не защищает от блокировки аккаунта на HH.\n\n"
                     "Если результат отправки неизвестен, проверь отклики на hh.ru. Не запускай повторно вслепую.")
@@ -1105,7 +1109,8 @@ class Application:
             self.dialogs.showerror("Запуск", str(error))
 
     def prepare_run_view(self, action, limit):
-        self.run_counts = {"vacancies": 0, "sent": 0, "limit": limit if action == "auto" else None}
+        self.run_counts = {"vacancies": 0, "sent": 0, "captcha": 0, "unconfirmed": 0,
+                           "limit": limit if action == "auto" else None}
         self.review_note = None
         self.stop_reason = None
         if getattr(self, "heading", None) is None:
@@ -1127,8 +1132,14 @@ class Application:
         if counts["vacancies"]:
             parts.append(f"вакансий: {counts['vacancies']}")
         if counts["sent"] or counts["limit"]:
-            parts.append(f"отправок: {counts['sent']}" + (f" из {counts['limit']}" if counts["limit"] else ""))
-        counter.configure(text=" · ".join(parts).capitalize())
+            parts.append((f"успешных откликов: {counts['sent']} из {counts['limit']}" if counts["limit"]
+                          else f"отправлено: {counts['sent']}"))
+        if counts.get("captcha"):
+            parts.append(f"отклонено капчей: {counts['captcha']}")
+        if counts.get("unconfirmed"):
+            parts.append(f"без подтверждения HH: {counts['unconfirmed']}")
+        text = " · ".join(parts)
+        counter.configure(text=text[:1].upper() + text[1:])
 
     def respond(self, action, text=""):
         from gui_protocol import ProtocolError
@@ -1742,10 +1753,17 @@ class Application:
             attention(self.root, "warning")
         elif name == "sending":
             self.sending = value is True
-            if not self.sending and getattr(self, "run_counts", None) is not None:
-                self.run_counts["sent"] += 1
-                self.update_counter()
             self.say("Идёт отправка в HH…" if self.sending else "Отправка завершена. Жду следующий шаг.")
+        elif name == "counts":
+            if (not isinstance(value, dict) or set(value) != {"attempts", "http_success", "captcha_rejections"}
+                    or any(type(count) is not int or count < 0 for count in value.values())):
+                raise ProtocolError("Invalid counts")
+            if getattr(self, "run_counts", None) is not None:
+                # Only what HH accepted counts toward the limit (#8); the rest is shown apart.
+                self.run_counts.update(sent=value["http_success"], captcha=value["captcha_rejections"],
+                                       unconfirmed=max(0, value["attempts"] - value["http_success"]
+                                                       - value["captcha_rejections"]))
+                self.update_counter()
         elif name in {"letter", "application", "preview_skipped"}:
             if session.state.pending is not None:
                 raise ProtocolError("Output cannot replace a pending reviewed message")

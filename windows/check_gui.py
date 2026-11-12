@@ -657,6 +657,30 @@ class ConstructionChecks(unittest.TestCase):
                 self.assertEqual(done["counts"]["attempts"], 1)
                 self.assertEqual(done["counts"]["http_success"], 0 if failure else 1)
                 self.assertNotIn("SECRET", json.dumps(writer.items))
+                # The GUI counter gets HH-accepted sends, not attempts (#8).
+                counts = [item["payload"]["data"] for item in writer.items
+                          if item["type"] == "event" and item["payload"]["name"] == "counts"]
+                self.assertEqual(counts, [{"attempts": 1, "http_success": 0 if failure else 1,
+                                           "captcha_rejections": 0}])
+
+    def test_worker_reports_counts_after_a_rejected_send(self):
+        reader, writer = Reader(), Writer()
+        reader.put(frame(uuid4().hex, "start", {"action": "resumes", "settings": {}}))
+        response = requests.Response()
+        response.status_code = 400
+        response._content = b"{}"
+        request = requests.Request("POST", "https://api.hh.ru/negotiations", data={"message": "x"}).prepare()
+        def dispatch(_action, _settings, _channel):
+            requests.Session().send(request)
+            return 0
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+             patch.object(requests.sessions.Session, "send", Mock(return_value=response)), \
+             patch("gui_worker.dispatch", dispatch):
+            gui_worker.worker_main(reader, writer)
+        reader.put("")
+        counts = [item["payload"]["data"] for item in writer.items
+                  if item["type"] == "event" and item["payload"]["name"] == "counts"]
+        self.assertEqual(counts, [{"attempts": 1, "http_success": 0, "captcha_rejections": 0}])
 
     def test_worker_cancel_before_transport_cannot_start_network_request(self):
         reader, writer = Reader(), Writer()
@@ -801,6 +825,39 @@ class ConstructionChecks(unittest.TestCase):
                 response = session.outgoing.get_nowait()
                 self.assertEqual(response["id"], fresh["id"])
                 self.assertEqual(response["payload"]["action"], "yes")
+        finally:
+            root.destroy()
+
+    def test_real_tk_auto_counter_counts_only_hh_accepted_responses(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                session = gui_controller.Session("auto", {})
+                app.session = session
+                app.prepare_run_view("auto", 5)
+                self.assertEqual(str(app.counter["text"]), "Успешных откликов: 0 из 5")
+                for sending in (True, False):  # A finished send alone is not a success.
+                    app.handle_frame(frame(session.run, "event", {"name": "sending", "data": sending}))
+                self.assertEqual(str(app.counter["text"]), "Успешных откликов: 0 из 5")
+                app.handle_frame(frame(session.run, "event", {"name": "counts", "data": {
+                    "attempts": 4, "http_success": 2, "captcha_rejections": 1}}))
+                self.assertEqual(str(app.counter["text"]),
+                                 "Успешных откликов: 2 из 5 · отклонено капчей: 1 · без подтверждения HH: 1")
+                for bad in ({"attempts": 1}, {"attempts": -1, "http_success": 0, "captcha_rejections": 0},
+                            {"attempts": "1", "http_success": 0, "captcha_rejections": 0}, [1, 2, 3]):
+                    with self.subTest(bad=bad), self.assertRaises(ProtocolError):
+                        app.handle_frame(frame(session.run, "event", {"name": "counts", "data": bad}))
+                app.prepare_run_view("apply", 1)
+                app.handle_frame(frame(session.run, "event", {"name": "counts", "data": {
+                    "attempts": 1, "http_success": 1, "captcha_rejections": 0}}))
+                self.assertEqual(str(app.counter["text"]), "Отправлено: 1")
         finally:
             root.destroy()
 

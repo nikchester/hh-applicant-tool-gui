@@ -48,6 +48,22 @@ class AutoChecks(unittest.TestCase):
         self.assertEqual(self.sender.call_count, 2)
         self.assertEqual(self.gate.counts['attempts'], 2)
 
+    def test_limit_counts_hh_accepted_responses_not_attempts(self):
+        # #8: a POST rejected by an HH captcha is an attempt, not a response toward the limit.
+        challenge = SimpleNamespace(status_code=403, json=lambda: {
+            "errors": [{"value": "captcha_required", "captcha_url": "https://hh.ru/account/captcha"}]})
+        self.sender.side_effect = [challenge, SimpleNamespace(status_code=201)]
+        self.gate.max_responses = 1
+        self.gate.operation = SimpleNamespace(tool=SimpleNamespace(
+            captcha_manual=False, _can_use_tkinter=lambda: True, handle_captcha=Mock(return_value=True)))
+        self.send()
+        self.assertEqual(self.gate.counts["attempts"], 2)
+        self.assertEqual(self.gate.counts["captcha_rejections"], 1)
+        self.assertEqual(self.gate.counts["http_success"], 1)
+        with self.assertRaises(StopReview):  # One accepted response reaches the limit of 1.
+            self.send()
+        self.assertEqual(self.sender.call_count, 2)
+
     def test_skips_do_not_count_or_sleep(self):
         overpaid = VACANCY | {'salary': {'from': 300001, 'currency': 'RUR'}}
         self.gate.original_vacancies = lambda *_a, **_kw: iter([overpaid, VACANCY])
