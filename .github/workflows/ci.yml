@@ -47,7 +47,8 @@ jobs:
           # Run every suite, then fail if any failed (pwsh alone checks only the last one).
           $failed = @()
           foreach ($check in 'check_preview', 'check_chatmock', 'check_windows', 'check_send',
-                             'check_auto_send', 'check_reply_chats', 'check_manual_captcha', 'check_authorize') {
+                             'check_auto_send', 'check_reply_chats', 'check_manual_captcha', 'check_authorize',
+                             'check_updater') {
             python "windows/$check.py"
             if ($LASTEXITCODE) { $failed += $check }
           }

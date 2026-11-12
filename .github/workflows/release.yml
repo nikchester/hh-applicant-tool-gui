@@ -67,6 +67,19 @@ jobs:
         shell: pwsh
         run: |
           ./windows/build-installer.ps1 -Python ./windows/build/venv/Scripts/python.exe -Iscc $env:ISCC
+      - name: Sign self-update files (code zip and update.json)
+        shell: pwsh
+        env:
+          # base64 raw ed25519 private key; its public half is updater.PUBLIC_KEY.
+          UPDATE_SIGNING_KEY: ${{ secrets.UPDATE_SIGNING_KEY }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = @(Get-ChildItem windows/dist/*/installer -Directory)
+          $app = @(Get-ChildItem windows/dist/*/app/hh-applicant-tool-gui -Directory)
+          if ($installer.Count -ne 1 -or $app.Count -ne 1) { throw 'Expected one build output' }
+          $setup = Join-Path $installer[0].FullName "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
+          windows/build/venv/Scripts/python.exe -I windows/packaging/update_bundle.py $app[0].FullName $setup $installer[0].FullName
+          if ($LASTEXITCODE) { throw 'Self-update files were not signed' }
       - name: Publish GitHub release
         shell: pwsh
         env:
@@ -75,10 +88,14 @@ jobs:
         run: |
           $installer = @(Get-ChildItem windows/dist/*/installer -Directory)
           if ($installer.Count -ne 1) { throw "Expected one installer directory, found $($installer.Count)" }
-          $setup = Join-Path $installer[0].FullName "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
-          $sums = Join-Path $installer[0].FullName 'SHA256SUMS.txt'
-          foreach ($file in $setup, $sums) {
+          $dir = $installer[0].FullName
+          $setup = Join-Path $dir "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
+          $sums = Join-Path $dir 'SHA256SUMS.txt'
+          $code = Join-Path $dir "hh-applicant-tool-gui-$env:VERSION-code.zip"
+          $update = Join-Path $dir 'update.json'
+          $signature = Join-Path $dir 'update.json.sig'
+          foreach ($file in $setup, $sums, $code, $update, $signature) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing release file $file" }
           }
-          gh release create $env:GITHUB_REF_NAME $setup $sums --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag
+          gh release create $env:GITHUB_REF_NAME $setup $sums $code $update $signature --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag
           if ($LASTEXITCODE) { throw 'GitHub release creation failed' }

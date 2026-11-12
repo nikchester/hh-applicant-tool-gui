@@ -187,13 +187,21 @@ def audit_runtime(root):
                 internal / "Python-LICENSE.txt", internal / "certifi/cacert.pem",
                 internal / "hh_applicant_tool/operations/authorize.py",
                 internal / "hh_applicant_tool/operations/apply_vacancies.py",
-                internal / "hh_applicant_tool/operations/reply_chats.py"]
+                internal / "hh_applicant_tool/operations/reply_chats.py",
+                # Updatable application code outside the executable (entrypoint.py).
+                internal / "code/gui.py", internal / "code/updater.py",
+                internal / "code/config.example.toml", internal / "code/version.json"]
     if not all(path.is_file() for path in required):
         raise RuntimeError("Frozen runtime missing required data, licenses or discovery sources")
     if not (list(internal.glob("python312.dll")) and list(internal.glob("_ssl.pyd"))
             and (internal / "_tcl_data").is_dir() and (internal / "_tk_data").is_dir()):
         raise RuntimeError("Frozen Python/SSL/Tcl/Tk runtime incomplete")
     validate_template(internal / "config.example.toml")
+    validate_template(internal / "code/config.example.toml")
+    names = sorted(path.name for path in (internal / "code").iterdir())
+    expected = sorted([name + ".py" for name in APP_MODULES] + ["config.example.toml", "version.json"])
+    if names != expected:
+        raise RuntimeError("Code directory differs from the application allowlist")
     print("Frozen runtime privacy/resource audit OK")
 
 

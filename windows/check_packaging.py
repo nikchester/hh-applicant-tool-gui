@@ -129,7 +129,10 @@ class PackagingChecks(unittest.TestCase):
         self.assertIn("{userprograms}", active)
         self.assertIn("{userdesktop}", active)
         self.assertNotIn("[UninstallDelete]", active)
-        self.assertNotIn("[Run]", active)
+        # [Run] only restarts the app after a silent self-update; interactive installs skip it.
+        run = active.split("[Run]", 1)[1].strip().splitlines() if "[Run]" in active else []
+        self.assertEqual(run, ['Filename: "{app}\\hh-applicant-tool-gui.exe"; WorkingDir: "{app}"; '
+                               'Flags: nowait skipifnotsilent'])
         # No profile folders: uninstall must never touch ~/.config or ~/.local/state.
         self.assertNotIn(".config", active)
         self.assertNotIn(".local", active)

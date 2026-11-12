@@ -9,7 +9,7 @@
   #error OutputPath is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.3.2"
+  #define AppVersion "0.4.0"
 #endif
 [Setup]
 AppId={{CA2072D5-592B-4A8D-98AB-596909B98D40}
@@ -50,4 +50,9 @@ Type: files; Name: "{userdesktop}\PocketNode HH.lnk"
 ; Executable of the former name; the shortcuts above now start hh-applicant-tool-gui.exe.
 Type: files; Name: "{app}\PocketNodeHH.exe"
 
-; Deliberately no [Run], [UninstallDelete], or profile-directory [Dirs] entries.
+[Run]
+; Self-update only: the app exits and starts this installer with /VERYSILENT, then the
+; installer starts the updated app. An interactive install never starts the app itself.
+Filename: "{app}\hh-applicant-tool-gui.exe"; WorkingDir: "{app}"; Flags: nowait skipifnotsilent
+
+; Deliberately no [UninstallDelete] or profile-directory [Dirs] entries.

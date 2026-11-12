@@ -74,6 +74,19 @@ def smoke_check():
     for operation in ("authorize", "apply-vacancies", "reply-chats"):
         parsed = parser.parse_args([operation])
         assert callable(parsed.operation_run)
+    if getattr(sys, "frozen", False):
+        # Application code runs from the updatable code directory, not from the executable.
+        from manifest import APP_VERSION
+        assert Path(gui_profile.__file__).parent == Path(sys._MEIPASS) / "code"
+        assert os.environ["HH_APP_VERSION"] == APP_VERSION
+    import updater
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+    key = Ed25519PrivateKey.generate()
+    public = __import__("base64").b64encode(key.public_key().public_bytes(
+        serialization.Encoding.Raw, serialization.PublicFormat.Raw)).decode()
+    signature = __import__("base64").b64encode(key.sign(b"smoke"))
+    updater.verify(b"smoke", signature, public)  # Signature checks work in the frozen runtime.
     template = Path(gui_profile.__file__).with_name("config.example.toml")
     config = tomllib.loads(template.read_text(encoding="utf-8"))
     assert config["openai"]["default"]["model"] == "CHOOSE_AFTER_LOGIN"

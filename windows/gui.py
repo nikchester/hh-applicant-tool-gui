@@ -73,6 +73,11 @@ def main(argv=None):
         return 1
     try:
         Application(root, tk, ttk, messagebox)
+        try:
+            import updater
+            updater.mark_started()  # The window opened: this code version is good.
+        except (ImportError, OSError):
+            pass
     except (OSError, ValueError):
         messagebox.showerror(APP_TITLE, "Не удалось открыть папку настроек приложения.")
         root.destroy()
@@ -222,6 +227,12 @@ class Application:
         ttk.Label(header, text=APP_TITLE, style="Title.TLabel").pack(side="left")
         ttk.Label(header, text="Отклики на hh.ru с письмами от AI", style="PageHint.TLabel").pack(
             side="left", padx=12, pady=(8, 0))
+        import os
+        version = os.environ.get("HH_APP_VERSION")
+        self.update_release = None
+        self.update_button = ttk.Button(header, text="Обновить", style="Accent.TButton", command=self.apply_update)
+        if version:
+            ttk.Label(header, text="версия " + version, style="PageHint.TLabel").pack(side="right", pady=(8, 0))
         self.build_infobar(outer)
 
         body = ttk.Frame(outer, style="Page.TFrame")
@@ -243,6 +254,7 @@ class Application:
         root.after(100, self.poll)
         self.root.after_idle(self.check_recovery)
         self.root.after_idle(self.auto_load_resumes)
+        self.root.after(3000, self.check_updates)
 
     # ---- layout -----------------------------------------------------------------
 
@@ -1158,6 +1170,70 @@ class Application:
                 self.stop()
             return
         self.root.destroy()
+
+    # ---- self-update ------------------------------------------------------------
+
+    UPDATE_INTERVAL_MS = 6 * 3600 * 1000
+
+    def run_in_background(self, work, done):
+        """Run work() in a thread; call done(result, error) on the Tk thread."""
+        import threading
+        box = {}
+
+        def target():
+            try:
+                box["result"] = work()
+            except Exception as error:  # updater.UpdateError carries a plain sentence.
+                box["error"] = error
+        thread = threading.Thread(target=target, daemon=True)
+        thread.start()
+
+        def wait():
+            if thread.is_alive():
+                self.root.after(200, wait)
+            else:
+                done(box.get("result"), box.get("error"))
+        self.root.after(200, wait)
+
+    def check_updates(self):
+        import updater
+        self.root.after(self.UPDATE_INTERVAL_MS, self.check_updates)
+        if not updater.enabled() or self.update_release is not None:
+            return
+
+        def done(release, error):
+            if error is None and release is not None:
+                self.update_release = release
+                self.update_button.configure(text="Обновить до " + release["version"])
+                self.update_button.pack(side="right", padx=(0, 12))
+                self.append_log("Доступна версия " + release["version"] + ". Кнопка «Обновить» — справа вверху.")
+        self.run_in_background(updater.check, done)
+
+    def apply_update(self):
+        import updater
+        release = self.update_release
+        if release is None:
+            return
+        if self.session is not None:
+            self.dialogs.showinfo("Обновление", "Сейчас идёт запуск. Дождись его завершения, затем обнови программу.")
+            return
+        if not self.dialogs.askyesno("Обновление", f"Установить версию {release['version']}?\n\n"
+                                     "Программа закроется и через несколько секунд откроется снова. "
+                                     "Вход в HH, ключи и настройки сохранятся."):
+            return
+        self.update_button.configure(state="disabled", text="Скачиваю обновление…")
+        self.say("Скачиваю обновление " + release["version"] + ". Не закрывай окно.")
+
+        def done(command, error):
+            if error is not None or self.session is not None:
+                self.update_button.configure(state="normal", text="Обновить до " + release["version"])
+                message = str(error) if isinstance(error, updater.UpdateError) else "Обновление не удалось."
+                self.say(message + " Программа работает на текущей версии.", "error")
+                self.append_log("Обновление не установлено: " + message)
+                return
+            updater.launch(command)
+            self.root.destroy()
+        self.run_in_background(lambda: updater.prepare(release), done)
 
     # ---- AI provider ------------------------------------------------------------
 

@@ -1,13 +1,13 @@
 """Closed source allowlist. Never walk the repository to assemble a release."""
 
 APP_NAME = "hh-applicant-tool-gui"
-APP_VERSION = "0.3.2"
+APP_VERSION = "0.4.0"
 APP_MODULES = (
     "gui", "gui_chatmock_auth", "gui_controller", "gui_owned_process", "gui_profile", "gui_protocol",
     "gui_recovery", "gui_runtime", "gui_steps", "gui_worker",
     "ai_provider", "auto_send", "chatmock_server", "hh_fallback", "hh_network_diagnostics", "list_resumes",
     "manual_captcha", "preview", "preview_hh", "reply_chats", "resume_context",
-    "profile_migration", "send", "send_all", "vacancy_level", "vacancy_salary",
+    "profile_migration", "send", "send_all", "updater", "vacancy_level", "vacancy_salary",
 )
 ENTRY_FILES = ("entrypoint.py", "smoke.py", "manifest.py")
 APPLICATION_PINS = {"hh-applicant-tool": "2.3.7", "chatmock": "1.40"}
