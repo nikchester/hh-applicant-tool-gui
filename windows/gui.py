@@ -215,6 +215,18 @@ def describe_vacancy(item):
     return "\n".join(lines)
 
 
+# First-run setup (#5): one step per screen; the same pages serve the Settings menu.
+WIZARD_PAGES = (
+    ("hh", "Вход в HH", "Войди в аккаунт hh.ru. Приложение ищет вакансии и отправляет отклики от твоего имени."),
+    ("ai", "AI-провайдер", "Кто пишет сопроводительные письма и ответы в чатах. Для откликов без письма AI не нужен."),
+    ("model", "Модель", "Загрузи список моделей выбранного провайдера и выбери модель. "
+                        "Стиль письма и запасные модели можно настроить сейчас или позже."),
+    ("resume", "Резюме и поиск", "Выбери резюме и какие вакансии искать. Резюме загружаются сами после входа в HH."),
+    ("done", "Всё готово", "Настройка завершена. Начни с предпросмотра: он показывает письма и ничего не отправляет. "
+                           "Вход, AI-провайдер, модель и стили потом — в меню «Настройки» вверху справа."),
+)
+
+
 WELCOME = (
     ("TLabel", "Приложение ищет вакансии на hh.ru, пишет сопроводительные письма через ChatGPT "
                "или другого AI-провайдера "
@@ -224,11 +236,10 @@ WELCOME = (
                "• аккаунт ChatGPT, ключ OpenAI-совместимого API (есть бесплатные: OpenRouter,\n"
                "  Gemini, Groq) или локальная модель."),
     ("Subheading.TLabel", "Порядок работы"),
-    ("TLabel", "1. Войди в HH и подключи AI: ChatGPT или другого провайдера.\n"
-               "2. Загрузи резюме и выбери, какие вакансии искать.\n"
-               "3. Выбери модель и, если нужно, настрой стиль письма.\n"
-               "4. Запусти предпросмотр: он показывает письма и ничего не отправляет.\n"
-               "5. Нажми «Откликнуться с проверкой писем» и подтверди каждое письмо."),
+    ("TLabel", "1. Пройди настройку: вход в HH, AI-провайдер, модель, резюме и поиск.\n"
+               "2. Запусти предпросмотр: он показывает письма и ничего не отправляет.\n"
+               "3. Нажми «Откликнуться с проверкой писем» и подтверди каждое письмо.\n"
+               "Вход, AI-провайдер, модель и стили письма — в меню «Настройки» вверху справа."),
     ("Warn.TLabel", "HH может заблокировать аккаунт за автоматизацию. Капчу вводи только сам."),
 )
 
@@ -279,10 +290,12 @@ class Application:
         self.update_button = ttk.Button(header, text="Обновить", style="Accent.TButton", command=self.apply_update)
         if version:
             ttk.Label(header, text="версия " + version, style="PageHint.TLabel").pack(side="right", pady=(8, 0))
+        self.build_settings_menu(header)
         self.build_infobar(outer)
 
-        body = ttk.Frame(outer, style="Page.TFrame")
+        body = self.body = ttk.Frame(outer, style="Page.TFrame")
         body.pack(fill="both", expand=True)
+        self.wizard = ttk.Frame(outer, style="Page.TFrame")  # Shown instead of body while setting up (#5).
         body.columnconfigure(1, weight=1)
         body.rowconfigure(0, weight=1)
         sidebar_box, sidebar = self.scrollable(body)
@@ -290,13 +303,18 @@ class Application:
         main = ttk.Frame(body, style="Card.TFrame", padding=(22, 16, 22, 18))
         main.grid(row=0, column=1, sticky="nsew", padx=(16, 0))
         self.build_sidebar(sidebar)
+        self.build_wizard(self.wizard)
         self.build_main(main)
+        self.load_styles()
+        self.show_fallback_count()
+        self.update_search_mode()
         self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
         self.clear_review()
         for variable in (self.search, self.search_mode, self.limit, self.minimum, self.maximum):
             variable.trace_add("write", lambda *_a: self.refresh_steps())
         self.refresh_steps()
         self.say(self.next_hint())
+        self.decide_start()
         root.after(100, self.poll)
         self.root.after_idle(self.check_recovery)
         self.root.after_idle(self.auto_load_resumes)
@@ -396,6 +414,8 @@ class Application:
         self.infobar_message = message
         # Errors and warnings link to the journal instead of opening it by themselves (#11).
         self.infobar_more = ttk.Button(self.infobar, text="Подробнее", command=self.open_log)
+        # One action for a warning, e.g. «Войти» after a lost login (#5).
+        self.infobar_action = ttk.Button(self.infobar)
         self.set_severity("info")
 
     def set_severity(self, level):
@@ -446,17 +466,14 @@ class Application:
         card.columnconfigure(0, weight=1)
         return card
 
-    def step(self, parent, number, title):
+    def section(self, parent, title):
+        """A titled card of the main screen; the setup steps live in the wizard (#5)."""
         card = self.card(parent)
         card.pack(fill="x", pady=(0, 10))
-        header = self.ttk.Label(card, style="StepLocked.TLabel")
-        header.grid(row=0, column=0, sticky="w")
+        self.ttk.Label(card, text=title, style="StepCurrent.TLabel").grid(row=0, column=0, sticky="w")
         frame = self.ttk.Frame(card)
-        frame.grid(row=1, column=0, sticky="ew")
+        frame.grid(row=1, column=0, sticky="ew", pady=(6, 0))
         frame.columnconfigure(0, weight=1)
-        note = self.ttk.Label(frame, style="Hint.TLabel", wraplength=300, justify="left")
-        note.grid(row=0, column=0, columnspan=2, sticky="w", pady=(2, 8))
-        self.steps.append((card, header, f"{number}. {title}", note))
         return frame
 
     def hint(self, parent, text, row, style="Hint.TLabel", pady=(4, 0)):
@@ -464,88 +481,45 @@ class Application:
         label.grid(row=row, column=0, columnspan=2, sticky="w", pady=pady)
         return label
 
-    def build_sidebar(self, side):
+    def search_widgets(self, parent, row):
+        """Search mode controls; the wizard and the main screen each get one set on the same variables."""
         ttk = self.ttk
-        self.steps = []
-        summary = ttk.Frame(side, style="Page.TFrame")
-        summary.pack(fill="x", pady=(0, 10))
-        self.setup_label = ttk.Label(summary, style="PageHint.TLabel")
-        self.setup_label.pack(anchor="w")
-        self.setup_bar = ttk.Progressbar(summary, style="Accent.Horizontal.TProgressbar", maximum=3, length=300)
-        self.setup_bar.pack(fill="x", pady=(4, 0))
-        login = self.step(side, 1, "Вход")
-        login.columnconfigure(1, weight=1)
-        self.action_button(login, "Войти в HH", "hh_login").grid(row=1, column=0, sticky="ew", padx=(0, 6))
-        self.hh_state = ttk.Label(login, style="Hint.TLabel")
-        self.hh_state.grid(row=1, column=1, sticky="w")
-        self.provider_button = ttk.Button(login, text="AI-провайдер…", command=self.edit_provider)
-        self.provider_button.grid(row=2, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
-        self.buttons.append(self.provider_button)
-        self.provider_state = ttk.Label(login, style="Hint.TLabel", wraplength=170, justify="left")
-        self.provider_state.grid(row=2, column=1, sticky="w", pady=(4, 0))
-        self.chatgpt_button = self.action_button(login, "Войти в ChatGPT", "chatgpt_login")
-        self.chatgpt_button.grid(row=3, column=0, sticky="ew", padx=(0, 6), pady=(4, 0))
-        self.chatgpt_state = ttk.Label(login, style="Hint.TLabel")
-        self.chatgpt_state.grid(row=3, column=1, sticky="w", pady=(4, 0))
-        # Login input lives next to the login buttons, not in the review area.
-        self.credential_frame = ttk.Frame(login)
-        self.credential_frame.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(8, 0))
-        self.credential_frame.columnconfigure(0, weight=1)
-        self.credential_label = ttk.Label(self.credential_frame, text="Email или телефон от аккаунта HH",
-                                          style="Subheading.TLabel")
-        self.credential_label.grid(row=0, column=0, columnspan=2, sticky="w")
-        self.credential = ttk.Entry(self.credential_frame)
-        self.credential.grid(row=1, column=0, sticky="ew")
-        self.credential.bind("<Return>", lambda _e: self.submit_credential())
-        self.submit = ttk.Button(self.credential_frame, text="Продолжить", style="Accent.TButton",
-                                 command=self.submit_credential)
-        self.submit.grid(row=1, column=1, padx=(6, 0))
-
-        resume = self.step(side, 2, "Резюме и поиск")
-        self.action_button(resume, "Обновить список резюме", "resumes").grid(row=1, column=0, columnspan=2, sticky="ew")
-        ttk.Label(resume, text="Резюме").grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.resume_box = ttk.Combobox(resume, textvariable=self.resume, state="readonly", width=30)
-        self.resume_box.grid(row=3, column=0, columnspan=2, sticky="ew")
-        self.resume_box.bind("<<ComboboxSelected>>", self.select_resume)
-        ttk.Label(resume, text="Какие вакансии искать").grid(row=4, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        modes = ttk.Frame(resume)
-        modes.grid(row=5, column=0, columnspan=2, sticky="w")
+        ttk.Label(parent, text="Какие вакансии искать").grid(row=row, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        modes = ttk.Frame(parent)
+        modes.grid(row=row + 1, column=0, columnspan=2, sticky="w")
         ttk.Radiobutton(modes, text="По запросу", value="query", variable=self.search_mode,
                         command=self.select_search_mode).pack(side="left")
         ttk.Radiobutton(modes, text="Все подходящие для резюме", value="all", variable=self.search_mode,
                         command=self.select_search_mode).pack(side="left", padx=(12, 0))
-        self.search_entry = ttk.Entry(resume, textvariable=self.search)
-        self.search_entry.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
-        self.search_entry.bind("<FocusOut>", lambda _e: self.remember_search())
-        self.search_hint = self.hint(resume, "", 7, pady=(2, 0))
+        entry = ttk.Entry(parent, textvariable=self.search)
+        entry.grid(row=row + 2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        entry.bind("<FocusOut>", lambda _e: self.remember_search())
+        self.search_entries.append(entry)
+        self.search_hints.append(self.hint(parent, "", row + 3, pady=(2, 0)))
+        return entry
+
+    def build_sidebar(self, side):
+        """The main screen holds only work (#5): resume, search and style change often; setup is in the wizard."""
+        ttk = self.ttk
+        self.search_entries, self.search_hints = [], []
+        resume = self.section(side, "Резюме и поиск")
+        self.resume_box_main = ttk.Combobox(resume, textvariable=self.resume, state="readonly", width=30)
+        self.resume_box_main.grid(row=0, column=0, columnspan=2, sticky="ew")
+        self.resume_box_main.bind("<<ComboboxSelected>>", self.select_resume)
+        self.search_entry = self.search_widgets(resume, 1)
         ttk.Checkbutton(resume, text="Откликаться со всех резюме по очереди", variable=self.all_resumes).grid(
-            row=8, column=0, columnspan=2, sticky="w", pady=(6, 0))
-        self.hint(resume, "Для каждого резюме выбери свой режим поиска.", 9, pady=(0, 0))
-        self.update_search_mode()
-
-        model = self.step(side, 3, "Модель и стиль письма")
-        self.action_button(model, "Загрузить список моделей", "models").grid(row=1, column=0, columnspan=2, sticky="ew")
-        self.models = ttk.Combobox(model, textvariable=self.model, state="readonly", width=30)
-        self.models.grid(row=2, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.models.bind("<<ComboboxSelected>>", self.select_model)
-        self.hint(model, "Выбранная модель сохраняется сама.", 3)
-        self.fallback_button = ttk.Button(model, text="Запасные модели…", command=self.edit_fallbacks)
-        self.fallback_button.grid(row=7, column=0, columnspan=2, sticky="ew", pady=(10, 0))
-        self.buttons.append(self.fallback_button)
-        self.fallback_hint = self.hint(model, "", 8, pady=(2, 0))
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        refresh = ttk.Button(resume, text="Обновить список резюме", command=lambda: self.launch("resumes"))
+        refresh.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self.buttons.append(refresh)
+        self.extra_action_buttons = [("resumes", refresh)]
+        ttk.Label(resume, text="Стиль письма").grid(row=7, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.style_name = self.tk.StringVar()
-        self.style_box = ttk.Combobox(model, textvariable=self.style_name, state="readonly", width=30)
-        self.style_box.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+        self.style_box = ttk.Combobox(resume, textvariable=self.style_name, state="readonly", width=30)
+        self.style_box.grid(row=8, column=0, columnspan=2, sticky="ew")
         self.style_box.bind("<<ComboboxSelected>>", self.select_style)
-        self.style_button = ttk.Button(model, text="Стиль письма…", command=self.edit_letter_style)
-        self.style_button.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.buttons.append(self.style_button)
-        self.hint(model, "Каким ChatGPT пишет письмо: тон, длина, обращение. Выбранный стиль действует сразу.",
-                  6, pady=(2, 0))
-        self.load_styles()
-        self.show_fallback_count()
 
-        run = self.step(side, 4, "Отклики")
+        run = self.section(side, "Отклики")
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
         self.hint(run, "Показывает письма и ничего не отправляет. Начни с него.", 2, pady=(2, 8))
         self.action_button(run, "Откликнуться с проверкой писем", "apply").grid(row=3, column=0, sticky="ew")
@@ -582,6 +556,277 @@ class Application:
         self.auto_error = ttk.Label(auto, style="Error.TLabel", wraplength=300, justify="left")
         self.auto_error.grid(row=2, column=0, sticky="w", pady=(4, 0))
         self.action_button(auto, "Запустить автоотклики…", "auto").grid(row=3, column=0, sticky="ew", pady=(6, 0))
+
+    def build_wizard(self, parent):
+        """Setup pages (#5): the first run walks them in order; the Settings menu opens one of them."""
+        ttk = self.ttk
+        parent.columnconfigure(0, weight=1)
+        top = ttk.Frame(parent, style="Page.TFrame")
+        top.grid(row=0, column=0, sticky="ew")
+        self.wizard_step = ttk.Label(top, style="PageHint.TLabel")
+        self.wizard_step.pack(anchor="w")
+        self.wizard_bar = ttk.Progressbar(top, style="Accent.Horizontal.TProgressbar", maximum=4, length=420)
+        self.wizard_bar.pack(anchor="w", pady=(4, 10))
+        # The card hugs its page and carries the buttons, so «Далее» never falls below a small screen.
+        holder = self.card(parent)
+        holder.grid(row=1, column=0, sticky="new")
+        holder.configure(padding=(28, 22, 28, 24))
+        self.wizard_title = ttk.Label(holder, style="Heading.TLabel")
+        self.wizard_title.grid(row=0, column=0, sticky="w")
+        self.wizard_note = ttk.Label(holder, style="Hint.TLabel", wraplength=640, justify="left")
+        self.wizard_note.grid(row=1, column=0, sticky="w", pady=(2, 14))
+        pages = ttk.Frame(holder)
+        pages.grid(row=2, column=0, sticky="nsew")
+        pages.columnconfigure(0, weight=1)
+        self.wizard_pages = {}
+        for name, _title, _note in WIZARD_PAGES:
+            frame = ttk.Frame(pages)
+            frame.grid(row=0, column=0, sticky="nw")
+            frame.grid_remove()
+            self.wizard_pages[name] = frame
+
+        login = self.wizard_pages["hh"]
+        self.action_button(login, "Войти в HH", "hh_login").grid(row=0, column=0, sticky="w", padx=(0, 10))
+        self.hh_state = ttk.Label(login, style="Hint.TLabel")
+        self.hh_state.grid(row=0, column=1, sticky="w")
+        # Login input lives next to the login button, not in the review area.
+        self.credential_frame = ttk.Frame(login)
+        self.credential_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(12, 0))
+        self.credential_frame.columnconfigure(0, weight=1)
+        self.credential_label = ttk.Label(self.credential_frame, text="Email или телефон от аккаунта HH",
+                                          style="Subheading.TLabel")
+        self.credential_label.grid(row=0, column=0, columnspan=2, sticky="w")
+        self.credential = ttk.Entry(self.credential_frame, width=40)
+        self.credential.grid(row=1, column=0, sticky="ew")
+        self.credential.bind("<Return>", lambda _e: self.submit_credential())
+        self.submit = ttk.Button(self.credential_frame, text="Продолжить", style="Accent.TButton",
+                                 command=self.submit_credential)
+        self.submit.grid(row=1, column=1, padx=(6, 0))
+
+        ai = self.wizard_pages["ai"]
+        self.provider_button = ttk.Button(ai, text="AI-провайдер…", command=self.edit_provider)
+        self.provider_button.grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.buttons.append(self.provider_button)
+        self.provider_state = ttk.Label(ai, style="Hint.TLabel", wraplength=420, justify="left")
+        self.provider_state.grid(row=0, column=1, sticky="w")
+        self.chatgpt_button = self.action_button(ai, "Войти в ChatGPT", "chatgpt_login")
+        self.chatgpt_button.grid(row=1, column=0, sticky="ew", padx=(0, 10), pady=(6, 0))
+        self.chatgpt_state = ttk.Label(ai, style="Hint.TLabel")
+        self.chatgpt_state.grid(row=1, column=1, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(ai, text="Откликаться без сопроводительного письма: AI не нужен",
+                        variable=self.no_letter).grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        self.hint(ai, "Тогда шаг «Модель» пропускается. Предпросмотр и ответы в чатах всё равно "
+                      "используют AI: его можно подключить позже в меню «Настройки».", 3, pady=(2, 0))
+
+        model = self.wizard_pages["model"]
+        self.action_button(model, "Загрузить список моделей", "models").grid(row=0, column=0, sticky="w")
+        self.models = ttk.Combobox(model, textvariable=self.model, state="readonly", width=44)
+        self.models.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.models.bind("<<ComboboxSelected>>", self.select_model)
+        self.hint(model, "Выбранная модель сохраняется сама.", 2)
+        self.style_button = ttk.Button(model, text="Стили письма…", command=self.edit_letter_style)
+        self.style_button.grid(row=3, column=0, sticky="w", pady=(14, 0))
+        self.buttons.append(self.style_button)
+        self.hint(model, "Каким AI пишет письмо: тон, длина, обращение. Стиль выбирается и на главном экране.",
+                  4, pady=(2, 0))
+        self.fallback_button = ttk.Button(model, text="Запасные модели…", command=self.edit_fallbacks)
+        self.fallback_button.grid(row=5, column=0, sticky="w", pady=(14, 0))
+        self.buttons.append(self.fallback_button)
+        self.fallback_hint = self.hint(model, "", 6, pady=(2, 0))
+
+        resume = self.wizard_pages["resume"]
+        self.action_button(resume, "Обновить список резюме", "resumes").grid(row=0, column=0, sticky="w")
+        ttk.Label(resume, text="Резюме").grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.resume_box = ttk.Combobox(resume, textvariable=self.resume, state="readonly", width=44)
+        self.resume_box.grid(row=2, column=0, columnspan=2, sticky="ew")
+        self.resume_box.bind("<<ComboboxSelected>>", self.select_resume)
+        self.wizard_search_entry = self.search_widgets(resume, 3)
+        self.hint(resume, "Для каждого резюме выбери свой режим поиска.", 7, pady=(4, 0))
+
+        done = self.wizard_pages["done"]
+        ttk.Button(done, text="Перейти к откликам", style="Accent.TButton", command=self.finish_wizard).grid(
+            row=0, column=0, sticky="w", ipady=2)
+
+        nav = ttk.Frame(holder)
+        nav.grid(row=3, column=0, sticky="ew", pady=(22, 0))
+        self.wizard_back = ttk.Button(nav, text="Назад", command=lambda: self.wizard_move(-1))
+        self.wizard_back.pack(side="left")
+        self.wizard_next = ttk.Button(nav, text="Далее", style="Accent.TButton", command=lambda: self.wizard_move(1))
+        self.wizard_next.pack(side="left", padx=(6, 0))
+        self.wizard_close = ttk.Button(nav, text="Готово", command=self.close_wizard)
+        self.wizard_page, self.wizard_settings = None, False
+
+    def build_settings_menu(self, header):
+        """«Настройки» (#5): setup pages, letter styles, fallback models and the journal after setup."""
+        ttk = self.ttk
+        menu = self.settings_menu = self.tk.Menu(self.root, tearoff=0, background=CARD, foreground=TEXT,
+                                                 activebackground=ACCENT, activeforeground=ON_ACCENT,
+                                                 disabledforeground=DISABLED, borderwidth=0)
+        self.settings_items = (
+            ("Аккаунт HH…", lambda: self.show_wizard("hh", settings=True), True),
+            ("AI-провайдер и модель…", lambda: self.show_wizard("ai", settings=True), True),
+            ("Стили письма…", self.edit_letter_style, True),
+            ("Запасные модели…", self.edit_fallbacks, True),
+            ("Журнал…", self.open_log, False),
+            ("Пройти настройку заново", lambda: self.show_wizard("hh"), True),
+        )
+        for label, command, _locked in self.settings_items:
+            if label == "Пройти настройку заново":
+                menu.add_separator()
+            menu.add_command(label=label, command=command)
+        self.settings_button = ttk.Button(header, text="Настройки ▾", command=self.post_settings_menu)
+        self.settings_button.pack(side="right", padx=(12, 0))
+        self.setup_status = ttk.Label(header, style="PageHint.TLabel", cursor="hand2")
+        self.setup_status.pack(side="right", pady=(8, 0))
+        self.setup_status.bind("<Button-1>", lambda _e: self.post_settings_menu())
+
+    def post_settings_menu(self):
+        button = self.settings_button
+        self.settings_menu.tk_popup(button.winfo_rootx(), button.winfo_rooty() + button.winfo_height())
+
+    def lock_settings(self, running):
+        """Setup must not change under a running worker; the journal stays open."""
+        menu = getattr(self, "settings_menu", None)
+        if menu is None:
+            return
+        for label, _command, locked in self.settings_items:
+            if locked:
+                menu.entryconfigure(label, state="disabled" if running else "normal")
+
+    # ---- wizard -----------------------------------------------------------------
+
+    def wizard_sequence(self):
+        names = [name for name, _title, _note in WIZARD_PAGES]
+        if self.no_letter.get():
+            names.remove("model")  # No letter, no model (#9).
+        return names
+
+    def page_done(self, name, progress=None):
+        progress = progress or self.progress_state()
+        return {"hh": progress.hh, "ai": progress.chatgpt or progress.no_letter,
+                "model": progress.model or progress.no_letter,
+                "resume": progress.resume and progress.search, "done": True}[name]
+
+    def setup_complete(self):
+        """Setup kept between starts: login, AI or the no-letter mode, a model and a saved search."""
+        progress = self.progress_state()
+        return (self.signed_hh and (progress.no_letter or (self.ai_ready and progress.model))
+                and bool(self.searches))
+
+    def decide_start(self):
+        """The wizard opens until setup is done once; later a lost login only warns (#5)."""
+        from gui_profile import read_option, save_option
+        if not read_option("setup_done"):
+            if not self.setup_complete():
+                self.show_wizard()
+                return
+            try:
+                save_option("setup_done", True)  # A profile set up before the wizard existed.
+            except (OSError, ValueError):
+                pass
+        self.root.after_idle(self.check_lost_login)
+
+    def show_wizard(self, page=None, settings=False):
+        self.wizard_settings = settings
+        if page is None:  # The first unfinished step.
+            page = next((name for name in self.wizard_sequence() if not self.page_done(name)), "done")
+        self.body.pack_forget()
+        self.wizard.pack(fill="both", expand=True)
+        self.show_page(page)
+
+    def show_page(self, name):
+        if name not in self.wizard_sequence():
+            name = "ai" if name == "model" else "hh"
+        self.wizard_page = name
+        for key, frame in self.wizard_pages.items():
+            if key == name:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        title, note = next((title, note) for key, title, note in WIZARD_PAGES if key == name)
+        self.wizard_title.configure(text=title)
+        self.wizard_note.configure(text=note)
+        self.refresh_wizard()
+        self.say(self.page_hint(name))
+
+    def page_hint(self, name):
+        """The InfoBar line for a setup page: what to do on it, or that «Далее» is open."""
+        if name == "done":
+            return "Нажми «Перейти к откликам»."
+        if self.page_done(name):
+            return "Шаг выполнен. Нажми «Далее»." if not self.wizard_settings else "Готово. Можно закрыть настройки."
+        return {"hh": "Нажми «Войти в HH» и введи email или телефон, затем код.",
+                "ai": ("Нажми «Войти в ChatGPT»." if self.provider.kind == "chatmock"
+                       else "Нажми «AI-провайдер…» и сохрани ключ API."),
+                "model": "Нажми «Загрузить список моделей» и выбери модель.",
+                "resume": "Выбери резюме и введи запрос или выбери «Все подходящие для резюме»."}[name]
+
+    def refresh_wizard(self):
+        page = getattr(self, "wizard_page", None)
+        if page is None or not self.wizard.winfo_manager():
+            return
+        sequence = self.wizard_sequence()
+        if page not in sequence:
+            self.show_page(page)
+            return
+        # The step count follows the no-letter switch, which drops the model step.
+        steps = [key for key in sequence if key != "done"]
+        number = steps.index(page) + 1 if page in steps else len(steps)
+        self.wizard_step.configure(text="Настройка завершена" if page == "done"
+                                   else f"Настройка · Шаг {number} из {len(steps)}")
+        self.wizard_bar.configure(maximum=len(steps), value=number if page == "done" else number - 1)
+        index = sequence.index(page)
+        idle = self.session is None
+        self.wizard_back.configure(state="normal" if index > 0 and idle else "disabled")
+        if page == "done":
+            self.wizard_next.pack_forget()
+        else:
+            self.wizard_next.pack(side="left", padx=(6, 0), after=self.wizard_back)
+            self.wizard_next.configure(state="normal" if idle and self.page_done(page) else "disabled")
+        if self.wizard_settings:
+            self.wizard_close.pack(side="right")
+            self.wizard_close.configure(state="normal" if idle else "disabled")
+        else:
+            self.wizard_close.pack_forget()
+
+    def wizard_move(self, step):
+        sequence = self.wizard_sequence()
+        index = sequence.index(self.wizard_page)
+        if step > 0 and not self.page_done(self.wizard_page):
+            return  # «Далее» waits for this step.
+        if 0 <= index + step < len(sequence):
+            self.show_page(sequence[index + step])
+
+    def close_wizard(self):
+        self.wizard.pack_forget()
+        self.body.pack(fill="both", expand=True)
+        self.wizard_page = None
+        self.refresh_steps()
+        self.say(self.next_hint())
+
+    def finish_wizard(self):
+        from gui_profile import save_option
+        try:
+            save_option("setup_done", True)
+        except (OSError, ValueError):
+            self.append_log("Не удалось сохранить отметку о завершённой настройке.")
+        self.close_wizard()
+        self.say("Настройка завершена. Начни с «Предпросмотр писем»: он ничего не отправляет.", "success")
+
+    def check_lost_login(self):
+        """Setup was done, but a login or key is gone: one warning with one button, not the wizard."""
+        if self.wizard.winfo_manager():
+            return
+        if not self.signed_hh:
+            self.say("Вход в HH не выполнен или истёк. Нажми «Войти».", "warning",
+                     action=("Войти", lambda: self.show_wizard("hh", settings=True)))
+        elif not self.no_letter.get() and not self.ai_ready:
+            if self.provider.kind == "chatmock":
+                self.say("Вход в ChatGPT не выполнен или истёк. Нажми «Войти».", "warning",
+                         action=("Войти", lambda: self.show_wizard("ai", settings=True)))
+            else:
+                self.say("Ключ AI-провайдера не найден. Нажми «Изменить ключ».", "warning",
+                         action=("Изменить ключ", self.edit_provider))
 
     def toggle_auto(self):
         if self.auto_frame.winfo_ismapped():
@@ -842,36 +1087,20 @@ class Application:
 
     def do_next(self):
         action, _text = self.next_action(self.progress_state())
-        if action == "search":
-            self.search_entry.focus_set()
-        elif action == "provider":
-            self.edit_provider()
+        pages = {"hh_login": "hh", "chatgpt_login": "ai", "provider": "ai", "models": "model"}
+        if action in pages:  # Setup actions live on the setup pages (#5).
+            self.show_wizard(pages[action], settings=True)
+        elif action == "search":
+            self.search_target().focus_set()
         else:
             self.launch(action)
 
     def refresh_steps(self):
-        """Mark each step, lock unready actions and highlight the one next button."""
-        if getattr(self, "steps", None) is None:
+        """Lock unready actions, highlight the one next button and keep the setup status current."""
+        if getattr(self, "wizard_pages", None) is None:
             return
-        from gui_steps import CURRENT, DONE, LOCKED, MARKS, blocker, parse_auto_settings, step_states
+        from gui_steps import blocker, parse_auto_settings
         progress = self.progress_state()
-        states = step_states(progress)
-        locks = (None, blocker("resumes", progress), blocker("models", progress), blocker("preview", progress))
-        for (card, header, title, note), state, lock in zip(self.steps, states, locks):
-            header.configure(text=f"{MARKS[state]}  {title}", style={
-                DONE: "StepDone.TLabel", CURRENT: "StepCurrent.TLabel"}.get(state, "StepLocked.TLabel"))
-            card.configure(style="CurrentCard.TFrame" if state == CURRENT else "Card.TFrame")
-            if state == DONE:
-                note.configure(text="Готово.", style="Done.TLabel")
-            elif state == LOCKED:
-                note.configure(text=lock or "", style="Locked.TLabel")
-            elif state == CURRENT:
-                note.configure(text="Сделай этот шаг сейчас.", style="Hint.TLabel")
-            else:
-                note.configure(text="", style="Hint.TLabel")
-        finished = sum(state == DONE for state in states[:3])
-        self.setup_label.configure(text="Настройка завершена" if finished == 3 else f"Настройка: {finished} из 3 шагов")
-        self.setup_bar.configure(value=finished)
         self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
                                 style="Done.TLabel" if progress.hh else "Hint.TLabel")
         chatmock = self.provider.kind == "chatmock"
@@ -887,6 +1116,14 @@ class Application:
                   "local": ""}[self.provider.kind]
         self.provider_state.configure(text=self.provider.title + status,
                                       style="Done.TLabel" if progress.chatgpt and not chatmock else "Hint.TLabel")
+        from urllib.parse import urlsplit
+        provider = ("ChatGPT" if chatmock else "локальная модель" if self.provider.kind == "local"
+                    else urlsplit(self.provider.base_url).hostname or "API")
+        parts = ["HH " + ("✓" if progress.hh else "✗"), provider + " " + ("✓" if progress.chatgpt else "✗"),
+                 self.model.get() or "модель не выбрана"]
+        if progress.no_letter:
+            parts.append("отклики без письма")
+        self.setup_status.configure(text=" · ".join(parts))
         _values, auto_problem = parse_auto_settings(self.limit.get(), self.minimum.get(), self.maximum.get())
         self.auto_error.configure(text=auto_problem or "")
         action, text = self.next_action(progress)
@@ -896,7 +1133,10 @@ class Application:
             ready = blocker(name, progress) is None and (name != "auto" or auto_problem is None)
             button.configure(state="normal" if idle and ready else "disabled",
                              style="Accent.TButton" if name == action else "TButton")
+        for name, button in getattr(self, "extra_action_buttons", ()):
+            button.configure(state="normal" if idle and blocker(name, progress) is None else "disabled")
         self.next_button.configure(state="normal" if idle else "disabled")
+        self.refresh_wizard()
 
     # ---- state helpers ----------------------------------------------------------
 
@@ -979,6 +1219,7 @@ class Application:
     def set_busy(self, running):
         for button in self.buttons:
             button.configure(state="disabled" if running else "normal")
+        self.lock_settings(running)
         style_box = getattr(self, "style_box", None)
         if style_box is not None:
             style_box.configure(state="disabled" if running else "readonly")
@@ -1020,7 +1261,7 @@ class Application:
     def selected_id(self):
         index = self.resume_box.current()
         if not 0 <= index < len(self.resumes):
-            raise ValueError("Сначала загрузи и выбери опубликованное резюме (шаг 2).")
+            raise ValueError("Сначала загрузи и выбери опубликованное резюме в блоке «Резюме и поиск».")
         return self.resumes[index]["id"]
 
     def search_value(self):
@@ -1028,17 +1269,27 @@ class Application:
         mode = getattr(self, "search_mode", None)
         return "" if mode is not None and mode.get() == "all" else self.search.get()
 
+    def search_target(self):
+        """The search entry the person sees now: the wizard page or the main screen."""
+        wizard = getattr(self, "wizard", None)
+        return (self.wizard_search_entry if wizard is not None and wizard.winfo_manager()
+                else self.search_entry)
+
     def update_search_mode(self):
+        if not hasattr(self, "search_entries"):
+            return
         all_mode = self.search_mode.get() == "all"
-        self.search_entry.configure(state="disabled" if all_mode else "normal")
-        self.search_hint.configure(text="HH подберёт вакансии под это резюме, как в разделе «Подходящие вакансии». "
-                                        "Выбор сохраняется сам." if all_mode else
-                                   "Например: Python разработчик. Запрос сохраняется сам.")
+        for entry in self.search_entries:
+            entry.configure(state="disabled" if all_mode else "normal")
+        for hint in self.search_hints:
+            hint.configure(text="HH подберёт вакансии под это резюме, как в разделе «Подходящие вакансии». "
+                                "Выбор сохраняется сам." if all_mode else
+                           "Например: Python разработчик. Запрос сохраняется сам.")
 
     def select_search_mode(self):
         self.update_search_mode()
         if self.search_mode.get() == "query":
-            self.search_entry.focus_set()
+            self.search_target().focus_set()
         self.remember_search()
         self.refresh_steps()
 
@@ -1091,10 +1342,9 @@ class Application:
             search = self.search_value()
             all_mode = getattr(self, "search_mode", None) is not None and self.search_mode.get() == "all"
             if not all_mode and not search.strip():
-                entry = getattr(self, "search_entry", None)
-                if entry is not None:
-                    entry.focus_set()
-                raise ValueError("Введи поисковый запрос на HH в шаге 2 или выбери «Все подходящие для резюме».")
+                if getattr(self, "search_entry", None) is not None:
+                    self.search_target().focus_set()
+                raise ValueError("Введи поисковый запрос на HH в блоке «Резюме и поиск» или выбери «Все подходящие для резюме».")
             if len(search) > 4000:
                 raise ValueError("Поисковый запрос слишком длинный: максимум 4000 символов.")
             save_search(resume_id, search)
@@ -1139,7 +1389,7 @@ class Application:
             resume, search = "", ""
             if action in REVIEW_ACTIONS:
                 if self.model.get() == "CHOOSE_AFTER_LOGIN" or not self.model.get():
-                    raise ValueError("Подключи AI (шаг 1), загрузи список моделей и выбери модель (шаг 3).")
+                    raise ValueError("Подключи AI и выбери модель: меню «Настройки» → «AI-провайдер и модель…».")
                 set_model(self.model.get())
             if action in {"preview", "apply", "auto"}:
                 resume, search = self.selected_id(), self.search_value()
@@ -1150,7 +1400,7 @@ class Application:
                            if item["id"] not in self.searches]
                 if missing:
                     raise ValueError("Включён режим «со всех резюме по очереди», но нет запроса для резюме:\n• "
-                                     + "\n• ".join(missing) + "\n\nВыбери каждое резюме в шаге 2 и задай для него "
+                                     + "\n• ".join(missing) + "\n\nВыбери каждое резюме в блоке «Резюме и поиск» и задай для него "
                                      "запрос или режим «Все подходящие». Или сними этот флажок.")
             limit, minimum, maximum, consent = 1, 60, 180, False
             if action == "auto":
@@ -1282,7 +1532,7 @@ class Application:
         def add():
             model = self.model.get()
             if self.provider.kind == ai_provider.CHATMOCK or model in {"", "CHOOSE_AFTER_LOGIN"}:
-                error.configure(text="Сначала выбери провайдера (не ChatMock) и модель в шаге 3.")
+                error.configure(text="Сначала выбери провайдера (не ChatMock) и модель: «Настройки» → «AI-провайдер и модель…».")
                 return
             item = {"base_url": self.provider.base_url, "model": model}
             if item in items:
@@ -1604,7 +1854,7 @@ class Application:
             close()
             self.load_provider()
             self.refresh_steps()
-            self.say(f"AI-провайдер: {self.provider.title}. Теперь загрузи список моделей (шаг 3)."
+            self.say(f"AI-провайдер: {self.provider.title}. Теперь загрузи список моделей и выбери модель."
                      if self.ai_ready else self.next_hint(), "success" if self.ai_ready else "info")
             self.append_log("AI-провайдер изменён: " + self.provider.title)
 
@@ -1779,7 +2029,7 @@ class Application:
                     return
                 name = gui_profile.free_style_name(MIGRATED_STYLE, state["styles"])
             saved = run(lambda: gui_profile.save_style(name, text()),
-                        f"Стиль письма «{name}» сохранён и выбран. Проверь его на предпросмотре писем (шаг 4).")
+                        f"Стиль письма «{name}» сохранён и выбран. Проверь его на предпросмотре писем.")
             if saved:
                 self.append_log("Стиль письма сохранён: " + saved)
                 close()
@@ -1896,7 +2146,7 @@ class Application:
                 self.credential_frame.grid()
                 self.submit.configure(state="normal")
                 self.credential.focus_set()
-                self.say("Шаг 1: введи «" + (payload["context"] or "данные для входа")
+                self.say("Введи «" + (payload["context"] or "данные для входа")
                                 + "» под кнопкой «Войти в HH» и нажми «Продолжить».")
                 return
             self.show_work()
@@ -1940,7 +2190,8 @@ class Application:
         name, value = payload.get("name"), payload.get("data")
         if name == "resumes":
             self.resumes = value
-            self.resume_box.configure(values=[item["title"] for item in value])
+            for box in (self.resume_box, self.resume_box_main):
+                box.configure(values=[item["title"] for item in value])
             if value:
                 self.resume_box.current(0)
                 self.select_resume()
@@ -2063,6 +2314,13 @@ class Application:
         if job is not None:
             self.root.after_cancel(job)
 
+    def finish_action(self):
+        """One InfoBar button after a failed run: a provider that rejected the key leads to the key (#5)."""
+        import re
+        if re.search(r": HTTP 40[13]; check the API key", getattr(self, "stop_reason", None) or ""):
+            return ("Изменить ключ", self.edit_provider)
+        return None
+
     def finish_message(self, data, action=None):
         from gui_steps import FAILURE_HINTS, readable_reason
         done = data["done"]
@@ -2090,10 +2348,17 @@ class Application:
                 message += UNKNOWN_RESULT
         return message
 
-    def say(self, text, level="info"):
-        """Show one status message in the InfoBar with its severity."""
+    def say(self, text, level="info", action=None):
+        """Show one status message in the InfoBar with its severity and, optionally, one button."""
         self.status.set(text)
         self.set_severity(level)
+        button = getattr(self, "infobar_action", None)
+        if button is not None:
+            if action:
+                button.configure(text=action[0], command=action[1])
+                button.pack(side="right", padx=(10, 0))
+            else:
+                button.pack_forget()
 
     def finish_severity(self, data, action):
         done = data["done"]
@@ -2124,7 +2389,7 @@ class Application:
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
         severity = self.finish_severity(data, session.action)
-        self.say(message, severity)
+        self.say(message, severity, action=None if data["success"] else self.finish_action())
         if needs_attention(severity, session.action):
             attention(self.root, severity)
         if session.action == "hh_login" and data["success"]:

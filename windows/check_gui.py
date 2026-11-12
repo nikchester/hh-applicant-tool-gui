@@ -1060,7 +1060,7 @@ class AttentionChecks(unittest.TestCase):
         app = SimpleNamespace(
             close_device_window=Mock(), stop_chat_wait=Mock(), finish_message=Mock(return_value="msg"),
             append_log=Mock(), set_busy=Mock(), say=Mock(), next_hint=Mock(return_value=""),
-            finish_severity=Mock(return_value="error"), root=Mock(), show_tab=Mock(),
+            finish_severity=Mock(return_value="error"), root=Mock(), show_tab=Mock(), finish_action=Mock(return_value=None),
             work=Mock(winfo_ismapped=Mock(return_value=False)))
         session = SimpleNamespace(action="auto")
         with patch("gui.attention") as alert:
@@ -1083,7 +1083,7 @@ class StepChecks(unittest.TestCase):
         self.assertIn("войди в HH", blocker("preview", fresh))
         hh_only = Progress(hh=True)
         self.assertEqual(step_states(hh_only), [CURRENT, "open", LOCKED, LOCKED])
-        self.assertIn("ChatGPT", blocker("models", hh_only))
+        self.assertIn("«AI-провайдер и модель…»", blocker("models", hh_only))  # #5: the menu, not a step.
         ready = Progress(hh=True, chatgpt=True, resume=True, search=True, model=True)
         self.assertEqual(step_states(ready), [DONE, DONE, DONE, CURRENT])
         for action in ("preview", "apply", "auto", "chats", "resumes", "models"):
@@ -1245,6 +1245,13 @@ class StepChecks(unittest.TestCase):
             with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
                 app = gui.Application(root, tk, ttk, Mock())
                 root.update_idletasks()
+                # #5: a new profile opens only the setup wizard, on its first step.
+                self.assertEqual(app.wizard.winfo_manager(), "pack")
+                self.assertEqual(app.body.winfo_manager(), "")
+                self.assertEqual(app.wizard_page, "hh")
+                self.assertEqual(str(app.wizard_step["text"]), "Настройка · Шаг 1 из 4")
+                self.assertEqual(str(app.wizard_next["state"]), "disabled")  # «Далее» waits for the login.
+                self.assertEqual(app.wizard_close.winfo_manager(), "")  # No way around the first setup.
                 self.assertEqual(str(app.action_buttons["hh_login"]["state"]), "normal")
                 self.assertEqual(str(app.action_buttons["hh_login"]["style"]), "Accent.TButton")
                 for action in ("resumes", "models", "preview", "apply", "auto", "chats"):
@@ -1264,6 +1271,174 @@ class StepChecks(unittest.TestCase):
                                  {"action": "submit", "text": "test@example.invalid"})
         finally:
             root.destroy()
+
+
+class WizardChecks(unittest.TestCase):
+    """#5: first-run wizard, the Settings menu and warnings for a lost login."""
+
+    def run_app(self, test, *, prepare=lambda: None, patches=()):
+        import contextlib
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                 contextlib.ExitStack() as stack:
+                # A signed-in profile would load resumes through a real worker: never in these tests.
+                stack.enter_context(patch.object(gui.Application, "auto_load_resumes", lambda _self: None))
+                stack.enter_context(patch.object(gui.Application, "check_updates", lambda _self: None))
+                for item in patches:
+                    stack.enter_context(item)
+                prepare()
+                app = gui.Application(root, tk, ttk, Mock())
+                root.update()
+                test(app, root)
+        finally:
+            root.destroy()
+
+    @staticmethod
+    def sign_in_hh():
+        path = gui_profile.profile_dir() / "token.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"token": {"refresh_token": "offline"}}), encoding="utf-8")
+
+    def complete_profile(self, provider="http://127.0.0.1:11434/v1"):
+        self.sign_in_hh()
+        gui_profile.set_provider(provider)
+        gui_profile.set_model("qwen")
+        gui_profile.save_search("r", "Python")
+
+    def test_next_waits_for_each_step_and_back_keeps_what_was_entered(self):
+        def test(app, _root):
+            self.assertEqual(app.wizard_page, "hh")
+            app.signed_hh = True
+            app.refresh_steps()
+            self.assertEqual(str(app.wizard_next["state"]), "normal")
+            app.wizard_next.invoke()
+            self.assertEqual(app.wizard_page, "ai")
+            self.assertTrue(app.page_done("ai"))  # A local model needs no login or key.
+            app.wizard_next.invoke()
+            self.assertEqual(app.wizard_page, "model")
+            self.assertEqual(str(app.wizard_next["state"]), "disabled")  # No model yet.
+            app.wizard_move(1)
+            self.assertEqual(app.wizard_page, "model")  # «Далее» cannot be forced past the step.
+            app.model.set("qwen")
+            app.refresh_steps()
+            app.wizard_next.invoke()
+            self.assertEqual((app.wizard_page, str(app.wizard_step["text"])), ("resume", "Настройка · Шаг 4 из 4"))
+            app.search.set("Python разработчик")
+            app.wizard_back.invoke()
+            app.wizard_next.invoke()
+            self.assertEqual(app.wizard_search_entry.get(), "Python разработчик")  # «Назад» keeps the input.
+            self.assertEqual(app.search_entry.get(), "Python разработчик")  # One variable for both screens.
+            app.resumes = [{"id": "r", "title": "Python"}]
+            for box in (app.resume_box, app.resume_box_main):
+                box.configure(values=["Python"])
+            app.resume_box.current(0)
+            app.refresh_steps()
+            app.wizard_next.invoke()
+            self.assertEqual(app.wizard_page, "done")
+            self.assertFalse(app.wizard_next.winfo_manager())
+            self.assertIs(gui_profile.read_option("setup_done"), False)
+            app.finish_wizard()
+            self.assertEqual(app.body.winfo_manager(), "pack")
+            self.assertEqual(app.wizard.winfo_manager(), "")
+            self.assertIs(gui_profile.read_option("setup_done"), True)
+        self.run_app(test, prepare=lambda: gui_profile.set_provider("http://127.0.0.1:11434/v1"))
+
+    def test_ai_step_for_each_provider_and_the_no_letter_shortcut(self):
+        cases = (("http://127.0.0.1:8000/v1", {"signed_chatgpt": True}, "ChatGPT"),
+                 ("https://openrouter.ai/api/v1", {}, "openrouter.ai"),
+                 ("http://127.0.0.1:11434/v1", {}, "локальная модель"))
+        for base_url, extra, label in cases:
+            with self.subTest(provider=base_url):
+                def test(app, _root, extra=extra, label=label):
+                    self.assertIs(app.page_done("ai"), True)
+                    self.assertIn(label + " ✓", str(app.setup_status["text"]))
+                self.run_app(test, prepare=lambda base_url=base_url: gui_profile.set_provider(base_url),
+                             patches=(patch("ai_provider.read_key", return_value="sk-test"),
+                                      patch("gui_steps.chatgpt_signed_in", return_value=True)))
+        def chatmock_without_login(app, _root):
+            self.assertIs(app.page_done("ai"), False)
+            app.no_letter.set(True)  # Applications without a letter need no AI (#9).
+            self.assertIs(app.page_done("ai"), True)
+            self.assertNotIn("model", app.wizard_sequence())
+            self.assertEqual(str(app.wizard_step["text"]), "Настройка · Шаг 1 из 3")
+        self.run_app(chatmock_without_login, patches=(patch("gui_steps.chatgpt_signed_in", return_value=False),))
+
+    def test_a_profile_set_up_before_the_wizard_opens_the_main_screen(self):
+        def test(app, root):
+            self.assertEqual(app.wizard.winfo_manager(), "")
+            self.assertEqual(app.body.winfo_manager(), "pack")
+            self.assertIs(gui_profile.read_option("setup_done"), True)
+            self.assertEqual(str(app.setup_status["text"]), "HH ✓ · локальная модель ✓ · qwen")
+        self.run_app(test, prepare=self.complete_profile)
+
+    def test_lost_login_warns_with_one_button_instead_of_the_wizard(self):
+        def prepare():
+            self.complete_profile()
+            gui_profile.save_option("setup_done", True)
+            (gui_profile.profile_dir() / "token.json").unlink()  # The HH login is gone.
+        def test(app, root):
+            root.update()
+            self.assertEqual(app.wizard.winfo_manager(), "")
+            self.assertIn("Вход в HH не выполнен или истёк", app.status.get())
+            self.assertEqual(str(app.infobar_action["text"]), "Войти")
+            self.assertTrue(app.infobar_action.winfo_manager())
+            app.infobar_action.invoke()
+            self.assertEqual((app.wizard_page, app.wizard_settings), ("hh", True))
+            self.assertEqual(app.wizard_close.winfo_manager(), "pack")  # Settings can be left at once.
+            app.wizard_close.invoke()
+            self.assertEqual(app.body.winfo_manager(), "pack")
+            self.assertFalse(app.infobar_action.winfo_manager())
+        self.run_app(test, prepare=prepare)
+
+        def key_prepare():
+            self.complete_profile("https://openrouter.ai/api/v1")
+            gui_profile.save_option("setup_done", True)
+        def key_test(app, root):
+            root.update()
+            self.assertIn("Ключ AI-провайдера не найден", app.status.get())
+            self.assertEqual(str(app.infobar_action["text"]), "Изменить ключ")
+        self.run_app(key_test, prepare=key_prepare, patches=(patch("ai_provider.read_key", return_value=None),))
+
+    def test_settings_menu_opens_setup_pages_and_locks_during_a_run(self):
+        def test(app, _root):
+            menu = app.settings_menu
+            labels = [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)
+                      if menu.type(index) == "command"]
+            self.assertEqual(labels, ["Аккаунт HH…", "AI-провайдер и модель…", "Стили письма…",
+                                      "Запасные модели…", "Журнал…", "Пройти настройку заново"])
+            menu.invoke("AI-провайдер и модель…")
+            self.assertEqual((app.wizard_page, app.wizard_settings), ("ai", True))
+            app.wizard_next.invoke()
+            self.assertEqual(app.wizard_page, "model")
+            app.close_wizard()
+            menu.invoke("Журнал…")
+            self.assertIsNotNone(app.log_view)
+            app.set_busy(True)
+            self.assertEqual(menu.entrycget("Аккаунт HH…", "state"), "disabled")
+            self.assertEqual(menu.entrycget("Журнал…", "state"), "normal")
+            app.set_busy(False)
+            self.assertEqual(menu.entrycget("Аккаунт HH…", "state"), "normal")
+            menu.invoke("Пройти настройку заново")
+            self.assertEqual((app.wizard_page, app.wizard_settings), ("hh", False))
+            self.assertEqual(app.wizard_close.winfo_manager(), "")
+        self.run_app(test, prepare=self.complete_profile)
+
+    def test_a_rejected_provider_key_offers_to_change_it(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending = False
+        app.stop_reason = "Stopped: openrouter.ai: HTTP 401; check the API key and model access; no automatic replay"
+        data = {"done": None, "success": False, "cancelled": False, "forced": False}
+        self.assertIn("отклонил запрос (HTTP 401)", app.finish_message(data, "preview"))
+        self.assertEqual(app.finish_action()[0], "Изменить ключ")
+        app.stop_reason = "Stopped after HTTP 403"
+        self.assertIsNone(app.finish_action())
 
 
 class SearchAllChecks(unittest.TestCase):

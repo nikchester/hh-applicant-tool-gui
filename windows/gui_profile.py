@@ -121,7 +121,7 @@ def save_search(resume_id, search):
     atomic_write(search_path(), json.dumps(mapping, ensure_ascii=False, indent=2))
 
 
-OPTIONS = {"no_letter": False}  # GUI switches kept between runs; only these names and bool values.
+OPTIONS = {"no_letter": False, "setup_done": False}  # GUI switches kept between runs; only these names and bool values.
 
 
 def options_path():
