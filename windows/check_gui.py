@@ -857,25 +857,30 @@ class ConstructionChecks(unittest.TestCase):
                 app.handle_frame(review)
                 self.assertEqual(app.letter.get("1.0", "end-1c"), "Original exact text")
                 self.assertEqual(str(app.yes["state"]), "normal")
-                app.manual.insert("1.0", "Updated\nexact  ")
-                app.manual_edit()
+                self.assertEqual(str(app.letter["state"]), "normal")  # #17: edited in place.
+                app.letter.delete("1.0", "end")
+                app.letter.insert("1.0", "Updated\nexact  ")
+                app.approve()
                 response = session.outgoing.get_nowait()
                 self.assertEqual(response["id"], review["id"])
                 self.assertEqual(response["payload"], {"action": "manual", "text": "Updated\nexact  "})
                 self.assertEqual(str(app.yes["state"]), "disabled")
+                self.assertEqual(str(app.letter["state"]), "disabled")
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Updated\nexact  ")  # Shows what went.
                 self.assertIsNone(session.state.pending)
-                fresh = frame(session.run, "review", {"kind": "chat", "context": "Question",
-                    "text": "Updated\nexact  ", "options": []})
-                app.handle_frame(fresh)
-                self.assertTrue(session.outgoing.empty())  # The edit did not also approve.
+                # The worker shows the own text again; it changed in a moment, so it is shown, not sent.
+                changed = frame(session.run, "review", {"kind": "chat", "context": "Question",
+                    "text": "Updated\nexact", "options": []})
+                app.handle_frame(changed)
+                self.assertTrue(session.outgoing.empty())
                 with self.assertRaises(ProtocolError):
                     app.handle_frame(frame(session.run, "event", {"name": "letter", "data": {
                         "vacancy": {}, "text": "Unreviewed replacement"}}))
-                self.assertEqual(app.letter.get("1.0", "end-1c"), "Updated\nexact  ")
-                app.respond("yes")
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Updated\nexact")
+                app.approve()  # Unchanged field: a plain yes.
                 response = session.outgoing.get_nowait()
-                self.assertEqual(response["id"], fresh["id"])
-                self.assertEqual(response["payload"]["action"], "yes")
+                self.assertEqual(response["id"], changed["id"])
+                self.assertEqual(response["payload"], {"action": "yes", "text": ""})
         finally:
             root.destroy()
 
@@ -900,6 +905,10 @@ class ConstructionChecks(unittest.TestCase):
                 self.assertEqual(str(app.yes["text"]), "Отправить отклик")
                 self.assertFalse(app.chat_frame.winfo_manager())  # Nothing to rewrite.
                 self.assertEqual(str(app.yes["state"]), "normal")
+                self.assertEqual(str(app.letter["state"]), "disabled")  # #17: no letter to edit.
+                app.approve()
+                response = app.session.outgoing.get_nowait()
+                self.assertEqual(response["payload"], {"action": "yes", "text": ""})
         finally:
             root.destroy()
 
@@ -991,7 +1000,9 @@ class ConstructionChecks(unittest.TestCase):
                 self.assertTrue(app.chat_frame.winfo_manager())  # The edit controls are shown.
                 self.assertEqual(str(app.edit["state"]), "normal")
                 self.assertIn("письмо", str(app.refine_label["text"]))
-                self.assertEqual(app.manual.get("1.0", "end-1c"), "Исходное письмо")  # Prefilled for a fix.
+                self.assertEqual(str(app.letter["state"]), "normal")  # #17: fixed right in the field.
+                self.assertIn("прямо в поле", str(app.decision_hint["text"]))
+                self.assertFalse(hasattr(app, "manual"))  # No second box under the letter.
                 self.assertFalse(app.option.winfo_manager())
                 app.instruction.insert(0, "короче")
                 app.refine()
@@ -1004,17 +1015,116 @@ class ConstructionChecks(unittest.TestCase):
                 app.handle_frame(fresh)
                 self.assertTrue(session.outgoing.empty())  # The edit did not also approve.
                 self.assertIn(LETTER_REVISION_FAILED, app.status.get())
-                app.manual.delete("1.0", "end")
-                app.manual.insert("1.0", "Исправленное письмо")
-                app.manual_edit()
+                app.letter.delete("1.0", "end")
+                app.letter.insert("1.0", "Исправленное письмо")
+                app.approve()
                 response = session.outgoing.get_nowait()
                 self.assertEqual((response["id"], response["payload"]),
                                  (fresh["id"], {"action": "manual", "text": "Исправленное письмо"}))
+                # The worker shows the own letter once more: the GUI sends it without a second look.
+                again = frame(session.run, "review", {"kind": "application", "context": "Vacancy",
+                    "text": "Исправленное письмо", "options": []})
+                app.handle_frame(again)
+                response = session.outgoing.get_nowait()
+                self.assertEqual((response["id"], response["payload"]), (again["id"], {"action": "yes", "text": ""}))
+                self.assertIsNone(session.state.pending)
+                self.assertEqual(str(app.yes["state"]), "disabled")
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Исправленное письмо")
                 chat = frame(session.run, "review", {"kind": "chat", "context": "Question",
                     "text": "Ответ", "options": []})
                 app.handle_frame(chat)
-                self.assertEqual(app.manual.get("1.0", "end-1c"), "")  # A chat answer box starts empty.
+                self.assertTrue(session.outgoing.empty())  # Only the review right after the own text.
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Ответ")
+                self.assertEqual(str(app.letter["state"]), "normal")
                 self.assertIn("ответ", str(app.refine_label["text"]))
+        finally:
+            root.destroy()
+
+    def test_real_tk_field_edit_answers_only_the_identical_next_review(self):
+        import tkinter as tk
+        from tkinter import ttk
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                app = gui.Application(root, tk, ttk, Mock())
+                session = gui_controller.Session("apply", {})
+                app.session = session
+                app.prepare_run_view("apply", 1)
+
+                def show(text, context="Vacancy", kind="application", options=()):
+                    review = frame(session.run, "review", {"kind": kind, "context": context,
+                                                            "text": text, "options": list(options)})
+                    app.handle_frame(review)
+                    return review
+
+                def answer():
+                    response = session.outgoing.get_nowait()
+                    return response["id"], response["payload"]
+
+                show("Первое письмо")
+                app.respond("no")
+                answer()
+                second = show("Второе письмо")
+                # Layout-independent keys of the field (#17): undo cannot bring back the previous
+                # letter, paste adds to the text. A hidden window gets no key events.
+                press = lambda code: app.letter.clipboard_keys(SimpleNamespace(keycode=code))
+                press(90)
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Второе письмо")
+                root.clipboard_clear()
+                root.clipboard_append(" и ещё")
+                app.letter.mark_set("insert", "end-1c")
+                press(86)
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Второе письмо и ещё")
+                # An emptied field is not sent: the review stays open.
+                app.letter.delete("1.0", "end")
+                app.approve()
+                self.assertTrue(session.outgoing.empty())
+                self.assertEqual(session.state.pending["id"], second["id"])
+                self.assertIn("Поле пустое", app.status.get())
+                # Own text + a request to AI: the own text goes first, the request follows on its echo.
+                app.letter.insert("1.0", "Моё письмо")
+                app.instruction.insert(0, "короче")
+                app.refine()
+                self.assertEqual(answer(), (second["id"], {"action": "manual", "text": "Моё письмо"}))
+                echo = show("Моё письмо")
+                self.assertEqual(answer(), (echo["id"], {"action": "edit", "text": "короче"}))
+                # The echo must match exactly: another vacancy with the same text is shown, not sent.
+                revised = show("Короткое письмо")
+                self.assertTrue(session.outgoing.empty())
+                app.letter.insert("end", "!")
+                app.approve()
+                self.assertEqual(answer(), (revised["id"], {"action": "manual", "text": "Короткое письмо!"}))
+                other = show("Короткое письмо!", context="Another vacancy")
+                self.assertTrue(session.outgoing.empty())
+                self.assertEqual(session.state.pending["id"], other["id"])
+                self.assertEqual(str(app.yes["state"]), "normal")
+                app.letter.insert("end", "!")
+                app.respond("no")
+                answer()
+                app.letter.insert("end", "x")
+                self.assertEqual(app.letter.get("1.0", "end-1c"), "Короткое письмо!!")  # Locked after the answer.
+
+                # A chat with buttons: the field stays read-only, the list picks the answer.
+                chat = show("Да", context="Question", kind="chat", options=("Да", " Нет "))
+                self.assertEqual(str(app.letter["state"]), "disabled")
+                self.assertTrue(app.option.winfo_manager())
+                self.assertTrue(app.option_label.winfo_manager())
+                self.assertEqual(app.option.current(), 0)  # The proposed answer is preselected.
+                app.approve()
+                self.assertEqual(answer(), (chat["id"], {"action": "yes", "text": ""}))
+                chat = show("Да", context="Question", kind="chat", options=("Да", " Нет "))
+                app.option.current(1)
+                app.select_option()
+                self.assertEqual(app.letter.get("1.0", "end-1c"), " Нет ")
+                app.approve()
+                self.assertEqual(answer(), (chat["id"], {"action": "manual", "text": " Нет "}))
+                echo = show(" Нет ", context="Question", kind="chat", options=("Да", " Нет "))
+                self.assertEqual(answer(), (echo["id"], {"action": "yes", "text": ""}))
+                self.assertIsNone(session.state.pending)
         finally:
             root.destroy()
 
