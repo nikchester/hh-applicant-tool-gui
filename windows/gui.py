@@ -305,7 +305,7 @@ class Application:
         self.build_main(main)
         self.load_styles()
         self.update_search_mode()
-        self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
+        self.review_buttons = (self.yes, self.no, self.submit, self.edit)
         self.clear_review()
         for variable in (self.search, self.search_mode, self.limit, self.minimum, self.maximum):
             variable.trace_add("write", lambda *_a: self.refresh_steps())
@@ -863,6 +863,7 @@ class Application:
         menu = self.tk.Menu(text, tearoff=0)
         menu.add_command(label="Копировать", command=copy)
         menu.add_command(label="Выделить всё", command=select_all)
+        text.clipboard_keys, text.context_menu = control_key, menu
         text.bind("<Button-1>", lambda _e: text.focus_set(), add="+")
         text.bind("<Control-KeyPress>", control_key)
         text.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
@@ -901,8 +902,28 @@ class Application:
         menu.add_separator()
         menu.add_command(label="Выделить всё", command=select_all)
         text.clipboard_keys = control_key  # Tests call it: a hidden window gets no key events.
+        text.context_menu = menu
         text.bind("<Control-KeyPress>", control_key)
         text.bind("<Button-3>", lambda e: (text.focus_set(), menu.tk_popup(e.x_root, e.y_root)))
+
+    def make_reviewable(self, text):
+        """A copyable Text that a review can unlock for editing (#17): while its state is
+        normal it gets the editing keys and menu, otherwise the copy-only ones."""
+        read_keys, read_menu = text.clipboard_keys, text.context_menu
+        self.make_editable(text)
+        edit_keys, edit_menu = text.clipboard_keys, text.context_menu
+        text.configure(undo=True)
+
+        def editable():
+            return str(text["state"]) == "normal"
+
+        def control_key(event):
+            return (edit_keys if editable() else read_keys)(event)
+
+        text.clipboard_keys = control_key
+        text.bind("<Control-KeyPress>", control_key)
+        text.bind("<Button-3>", lambda e: (text.focus_set(), (edit_menu if editable() else read_menu)
+                                           .tk_popup(e.x_root, e.y_root)))
 
     def build_main(self, main):
         ttk = self.ttk
@@ -966,18 +987,20 @@ class Application:
         frame.grid(row=1, column=0, sticky="nsew")
         self.letter_label = ttk.Label(work, text="Сопроводительное письмо")
         self.letter_label.grid(row=2, column=0, sticky="w")
+        # The reviewed text is edited in place (#17): read-only until a review allows it.
         frame, self.letter = self.text_box(work, 7)
+        self.make_reviewable(self.letter)
         frame.grid(row=3, column=0, sticky="nsew", pady=(2, 6))
 
         self.decision = decision = ttk.Frame(work)
         decision.grid(row=4, column=0, sticky="ew")
         self.yes = ttk.Button(decision, text="Отправить письмо", style="Accent.TButton",
-                              command=lambda: self.respond("yes"))
+                              command=self.approve)
         self.no = ttk.Button(decision, text="Пропустить", command=lambda: self.respond("no"))
         self.yes.pack(side="left")
         self.no.pack(side="left", padx=6)
-        ttk.Label(decision, text="Текст уйдёт без изменений.",
-                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.decision_hint = ttk.Label(decision, style="Hint.TLabel")
+        self.decision_hint.pack(side="left", padx=6)
 
         self.chat_frame = self.card(work)
         self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(12, 0))
@@ -988,19 +1011,14 @@ class Application:
         self.instruction.bind("<Return>", lambda _e: self.refine())
         self.edit = ttk.Button(self.chat_frame, text="Переписать", command=self.refine)
         self.edit.grid(row=1, column=1, sticky="ew", padx=(6, 0))
-        self.manual_label = ttk.Label(self.chat_frame)
-        self.manual_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
-                                   relief="flat", borderwidth=0, padx=10, pady=8, background=CONTROL,
-                                   foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
-                                   highlightcolor=ACCENT, insertbackground=TEXT)
-        self.manual.grid(row=3, column=0, sticky="ew")
-        self.manual_button = ttk.Button(self.chat_frame, text="Взять мой текст", command=self.manual_edit)
-        self.manual_button.grid(row=3, column=1, sticky="new", padx=(6, 0))
+        # A chat with buttons accepts only one of them: the choice goes into the field above.
+        self.option_label = ttk.Label(self.chat_frame, text="Или выбери другой вариант ответа:")
+        self.option_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.option = ttk.Combobox(self.chat_frame, state="readonly")
-        self.option.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        self.option.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.option.bind("<<ComboboxSelected>>", self.select_option)
         self.edit_hint = ttk.Label(self.chat_frame, style="Hint.TLabel")
-        self.edit_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.edit_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         work.rowconfigure(1, weight=1, minsize=110)
         work.rowconfigure(3, weight=2, minsize=130)
@@ -1140,6 +1158,9 @@ class Application:
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
+        # Undo must not bring back an earlier letter, and only a person's change counts as an edit.
+        widget.edit_reset()
+        widget.edit_modified(False)
         widget.configure(state="disabled")
 
     def append_log(self, text):
@@ -1240,12 +1261,13 @@ class Application:
             self.next_button.configure(state="disabled")
 
     def clear_review(self):
-        self.review_kind = None
+        self.review_kind = self.review_shown = None
+        self.review_options = []
         for button in self.review_buttons:
             button.configure(state="disabled")
+        self.set_letter_editable(False)  # Keeps the text: after «Отправить» it shows what went.
         self.credential.delete(0, "end")
         self.instruction.delete(0, "end")
-        self.manual.delete("1.0", "end")
         self.option.configure(values=())
         self.option.set("")
         # Show only the controls the current decision needs.
@@ -1253,6 +1275,12 @@ class Application:
                       getattr(self, "decision", None)):
             if frame is not None:
                 frame.grid_remove()
+
+    def set_letter_editable(self, editable):
+        """Unlock the big field for a review (#17); the field colour shows whether it can be edited."""
+        self.letter.configure(state="normal" if editable else "disabled",
+                              background=CONTROL if editable else FIELD)
+        self.letter.edit_reset()
 
     def selected_id(self):
         index = self.resume_box.current()
@@ -1448,7 +1476,7 @@ class Application:
     def prepare_run_view(self, action, limit):
         self.run_counts = {"vacancies": 0, "sent": 0, "captcha": 0, "unconfirmed": 0,
                            "limit": limit if action == "auto" else None}
-        self.review_note = None
+        self.review_note = self.review_follow = None
         self.stop_reason = None
         self.letter_model, self.model_switched = None, False
         if getattr(self, "heading", None) is None:
@@ -1487,30 +1515,68 @@ class Application:
         text = " · ".join(parts)
         counter.configure(text=text[:1].upper() + text[1:])
 
-    def respond(self, action, text=""):
+    def respond(self, action, text="", message=None):
         from gui_protocol import ProtocolError
         if self.session is None:
-            return
+            return False
         try:
             self.session.respond(action, text)
             self.clear_review()  # Edits consume this review; next one has a fresh ID.
-            self.say("Правка принята. Новый вариант придёт на проверку и сам не отправится."
-                            if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг.")
+            self.say(message or ("Правка принята. Новый вариант придёт на проверку и сам не отправится."
+                                 if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг."))
+            return True
         except ProtocolError:
             self.stop()
+            return False
 
     def submit_credential(self):
         if str(self.submit["state"]) == "normal" and self.credential.get().strip():
             self.respond("submit", self.credential.get())
 
+    def approve(self):
+        if str(self.yes["state"]) == "normal":
+            self.answer_with_field("yes")
+
     def refine(self):
         if str(self.edit["state"]) == "normal" and self.instruction.get().strip():
-            self.respond("edit", self.instruction.get())
+            self.answer_with_field("edit", self.instruction.get())
 
-    def manual_edit(self):
-        text = self.option.get() if self.option["values"] else self.manual.get("1.0", "end-1c")
-        if text.strip():
-            self.respond("manual", text)
+    def edited_text(self):
+        """The big field if the person changed it during this review (#17), else None."""
+        if self.review_shown is None or not self.letter.edit_modified():
+            return None
+        text = self.letter.get("1.0", "end-1c")
+        return None if text == self.review_shown[2] else text
+
+    def answer_with_field(self, action, text=""):
+        """Answer the review with `action` for the text now in the big field (#17).
+
+        An unchanged field answers at once. A changed one goes first as «manual»: the worker
+        shows that exact text again, and handle_frame answers that identical review with
+        `action` itself, so the person decides once and the protocol stays as it was.
+        """
+        edited = self.edited_text()
+        if edited is None or self.session is None:
+            return self.respond(action, text)
+        if not edited.strip():
+            self.say("Поле пустое. Напиши текст или нажми «Пропустить».", "warning")
+            return False
+        if self.review_options and edited not in self.review_options:
+            self.say("Здесь можно отправить только один из вариантов в списке.", "warning")
+            return False
+        follow = (self.session.run, *self.review_shown[:2], edited, action, text)
+        if not self.respond("manual", edited, "Отправляю твой текст." if action == "yes"
+                            else "Твой текст принят, AI перепишет его. Новый вариант придёт на проверку."):
+            return False
+        self.review_follow = follow
+        return True
+
+    def select_option(self, _event=None):
+        """A chat with buttons: the chosen answer replaces the read-only field and goes on «Отправить»."""
+        index = self.option.current()
+        if self.review_shown is not None and 0 <= index < len(self.review_options):
+            self.replace_text(self.letter, self.review_options[index])
+            self.letter.edit_modified(True)
 
     def stop(self):
         if self.session is not None:
@@ -2041,6 +2107,8 @@ class Application:
                     or not all(isinstance(item, str) for item in payload["options"])):
                 raise ProtocolError("Invalid review payload")
             self.clear_review()
+            # One-shot (#17): only the review right after the person's own text may be answered for them.
+            follow, self.review_follow = getattr(self, "review_follow", None), None
             self.review_kind = payload["kind"]
             if self.review_kind == "credential":
                 self.credential_label.configure(text=payload["context"] or "Введи данные для входа")
@@ -2053,8 +2121,14 @@ class Application:
             self.show_work()
             self.replace_text(self.context, payload["context"])
             self.replace_text(self.letter, payload["text"])
+            if follow is not None and follow[:4] == (session.run, payload["kind"], payload["context"],
+                                                     payload["text"]):
+                self.respond(*follow[4:])  # The person's own text, shown back unchanged: already decided.
+                return
             chat = self.review_kind == "chat"
             bare = not chat and payload["text"] == ""  # #9: an application without a letter.
+            options = self.review_options = list(payload["options"])
+            self.review_shown = (payload["kind"], payload["context"], payload["text"])
             written = getattr(self, "letter_model", None)
             self.letter_label.configure(text=("Ответ в чат. Его получит работодатель." if chat else
                                               "Отклик без сопроводительного письма: работодатель увидит только резюме."
@@ -2064,28 +2138,32 @@ class Application:
             self.decision.grid()
             self.yes.configure(state="normal")
             self.no.configure(state="normal")
-            # Both an answer in a chat and a letter can be rewritten by AI or replaced by own text.
+            # The text is edited right in the big field (#17); a chat with buttons takes only a button.
+            self.set_letter_editable(not bare and not options)
+            self.decision_hint.configure(text="Отклик уйдёт без письма." if bare else
+                                         "Уйдёт вариант из поля выше." if options else
+                                         "Можно исправить прямо в поле: уйдёт то, что в нём написано.")
             what = "ответ" if chat else "письмо"
             self.refine_label.configure(text=f"Попроси AI переписать {what} (работодатель не увидит просьбу):")
-            self.manual_label.configure(text="Или напиши ответ сам:" if chat else
-                                        "Или исправь письмо сам и нажми «Взять мой текст»:")
-            self.edit_hint.configure(text=f"После правки {what} снова придёт на проверку и сам не отправится.")
+            self.edit_hint.configure(text=f"После просьбы к AI {what} снова придёт на проверку и сам не отправится.")
             if not bare:  # Nothing to rewrite when no letter is sent.
                 self.chat_frame.grid()
                 self.edit.configure(state="normal")
-                self.manual_button.configure(state="normal")
-            self.manual.configure(height=2 if chat else 5)
-            if not chat:
-                self.manual.insert("1.0", payload["text"])  # Fix a word without retyping the letter.
-            self.option.configure(values=payload["options"])
-            if payload["options"]:
+            self.option.configure(values=options)
+            if options:
+                self.option_label.grid()
                 self.option.grid()
-                self.option.current(0)
+                if payload["text"] in options:
+                    self.option.current(options.index(payload["text"]))
             else:
+                self.option_label.grid_remove()
                 self.option.grid_remove()
             note, self.review_note = getattr(self, "review_note", None), None
-            self.say((note + " " if note else "") + "Прочитай текст. Нажми «" + str(self.yes["text"])
-                     + "», «Пропустить» или исправь его ниже.", "warning" if note else "info")
+            self.say((note + " " if note else "")
+                     + ("Нажми «Отправить отклик» или «Пропустить»." if bare else
+                        "Прочитай ответ. Нажми «Отправить ответ», «Пропустить» или выбери другой вариант ниже."
+                        if options else "Прочитай текст и при необходимости исправь его прямо в поле. Нажми «"
+                        + str(self.yes["text"]) + "» или «Пропустить»."), "warning" if note else "info")
             return
         payload = data["payload"]
         name, value = payload.get("name"), payload.get("data")
