@@ -968,8 +968,8 @@ class ReplyChecks(unittest.TestCase):
         target = "GET https://hh.ru/applicant/my_resumes"
         state = '{"userType": "anonymous", "private": "private-response"}'
         anonymous = f'<template id="HH-Lux-InitialState">{state}</template>'
-        login = (f"HH web session is not logged in (HTTP 403 for {target}); "
-                 "run windows/hh-authorize.ps1, then retry")
+        login = (f"HH web session is not logged in (HTTP 403 for {target}); log in to HH again "
+                 "(GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry")
         for label, status, body, expected in (
             ("plain", 403, anonymous, login),
             ("escaped", 403,
