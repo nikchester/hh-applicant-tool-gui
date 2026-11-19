@@ -139,9 +139,19 @@ def _reset_time(reason):
     return time.strftime("в %H:%M" if same_day else "%d.%m в %H:%M", moment)
 
 
+WEB_LOGIN_LOST = "HH web session is not logged in"
+
+
+def web_login_lost(reason):
+    """True when HH answered as to a guest: the site login is gone although the API token works."""
+    return isinstance(reason, str) and WEB_LOGIN_LOST in reason
+
+
 # Internal stop reasons (English, for the journal) -> what the person reads (#11).
 # Each pattern matches the text our own guards raise; the first match wins.
 _REASONS = (
+    (WEB_LOGIN_LOST, lambda m, r:
+        "Вход в HH на сайте истёк: HH считает тебя гостем. Нажми «Войти» и войди в HH заново."),
     (r"fallback list exhausted", lambda m, r: (
         "Модели из списка запасных закончились: у каждой кончился лимит или она недоступна."
         + (f" Ближайший сброс лимита {_reset_time(r)}." if _reset_time(r) else "")

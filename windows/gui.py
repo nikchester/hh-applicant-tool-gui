@@ -254,6 +254,8 @@ class Application:
         config = tomllib.loads(initialize().read_text(encoding="utf-8"))
         model = config["openai"]["default"]["model"]
         self.signed_hh, self.signed_chatgpt = hh_signed_in(), chatgpt_signed_in()
+        # The API token can outlive the site login that chats need; a run tells us it is gone.
+        self.hh_web_lost = False
         self.load_provider()
         self.model = tk.StringVar(value="" if model == "CHOOSE_AFTER_LOGIN" else model)
         self.search, self.resume = tk.StringVar(), tk.StringVar()
@@ -735,6 +737,8 @@ class Application:
         """The InfoBar line for a setup page: what to do on it, or that «Далее» is open."""
         if name == "done":
             return "Нажми «Перейти к откликам»."
+        if name == "hh" and getattr(self, "hh_web_lost", False):
+            return "Вход в HH на сайте истёк. Нажми «Войти в HH» и введи email или телефон, затем код."
         if self.page_done(name):
             return "Шаг выполнен. Нажми «Далее»." if not self.wizard_settings else "Готово. Можно закрыть настройки."
         return {"hh": "Нажми «Войти в HH» и введи email или телефон, затем код.",
@@ -1083,8 +1087,10 @@ class Application:
             return
         from gui_steps import blocker, parse_auto_settings
         progress = self.progress_state()
-        self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
-                                style="Done.TLabel" if progress.hh else "Hint.TLabel")
+        web_lost = progress.hh and getattr(self, "hh_web_lost", False)
+        self.hh_state.configure(text="вход на сайте истёк" if web_lost
+                                else "✓ вход выполнен" if progress.hh else "вход не выполнен",
+                                style="Done.TLabel" if progress.hh and not web_lost else "Hint.TLabel")
         chatmock = self.provider.kind == "chatmock"
         if chatmock:
             self.chatgpt_button.grid()
@@ -2225,10 +2231,15 @@ class Application:
             self.root.after_cancel(job)
 
     def finish_action(self):
-        """One InfoBar button after a failed run: a provider that rejected the key leads to the key (#5)."""
+        """One InfoBar button after a failed run: a provider that rejected the key leads to the key (#5),
+        a lost HH site login leads to the HH login page."""
         import re
-        if re.search(r": HTTP 40[13]; check the API key", getattr(self, "stop_reason", None) or ""):
+        from gui_steps import web_login_lost
+        reason = getattr(self, "stop_reason", None) or ""
+        if re.search(r": HTTP 40[13]; check the API key", reason):
             return ("Изменить ключ", self.edit_provider)
+        if web_login_lost(reason):
+            return ("Войти", lambda: self.show_wizard("hh", settings=True))
         return None
 
     def finish_message(self, data, action=None):
@@ -2287,14 +2298,18 @@ class Application:
         return "error"
 
     def finish_run(self, session, data):
-        from gui_steps import chatgpt_signed_in, hh_signed_in
+        from gui_steps import chatgpt_signed_in, hh_signed_in, web_login_lost
         self.stop_chat_wait()
         self.close_device_window()
         if session.action == "hh_login":
             self.signed_hh = hh_signed_in()
+            if data["success"]:
+                self.hh_web_lost = False
         elif session.action == "chatgpt_login":
             self.signed_chatgpt = chatgpt_signed_in()
             self.load_provider()
+        if web_login_lost(getattr(self, "stop_reason", None)):
+            self.hh_web_lost = True
         message = self.finish_message(data, session.action)
         self.append_log(message)
         self.sending = False
