@@ -1286,6 +1286,9 @@ class StepChecks(unittest.TestCase):
             "Preview stopped: empty model response": "пустой ответ",
             "Preview stopped after HTTP 429": "HH ограничил частоту запросов",
             "Stopped after HTTP 403": "Проверь вход в HH",
+            "HH web session is not logged in (HTTP 403 for GET https://hh.ru/applicant/my_resumes); "
+            "log in to HH again (GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry":
+                "Вход в HH на сайте истёк",
             "Send outcome uncertain; connection failed; check HH manually before any retry": "Неизвестно, дошёл ли отклик",
             "Send returned HTTP 409; json_errors=x; check HH manually before any retry": "HH не принял отклик (HTTP 409)",
             "Manual HH captcha failed or cancelled; check HH before retrying": "Капча не введена",
@@ -1577,6 +1580,43 @@ class WizardChecks(unittest.TestCase):
         self.assertEqual(app.finish_action()[0], "Изменить ключ")
         app.stop_reason = "Stopped after HTTP 403"
         self.assertIsNone(app.finish_action())
+
+    def test_a_lost_hh_site_login_offers_to_log_in_again(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending = False
+        app.stop_reason = ("HH web session is not logged in (HTTP 403 for GET https://hh.ru/applicant/my_resumes); "
+                           "log in to HH again (GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry")
+        data = {"done": None, "success": False, "cancelled": False, "forced": False}
+        message = app.finish_message(data, "chats")
+        self.assertIn("Вход в HH на сайте истёк", message)
+        self.assertNotIn("защитой программы", message)
+        app.show_wizard = Mock()
+        label, command = app.finish_action()
+        self.assertEqual(label, "Войти")
+        command()
+        app.show_wizard.assert_called_once_with("hh", settings=True)
+
+        # The run marks the site login as lost; only a successful HH login clears the mark.
+        app.hh_web_lost = False
+        app.stop_chat_wait = app.close_device_window = app.append_log = app.set_busy = Mock()
+        app.say, app.root, app.next_hint = Mock(), Mock(), Mock(return_value="")
+        app.finish_message, app.finish_severity = Mock(return_value="m"), Mock(return_value="error")
+        with patch("gui.attention"):
+            app.finish_run(SimpleNamespace(action="chats"), data)
+        self.assertTrue(app.hh_web_lost)
+        self.assertEqual(app.say.call_args.kwargs["action"][0], "Войти")
+        app.stop_reason = None
+        with patch("gui_steps.hh_signed_in", return_value=True), patch("gui.attention"):
+            app.finish_run(SimpleNamespace(action="hh_login"), data)
+            self.assertTrue(app.hh_web_lost)
+            app.finish_run(SimpleNamespace(action="hh_login"), data | {"success": True})
+        self.assertFalse(app.hh_web_lost)
+        app.wizard_settings = True
+        app.page_done = Mock(return_value=True)
+        app.hh_web_lost = True
+        self.assertIn("Вход в HH на сайте истёк", app.page_hint("hh"))
+        app.hh_web_lost = False
+        self.assertEqual(app.page_hint("hh"), "Готово. Можно закрыть настройки.")
 
 
 class SearchAllChecks(unittest.TestCase):

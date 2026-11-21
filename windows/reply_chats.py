@@ -812,7 +812,8 @@ class ChatGate:
                 self.counts["failures"] += 1
                 if anonymous_web_session(request, response):
                     raise SystemExit(f"HH web session is not logged in (HTTP 403 for "
-                                     f"{request_target(request)}); run windows/hh-authorize.ps1, "
+                                     f"{request_target(request)}); log in to HH again (GUI: "
+                                     "Settings > HH account; CLI: windows/hh-authorize.ps1), "
                                      "then retry")
                 raise SystemExit(f"Stopped after HTTP {response.status_code} for {request_target(request)}")
             return response
