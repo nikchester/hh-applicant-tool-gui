@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f5f7fb">
+  <meta name="description" content="Автоотклики HH для Windows: скачать установщик, проверить файл и начать работу по простому руководству.">
+  <title>Автоотклики HH — загрузка для Windows</title>
+  <style>
+    :root { color-scheme: light; font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif; color: #172033; background: #f5f7fb; }
+    * { box-sizing: border-box; }
+    body { margin: 0; }
+    header, main, footer { width: min(100% - 2rem, 940px); margin-inline: auto; }
+    header { padding: 2.2rem 0 1rem; }
+    main { padding-bottom: 2rem; }
+    h1 { max-width: 760px; margin: .4rem 0 1rem; font-size: clamp(2rem, 6vw, 3.4rem); line-height: 1.1; letter-spacing: -.035em; }
+    h2 { margin-top: 2rem; line-height: 1.25; }
+    p { max-width: 72ch; }
+    a { color: #174ea6; }
+    .eyebrow { color: #43516c; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+    .card { margin: 1rem 0; padding: clamp(1.2rem, 4vw, 2rem); border: 1px solid #d9e0ed; border-radius: 1rem; background: white; box-shadow: 0 8px 28px #1720330a; }
+    .button { display: inline-flex; align-items: center; justify-content: center; min-height: 3.25rem; margin: .6rem 0; padding: .8rem 1.3rem; border-radius: .65rem; background: #174ea6; color: white; font-weight: 750; text-decoration: none; }
+    .button:focus-visible, a:focus-visible { outline: 3px solid #e6a700; outline-offset: 3px; }
+    .notice { padding: 1rem 1.1rem; border-left: 4px solid #b56b00; background: #fff7e8; }
+    .muted { color: #4e5b73; }
+    .meta { display: grid; gap: .2rem; }
+    .meta p { margin: .25rem 0; }
+    code { overflow-wrap: anywhere; }
+    footer { padding: 0 0 2rem; color: #4e5b73; }
+    @media (min-width: 680px) { .meta { grid-template-columns: 1fr 1fr; column-gap: 2rem; } }
+  </style>
+</head>
+<body>
+  <header>
+    <p class="eyebrow">Автоотклики HH</p>
+    <h1>Начните с безопасного предпросмотра</h1>
+    <p>Приложение помогает искать вакансии на hh.ru и готовить отклики. Сначала вы увидите письмо и сможете проверить его; отправка без проверки включается отдельно.</p>
+  </header>
+  <main>
+    <section class="card" aria-labelledby="download-title">
+      <h2 id="download-title">Скачать для Windows</h2>
+      <p>Работает на Windows 10 или 11, 64 бит. Для установки не нужны права администратора или отдельная установка Python.</p>
+      <a id="download" class="button" href="https://github.com/nikchester/hh-applicant-tool-gui/releases/latest" rel="noopener">Открыть последний стабильный релиз</a>
+      <div class="meta" aria-live="polite">
+        <p><strong>Версия:</strong> <span id="version">Последний стабильный выпуск</span></p>
+        <p><strong>Дата:</strong> <span id="date">Откройте страницу релиза</span></p>
+        <p><strong>Изменения:</strong> <a id="changes" href="https://github.com/nikchester/hh-applicant-tool-gui/releases/latest">описание выпуска</a></p>
+        <p><strong>SHA-256:</strong> <a id="checksums" href="https://github.com/nikchester/hh-applicant-tool-gui/releases/latest">файл и контрольные суммы на странице релиза</a></p>
+      </div>
+      <p id="status" class="muted">Если сведения о версии не загрузятся, ссылка выше всё равно откроет страницу последнего стабильного релиза.</p>
+    </section>
+
+    <section class="notice" aria-labelledby="safety-title">
+      <h2 id="safety-title">Перед установкой</h2>
+      <p>Сборка не подписана сертификатом издателя, поэтому Windows может показать SmartScreen. SHA-256 помогает проверить, что файл совпадает с опубликованным файлом; эта проверка сама по себе не подтверждает личность издателя. Если не удаётся сверить сумму или предупреждение вызывает сомнение, отмените запуск.</p>
+      <p>HH предупреждает, что программы, имитирующие действия пользователя, могут привести к блокировке аккаунта. Капчу вводит человек. Не оставляйте приложение без присмотра.</p>
+    </section>
+
+    <section class="card">
+      <h2>Что понадобится</h2>
+      <ul>
+        <li>Windows 10 или 11, 64-битная версия.</li>
+        <li>Аккаунт hh.ru и опубликованное резюме.</li>
+        <li>Для сопроводительных писем — выбранный AI-провайдер. Можно включить режим «Без сопроводительного письма».</li>
+        <li>Условия и лимиты AI-провайдеров могут меняться. Проверьте их перед вводом ключа; не включайте платный тариф, если он вам не нужен.</li>
+      </ul>
+      <p><a href="guide.md">Открыть подробное руководство: от загрузки до первого предпросмотра</a></p>
+      <p class="muted">Приложение предназначено только для Windows. На macOS, Linux, телефонах и планшетах установщик не работает.</p>
+    </section>
+  </main>
+  <footer>
+    <p><a href="https://github.com/nikchester/hh-applicant-tool-gui">Исходный код и сообщения об ошибках на GitHub</a>. Перед отправкой сообщения удалите из него пароли, коды, токены и личные данные.</p>
+  </footer>
+  <script>
+    (() => {
+      const releaseUrl = "https://github.com/nikchester/hh-applicant-tool-gui/releases/latest";
+      const stableName = "hh-applicant-tool-gui-windows-x64-setup.exe";
+      const checksumsName = "SHA256SUMS.txt";
+      const releaseApi = "https://api.github.com/repos/nikchester/hh-applicant-tool-gui/releases/latest";
+      const download = document.getElementById("download");
+      const changes = document.getElementById("changes");
+      const checksums = document.getElementById("checksums");
+      const status = document.getElementById("status");
+      const allowedAsset = (url) => {
+        try {
+          const parsed = new URL(url);
+          return parsed.protocol === "https:" && parsed.hostname === "github.com" && parsed.pathname.startsWith("/nikchester/hh-applicant-tool-gui/releases/download/");
+        } catch { return false; }
+      };
+      fetch(releaseApi, { headers: { Accept: "application/vnd.github+json" } })
+        .then((response) => {
+          if (!response.ok) throw new Error("release metadata unavailable");
+          return response.json();
+        })
+        .then((release) => {
+          if (!release || release.draft || release.prerelease || !Array.isArray(release.assets)) throw new Error("no stable release metadata");
+          const asset = (name) => release.assets.find((item) => item.name === name && allowedAsset(item.browser_download_url));
+          const installer = asset(stableName);
+          const sums = asset(checksumsName);
+          const version = document.getElementById("version");
+          const date = document.getElementById("date");
+          version.textContent = release.tag_name || release.name || "Последний стабильный выпуск";
+          const published = release.published_at ? new Date(release.published_at) : null;
+          date.textContent = published && !Number.isNaN(published.valueOf())
+            ? new Intl.DateTimeFormat("ru-RU", { dateStyle: "long", timeZone: "UTC" }).format(published)
+            : "Дата указана на странице релиза";
+          try {
+            const releasePage = new URL(release.html_url);
+            if (releasePage.protocol === "https:" && releasePage.hostname === "github.com" && releasePage.pathname.startsWith("/nikchester/hh-applicant-tool-gui/releases/tag/")) {
+              changes.href = releasePage.href;
+            }
+          } catch { /* Keep the safe default release page. */ }
+          if (installer) {
+            download.href = installer.browser_download_url;
+            download.textContent = "Скачать для Windows (64 бит)";
+          } else {
+            download.href = releaseUrl;
+            download.textContent = "Открыть последний стабильный релиз";
+          }
+          if (sums) {
+            checksums.href = sums.browser_download_url;
+            checksums.textContent = "SHA256SUMS.txt этого релиза";
+          }
+          status.textContent = installer
+            ? "Выбран стабильный выпуск. Если сумма файла не совпадает с SHA256SUMS.txt, не запускайте его."
+            : "Для этого выпуска постоянный установщик ещё не опубликован. На странице релиза выберите файл с окончанием -windows-x64-setup.exe; бета-версии сюда не попадают.";
+        })
+        .catch(() => {
+          download.href = releaseUrl;
+          download.textContent = "Открыть последний стабильный релиз";
+          status.textContent = "Не удалось загрузить сведения о выпуске. Ссылка ведёт на страницу последних стабильных релизов; черновики и бета-версии не предлагаются.";
+        });
+    })();
+  </script>
+</body>
+</html>
