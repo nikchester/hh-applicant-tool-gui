@@ -82,6 +82,7 @@ SEVERITY = {
     "warning": ("#433519", WARNING, "\ue7ba", "!"),
     "error": ("#442726", CRITICAL, "\uea39", "×"),
 }
+UPDATE_CHANNELS = {"stable": "Стабильные версии", "beta": "Бета-версии"}
 REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
 UNKNOWN_RESULT = " Результат последней отправки неизвестен. Проверь отклики на hh.ru, прежде чем запускать снова."
 
@@ -663,6 +664,7 @@ class Application:
         )
         for label, command, _locked in self.settings_items:
             if label == "Пройти настройку заново":
+                self.build_update_menu(menu)
                 menu.add_separator()
             menu.add_command(label=label, command=command)
         self.settings_button = ttk.Button(header, text="Настройки ▾", command=self.post_settings_menu)
@@ -670,6 +672,46 @@ class Application:
         self.setup_status = ttk.Label(header, style="PageHint.TLabel", cursor="hand2")
         self.setup_status.pack(side="right", pady=(8, 0))
         self.setup_status.bind("<Button-1>", lambda _e: self.post_settings_menu())
+
+    def build_update_menu(self, menu):
+        """«Обновления ▸»: which releases self-update installs, stable or beta."""
+        self.update_channel = self.tk.StringVar(value=self.current_channel())
+        sub = self.update_menu = self.tk.Menu(menu, tearoff=0, background=CARD, foreground=TEXT,
+                                              activebackground=ACCENT, activeforeground=ON_ACCENT,
+                                              selectcolor=TEXT, borderwidth=0)
+        for channel, label in UPDATE_CHANNELS.items():
+            sub.add_radiobutton(label=label, value=channel, variable=self.update_channel,
+                                command=lambda: self.set_update_channel(self.update_channel.get()))
+        sub.add_separator()
+        sub.add_command(label="Проверить обновления", command=lambda: self.check_updates(manual=True))
+        menu.add_cascade(label="Обновления", menu=sub)
+
+    def current_channel(self):
+        """The saved channel, or the one of the running version: a beta install stays on betas."""
+        import os
+        from gui_profile import read_option
+        from updater import default_channel
+        return read_option("update_channel") or default_channel(os.environ.get("HH_APP_VERSION", ""))
+
+    def set_update_channel(self, channel):
+        import os
+        from gui_profile import save_option
+        from updater import prerelease
+        try:
+            save_option("update_channel", channel)
+        except (OSError, ValueError):
+            self.say("Не удалось сохранить канал обновлений.", "warning")
+            return
+        version = os.environ.get("HH_APP_VERSION", "")
+        note = UPDATE_CHANNELS[channel] + "."
+        if channel == "stable" and prerelease(version):
+            note += (f" Версия {version} останется, пока не выйдет стабильная версия новее: "
+                     "автообновление не откатывает программу назад.")
+        self.append_log("Канал обновлений: " + note)
+        # A release found on the other channel no longer applies.
+        self.update_release = None
+        self.update_button.pack_forget()
+        self.check_updates(manual=True, note="Канал обновлений: " + note)
 
     def post_settings_menu(self):
         button = self.settings_button
@@ -1622,11 +1664,24 @@ class Application:
                 done(box.get("result"), box.get("error"))
         self.root.after(200, wait)
 
-    def check_updates(self):
+    def check_updates(self, manual=False, note=""):
+        """Look for a release on the chosen channel: by timer, or at once from the «Обновления» menu."""
         import updater
-        self.root.after(self.UPDATE_INTERVAL_MS, self.check_updates)
-        if not updater.enabled() or self.update_release is not None:
+        if not manual:
+            self.root.after(self.UPDATE_INTERVAL_MS, self.check_updates)
+        prefix = note + " " if note else ""
+        if not updater.enabled():
+            if manual:
+                self.say(prefix + "Автообновление работает только в установленной программе.", "info")
             return
+        if self.update_release is not None:
+            if manual:
+                self.say(prefix + "Доступна версия " + self.update_release["version"]
+                         + ". Нажми «Обновить» справа вверху.")
+            return
+        channel = self.current_channel()
+        if manual:
+            self.say(prefix + "Проверяю обновления…")
 
         def done(release, error):
             if error is None and release is not None:
@@ -1634,7 +1689,14 @@ class Application:
                 self.update_button.configure(text="Обновить до " + release["version"])
                 self.update_button.pack(side="right", padx=(0, 12))
                 self.append_log("Доступна версия " + release["version"] + ". Кнопка «Обновить» — справа вверху.")
-        self.run_in_background(updater.check, done)
+                if manual:
+                    self.say(prefix + "Доступна версия " + release["version"] + ". Нажми «Обновить» справа вверху.")
+            elif manual and error is not None:
+                message = str(error) if isinstance(error, updater.UpdateError) else "Проверка не удалась."
+                self.say(prefix + message, "warning")
+            elif manual:
+                self.say(prefix + "Обновлений нет: стоит последняя версия канала.", "success")
+        self.run_in_background(lambda: updater.check(channel=channel), done)
 
     def apply_update(self):
         import updater

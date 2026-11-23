@@ -13,6 +13,11 @@ A release publishes, next to the installer:
 Only update.json is signed; it pins the SHA-256 of the code zip and of the installer.
 If the runtime of the release equals ours, the code zip is enough: download, verify,
 unpack, restart. Otherwise the signed installer runs silently and restarts the app.
+
+Two channels: "stable" reads GitHub's "latest" release and never offers a beta;
+"beta" lists the releases, takes the newest one, beta or not, and reads its files.
+The listing is not signed: it only names a version, and update.json of that version
+must be signed and carry the same version.
 """
 
 import base64
@@ -31,11 +36,15 @@ import zipfile
 
 REPOSITORY = "nikchester/hh-applicant-tool-gui"
 LATEST = f"https://github.com/{REPOSITORY}/releases/latest/download/"
+DOWNLOAD = f"https://github.com/{REPOSITORY}/releases/download/"
+RELEASES = f"https://api.github.com/repos/{REPOSITORY}/releases?per_page=30"
+CHANNELS = ("stable", "beta")
 # Public half of the release signing key. The private half is only a CI secret.
 PUBLIC_KEY = "SGWT6/fpRuHEbC04XXLBgb2xLhZOI1xoJC0D+OX87Q8="
 ALLOWED_HOSTS = frozenset({"github.com", "objects.githubusercontent.com",
                            "release-assets.githubusercontent.com"})
 MAX_METADATA = 64 * 1024
+MAX_LISTING = 4 * 1024 * 1024
 MAX_CODE = 20 * 1024 * 1024
 MAX_INSTALLER = 400 * 1024 * 1024
 # A release "0.6.0" or a beta "0.6.0-beta.1"; a beta sorts below its release.
@@ -74,14 +83,18 @@ def prerelease(version):
     return "-" in version
 
 
-def _download(name, limit, opener=urlopen):
-    if not ASSET.match(name):
-        raise UpdateError("Неверное имя файла обновления.")
-    request = Request(LATEST + name, headers={"User-Agent": "hh-applicant-tool-gui-updater"})
+def default_channel(version):
+    """Without a saved choice a beta install stays on betas and a stable one on stable releases."""
+    return "beta" if version and prerelease(version) else "stable"
+
+
+def _get(url, limit, opener, hosts=ALLOWED_HOSTS):
+    request = Request(url, headers={"User-Agent": "hh-applicant-tool-gui-updater",
+                                    "Accept": "application/vnd.github+json"})
     try:
         with opener(request, timeout=30) as response:
             host = (urlsplit(response.geturl()).hostname or "").lower()
-            if host not in ALLOWED_HOSTS:
+            if host not in hosts:
                 raise UpdateError("Обновление пришло не с GitHub.")
             data = response.read(limit + 1)
     except UpdateError:
@@ -91,6 +104,28 @@ def _download(name, limit, opener=urlopen):
     if len(data) > limit:
         raise UpdateError("Файл обновления слишком большой.")
     return data
+
+
+def _download(name, limit, opener=urlopen, base=LATEST):
+    if not ASSET.match(name):
+        raise UpdateError("Неверное имя файла обновления.")
+    return _get(base + name, limit, opener)
+
+
+def newest_version(opener=urlopen):
+    """The newest published version, beta or not, from the GitHub release list."""
+    data = _get(RELEASES, MAX_LISTING, opener, hosts=frozenset({"api.github.com"}))
+    try:
+        items = json.loads(data)
+        if not isinstance(items, list):
+            raise ValueError  # E.g. GitHub's rate-limit answer.
+        versions = [item["tag_name"][1:] for item in items
+                    if isinstance(item, dict) and not item.get("draft")
+                    and isinstance(item.get("tag_name"), str) and item["tag_name"].startswith("v")
+                    and VERSION.match(item["tag_name"][1:])]
+    except (ValueError, TypeError, KeyError):
+        raise UpdateError("Список релизов GitHub повреждён.") from None
+    return max(versions, key=version_key, default=None)
 
 
 def verify(metadata, signature, public_key=PUBLIC_KEY):
@@ -117,26 +152,45 @@ def parse(metadata):
         raise UpdateError("Описание обновления повреждено.") from None
 
 
-def check(opener=urlopen, public_key=PUBLIC_KEY):
-    """Signed description of a newer release, or None when this version is the latest."""
+def check(opener=urlopen, public_key=PUBLIC_KEY, channel=None):
+    """Signed description of a newer release in the channel, or None when there is none.
+
+    Never a downgrade: a beta install on the stable channel waits for a newer stable release.
+    """
     running = current()
     if running is None:
         return None
-    metadata = _download("update.json", MAX_METADATA, opener)
-    signature = _download("update.json.sig", 1024, opener)
+    channel = channel or default_channel(running[0])
+    if channel not in CHANNELS:
+        raise UpdateError("Неизвестный канал обновлений.")
+    base, expected = LATEST, None
+    if channel == "beta":
+        expected = newest_version(opener)
+        if expected is None or version_key(expected) <= version_key(running[0]):
+            return None
+        base = DOWNLOAD + "v" + expected + "/"
+    metadata = _download("update.json", MAX_METADATA, opener, base)
+    signature = _download("update.json.sig", 1024, opener, base)
     verify(metadata, signature, public_key)
     release = parse(metadata)
-    # A beta reaches only installs that already run a beta: a stable install never gets one,
-    # even if a beta became GitHub's "latest" release by mistake.
-    if prerelease(release["version"]) and not prerelease(running[0]):
+    if expected is not None and release["version"] != expected:
+        raise UpdateError("Описание обновления не совпало с релизом на GitHub.")
+    # The stable channel never offers a beta, even if a beta became GitHub's "latest" by mistake.
+    if channel == "stable" and prerelease(release["version"]):
         return None
-    return release if version_key(release["version"]) > version_key(running[0]) else None
+    if version_key(release["version"]) <= version_key(running[0]):
+        return None
+    release["base"] = base  # Where its code zip and installer lie; not part of the signed text.
+    return release
 
 
-def _fetch_verified(item, limit, opener):
+def _fetch_verified(item, limit, opener, base=LATEST):
     if item["size"] > limit:
         raise UpdateError("Файл обновления слишком большой.")
-    data = _download(item["name"], limit, opener)
+    if base != LATEST and not (base.startswith(DOWNLOAD + "v") and base.endswith("/")
+                               and VERSION.match(base[len(DOWNLOAD) + 1:-1])):
+        raise UpdateError("Неверный адрес обновления.")
+    data = _download(item["name"], limit, opener, base)
     if len(data) != item["size"] or hashlib.sha256(data).hexdigest() != item["sha256"]:
         raise UpdateError("Скачанный файл не совпал с подписанным описанием. Обновление не установлено.")
     return data
@@ -153,7 +207,7 @@ def _atomic_json(path, data):
 def install_code(release, opener=urlopen, root=None):
     """Download and unpack the code of a release with our runtime. Returns its directory."""
     root = Path(root or updates_dir())
-    data = _fetch_verified(release["code"], MAX_CODE, opener)
+    data = _fetch_verified(release["code"], MAX_CODE, opener, release.get("base", LATEST))
     target = root / release["version"]
     staging = root / (release["version"] + ".tmp")
     shutil.rmtree(staging, ignore_errors=True)
@@ -184,7 +238,7 @@ def install_code(release, opener=urlopen, root=None):
 
 def download_installer(release, opener=urlopen, root=None):
     root = Path(root or updates_dir())
-    data = _fetch_verified(release["installer"], MAX_INSTALLER, opener)
+    data = _fetch_verified(release["installer"], MAX_INSTALLER, opener, release.get("base", LATEST))
     root.mkdir(parents=True, exist_ok=True)
     path = root / release["installer"]["name"]
     path.write_bytes(data)
