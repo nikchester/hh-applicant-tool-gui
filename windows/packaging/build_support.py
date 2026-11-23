@@ -105,8 +105,11 @@ def stage_dependencies(destination):
         "THIRD-PARTY COMPONENT INVENTORY (development build; not a license clearance)",
         "Inspect bundled metadata/license texts before any redistribution.",
         "No license grant is inferred when upstream metadata or texts are missing.",
-        "HH 2.3.7 wheel inspected locally had NO license declaration or license file.",
-        "Obtain and review upstream HH and application redistribution permissions before release.",
+        "HH 2.3.7 wheel has no license declaration or license file; author permission is recorded separately.",
+        "Author s3rgeym permitted including hh-applicant-tool in this Windows installer on 2026-11-14:",
+        "https://github.com/s3rgeym/hh-applicant-tool/issues/97#issuecomment-6883547540",
+        "This permission is not an SPDX license or a grant for other dependencies.",
+        "ChatMock 1.40: MIT; retain its bundled copyright and license text.",
         "",
     ]
     components = dependency_closure()
@@ -148,7 +151,7 @@ def stage_dependencies(destination):
         raise RuntimeError("CPython LICENSE.txt missing; prepare a complete official Python installation")
     shutil.copyfile(python_license, target / "Python-LICENSE.txt")
     notices += ["", "Python LICENSE.txt includes CPython and bundled third-party notices.",
-                "PyInstaller bootloader license/exception: review PyInstaller 6.16.0 distribution before release.",
+                "PyInstaller 6.16.0: GPL-2.0-or-later with bootloader exception; bundled COPYING.txt contains terms.",
                 "This inventory does not certify source-offer, attribution or redistribution obligations."]
     (destination / "THIRD-PARTY-NOTICES.txt").write_text("\n".join(notices) + "\n", encoding="utf-8")
     # Keep inventory alongside notices in the final runtime without local installation paths.
