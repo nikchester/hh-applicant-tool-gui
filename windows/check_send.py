@@ -768,7 +768,8 @@ class SendChecks(unittest.TestCase):
                         "connect_retry_exhausted": True, "request_id": "c" * 32}}})
                 with self.assertRaises(SystemExit) as caught:
                     self.gate.send(None, request)
-                self.assertEqual(str(caught.exception), f"Stopped after HTTP {status}")
+                self.assertEqual(str(caught.exception),
+                                 f"Stopped after HTTP {status} for POST http://127.0.0.1:8000/v1/chat/completions")
                 self.gate.sender.assert_called_once()
 
     def test_expired_token_get_refreshes_once_through_real_api_client(self):
@@ -867,6 +868,8 @@ class SendChecks(unittest.TestCase):
         )
         for request in cases:
             for status in (400, 404, 500, 502):
+                if status == 404 and request.url.endswith("/vacancies/123"):
+                    continue  # A removed current vacancy is skipped: see the 404 test below.
                 with self.subTest(method=request.method, url=request.url, status=status):
                     self.gate.sender = self.gateway_reply(status, {"error": {
                         "message": "PRIVATE", "generation_failure": {
@@ -874,7 +877,9 @@ class SendChecks(unittest.TestCase):
                             "connect_retry_exhausted": True, "request_id": "c" * 32}}})
                     with self.assertRaises(SystemExit) as caught:
                         self.gate.send(None, request)
-                    self.assertEqual(str(caught.exception), f"Stopped after HTTP {status}")
+                    # The journal names the request (no query) so an error report shows what failed.
+                    self.assertEqual(str(caught.exception),
+                                     f"Stopped after HTTP {status} for {request.method} {request.url}")
                     self.gate.sender.assert_called_once()
         self.gate.captcha.active = True
         for request in (requests.Request("GET", "https://hh.ru/account/captcha").prepare(),
@@ -884,7 +889,8 @@ class SendChecks(unittest.TestCase):
                 self.gate.sender = self.gateway_reply(500, {})
                 with self.assertRaises(SystemExit) as caught:
                     self.gate.send(None, request)
-                self.assertEqual(str(caught.exception), "Stopped after HTTP 500")
+                self.assertEqual(str(caught.exception),
+                                 f"Stopped after HTTP 500 for {request.method} {request.url.split('?')[0]}")
         self.gate.captcha.active = False
         for method, url in (("POST", "http://127.0.0.1:8000/v1/completions"),
                             ("POST", "http://127.0.0.1:8001/v1/chat/completions"),
@@ -1307,6 +1313,73 @@ class SendChecks(unittest.TestCase):
                 handler.assert_called_once()
                 self.assertEqual(gate.counts["attempts"], 2)
                 self.assertEqual(gate.counts["http_success"], 0)
+
+    def test_removed_vacancy_404_skips_only_that_vacancy(self):
+        """A vacancy removed during the run answers 404: skip it instead of stopping the whole run."""
+        from send import NOT_FOUND_SKIP_LIMIT
+        from gui_protocol import RETRY_NOTICES
+        self.assertIn("vacancy_not_found", RETRY_NOTICES)
+        self.gate.current = VACANCY | {"employer": {"id": "77", "name": "Test"}}
+        self.gate.observer = Mock()
+        not_found = SimpleNamespace(status_code=404, json=lambda: {})
+        reads = ("https://api.hh.ru/vacancies/123", "https://api.hh.ru/employers/77",
+                 "https://hh.ru/applicant/vacancy_response?vacancyId=123&startedWithQuestion=false"
+                 "&hhtmFrom=vacancy")
+        for number, url in enumerate(reads[:NOT_FOUND_SKIP_LIMIT - 1]):
+            with self.subTest(url=url):
+                self.gate.sender = Mock(return_value=not_found)
+                self.gate.letter = LETTER
+                with redirect_stdout(StringIO()) as out:
+                    response = self.gate.send(None, requests.Request("GET", url).prepare())
+                self.assertIs(response, not_found)  # Upstream turns it into ResourceNotFound and moves on.
+                self.assertIsNone(self.gate.letter)
+                self.assertIn("HH не нашёл вакансию", out.getvalue())
+                self.assertEqual(self.gate.not_found_skips, number + 1)
+        self.gate.observer.assert_any_call("retry", "vacancy_not_found")
+        # A sent application resets the series.
+        self.gate.sender = Mock(return_value=SimpleNamespace(status_code=201))
+        self.gate.letter = LETTER
+        with redirect_stdout(StringIO()):
+            self.gate.send(None, negotiation())
+        self.assertEqual(self.gate.not_found_skips, 0)
+        # Not a read of the current vacancy: a 404 still stops the run.
+        for url in ("https://api.hh.ru/vacancies/999", "https://api.hh.ru/employers/78",
+                    "https://api.hh.ru/resumes/mine", "https://hh.ru/applicant/vacancy_response?vacancyId=999",
+                    "https://api.hh.ru:8443/vacancies/123", "https://api.hh.ru/vacancies/123/similar_vacancies"):
+            with self.subTest(stops=url):
+                self.gate.sender = Mock(return_value=not_found)
+                with self.assertRaisesRegex(SystemExit, "Stopped after HTTP 404 for GET "):
+                    self.gate.send(None, requests.Request("GET", url).prepare())
+        current, self.gate.current = self.gate.current, None
+        with self.assertRaisesRegex(SystemExit, "Stopped after HTTP 404"):
+            self.gate.send(None, requests.Request("GET", reads[0]).prepare())
+        self.gate.current = current
+        # NOT_FOUND_SKIP_LIMIT removed vacancies in a row point to a wider fault: stop.
+        self.gate.sender = Mock(return_value=not_found)
+        with redirect_stdout(StringIO()):
+            for _ in range(NOT_FOUND_SKIP_LIMIT - 1):
+                self.gate.send(None, requests.Request("GET", reads[0]).prepare())
+            with self.assertRaises(SystemExit) as caught:
+                self.gate.send(None, requests.Request("GET", reads[0]).prepare())
+        self.assertIn(f"HH не нашёл {NOT_FOUND_SKIP_LIMIT} вакансии подряд", str(caught.exception))
+
+    def test_removed_vacancy_reaches_upstream_as_resource_not_found(self):
+        """Through the real API client the 404 becomes ResourceNotFound, which upstream skips."""
+        from hh_applicant_tool.api.errors import ResourceNotFound
+        self.gate.sender = self.gateway_reply(404, {"errors": [{"type": "not_found"}]})
+        client = ApiClient(access_token="USERx", refresh_token="r", access_expires_at=2**40,
+                           client_id="test", client_secret="test", delay=0.001)
+        try:
+            with patch.object(requests.sessions.Session, "send",
+                              lambda session, request, **kw: self.gate.send(session, request, **kw)), \
+                    redirect_stdout(StringIO()):
+                self.gate.operation = SimpleNamespace(api_client=client)
+                # complete() lets ResourceNotFound through: upstream catches ApiError and goes on.
+                with self.assertRaises(ResourceNotFound):
+                    self.gate.complete(None, "prompt")
+        finally:
+            client.session.close()
+        self.assertEqual(self.gate.counts["skipped"], 1)
 
     def test_repeated_captcha_skips_vacancies_until_a_series_stops_the_run(self):
         """#7: one repeated captcha skips one vacancy; CAPTCHA_SKIP_LIMIT in a row stop the run."""

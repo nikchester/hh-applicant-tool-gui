@@ -413,6 +413,8 @@ class Application:
         self.infobar_message = message
         # Errors and warnings link to the journal instead of opening it by themselves (#11).
         self.infobar_more = ttk.Button(self.infobar, text="Подробнее", command=self.open_log)
+        # One click copies a report for an issue or a message to the developer.
+        self.infobar_report = ttk.Button(self.infobar, text="Копировать отчёт", command=self.copy_report)
         # One action for a warning, e.g. «Войти» after a lost login (#5).
         self.infobar_action = ttk.Button(self.infobar)
         self.set_severity("info")
@@ -423,12 +425,13 @@ class Application:
             return
         _background, _icon, glyph, fallback = SEVERITY[level]
         infobar.configure(style=f"{level}.Info.TFrame")
-        more = getattr(self, "infobar_more", None)
-        if more is not None:
+        for button in (getattr(self, "infobar_more", None), getattr(self, "infobar_report", None)):
+            if button is None:
+                continue
             if level in ("error", "warning"):
-                more.pack(side="right", padx=(10, 0))
+                button.pack(side="right", padx=(10, 0))
             else:
-                more.pack_forget()
+                button.pack_forget()
         self.infobar_icon.configure(style=f"{level}.InfoIcon.TLabel", text=glyph if self.icon_font else fallback)
         self.infobar_message.configure(style=f"{level}.Info.TLabel")
 
@@ -1168,6 +1171,50 @@ class Application:
             except self.tk.TclError:
                 self.log_view = None
 
+    def error_report(self):
+        """The report text: version, system, the InfoBar message, the stop reason and the journal tail."""
+        import os
+        import platform
+        from pathlib import Path
+        from gui_steps import error_report
+        status = getattr(self, "last_failure", None)
+        if not status and getattr(self, "status", None) is not None:
+            status = self.status.get()
+        return error_report(getattr(self, "log_lines", []), version=os.environ.get("HH_APP_VERSION"),
+                            system=f"{platform.system()} {platform.release()} ({platform.version()})",
+                            status=status, reason=getattr(self, "stop_reason", None), home=Path.home())
+
+    def copy_report(self, button=None):
+        """Put the error report on the clipboard; the button says so for two seconds."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.error_report())
+        button = button or getattr(self, "infobar_report", None)
+        if button is None:
+            return
+        text = button.cget("text")
+        if text == "Скопировано ✓":
+            return
+        button.configure(text="Скопировано ✓")
+
+        def restore():
+            try:
+                button.configure(text=text)
+            except self.tk.TclError:
+                pass  # The window closed meanwhile.
+        self.root.after(2000, restore)
+
+    def report_issue(self):
+        """Copy the report and open a GitHub issue with it; the person reviews it before sending."""
+        import webbrowser
+        from gui_steps import issue_url
+        report = self.error_report()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(report)
+        try:
+            webbrowser.open(issue_url(report))
+        except Exception:  # No browser: the clipboard still holds the report.
+            self.say("Не удалось открыть браузер. Отчёт скопирован: вставь его в issue на GitHub.", "warning")
+
     def open_log(self):
         """The technical journal in its own window, away from the work view (#11)."""
         tk, ttk = self.tk, self.ttk
@@ -1178,15 +1225,17 @@ class Application:
             return
         window = self.log_window = tk.Toplevel(self.root, background=CARD)
         window.title("Журнал")
-        window.geometry("860x480")
+        window.geometry("1000x500")
         window.transient(self.root)
         dark_title_bar(window)
         frame = ttk.Frame(window, padding=14)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
-        ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой.",
-                  style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой. "
+                  "«Копировать отчёт» берёт версию, ошибку и конец журнала без текста писем: "
+                  "отчёт можно вставить в issue или отправить разработчику.",
+                  style="Hint.TLabel", wraplength=960, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 6))
         box, view = self.text_box(frame, 18)
         box.grid(row=1, column=0, sticky="nsew")
         view.configure(font=("Consolas", 9))
@@ -1213,7 +1262,11 @@ class Application:
         def close():
             self.log_view = self.log_window = None
             window.destroy()
-        ttk.Button(buttons, text="Скопировать всё", command=copy).pack(side="left")
+        report = ttk.Button(buttons, text="Копировать отчёт", style="Accent.TButton")
+        report.configure(command=lambda: self.copy_report(report))
+        report.pack(side="left")
+        ttk.Button(buttons, text="Сообщить на GitHub", command=self.report_issue).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Скопировать всё", command=copy).pack(side="left", padx=(6, 0))
         ttk.Button(buttons, text="Открыть папку с журналом", command=folder).pack(side="left", padx=6)
         ttk.Button(buttons, text="Закрыть", command=close).pack(side="left")
         window.protocol("WM_DELETE_WINDOW", close)
@@ -2318,6 +2371,8 @@ class Application:
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
         severity = self.finish_severity(data, session.action)
+        # The report quotes this run's result even after the InfoBar shows something else.
+        self.last_failure = message if severity in ("error", "warning") else None
         self.say(message, severity, action=None if data["success"] else self.finish_action())
         if needs_attention(severity, session.action):
             attention(self.root, severity)

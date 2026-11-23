@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, parse_qsl, urlsplit
 
 import requests
 from hh_applicant_tool.ai.base import AIError
-from hh_applicant_tool.api import Redirect
+from hh_applicant_tool.api import Redirect, ResourceNotFound
 from hh_applicant_tool.ai.openai import OpenAIClient
 from hh_applicant_tool.main import main
 from hh_applicant_tool.operations.apply_vacancies import Operation
@@ -55,6 +55,9 @@ LETTER_REJECTION_LIMIT = 3
 # A repeated HH captcha skips one vacancy; this many vacancies in a row mean HH's anti-bot is
 # on alert, so the run stops instead of asking for more captchas.
 CAPTCHA_SKIP_LIMIT = 2
+# An employer may remove a vacancy during a long run: HH then answers 404 to the reads of that
+# vacancy, and only that vacancy is skipped. This many in a row point to a wider fault: stop.
+NOT_FOUND_SKIP_LIMIT = 3
 # HH may show a fresh application in the vacancy relations only after a delay.
 SEND_CHECK_DELAY = 15
 # Trusted framing of an AI letter rewrite; the user's request travels only as JSON data.
@@ -249,6 +252,20 @@ def validate(argv, *, profile=None):
     return args
 
 
+def stop_target(request):
+    """Method, host and path of a stopped request for the journal: never the query or credentials."""
+    try:
+        url = urlsplit(request.url)
+        host = url.hostname or "?"
+        port = url.port
+    except (TypeError, ValueError):
+        return "an unparsable URL"
+    if port is not None:
+        host += f":{port}"
+    path = url.path if len(url.path) <= 120 else url.path[:120] + "…"
+    return f"{request.method} {url.scheme}://{host}{path}"
+
+
 def salary_text(salary):
     if not salary:
         return "не указана"
@@ -304,6 +321,7 @@ class ApprovalGate:
         self.generation_skips = 0
         self.letter_rejections = 0
         self.captcha_skips = 0
+        self.not_found_skips = 0
         self.captcha = ManualCaptcha()
         self.counts = {"vacancies": 0, "letters": 0, "skipped": 0,
                        "attempts": 0, "captcha_rejections": 0, "http_success": 0}
@@ -364,6 +382,8 @@ class ApprovalGate:
             vacancy = self.operation.api_client.get("/vacancies/" + self.current["id"])
             if reason := salary_rejection_reason(vacancy, self.operation.api_client):
                 raise SystemExit(f"Vacancy salary changed: {reason}")
+        except ResourceNotFound:
+            raise  # send() has skipped the removed vacancy; upstream logs ApiError and moves on.
         except Exception:
             raise SystemExit("Stopped after vacancy-detail failure; no application sent for this vacancy") from None
         prompt, kwargs = enrich_prompt(prompt, vacancy), letter_kwargs(kwargs, vacancy)
@@ -651,7 +671,7 @@ class ApprovalGate:
                     and all(c.isascii() and (c.isalnum() or c in "-_") for c in error) else "unknown")
             raise SystemExit(f"HH did not accept the test application: error={safe}; check HH manually")
         self.counts["http_success"] += 1
-        self.captcha_skips = 0
+        self.captcha_skips = self.not_found_skips = 0
         print(f"HH принял отклик с тестом на вакансию {self.current['id']}", flush=True)
         return response
 
@@ -672,9 +692,12 @@ class ApprovalGate:
                 return response
             # HH's manual solver interprets 403 on the final captcha form as
             # "incorrect answer". Do not mask it before it reaches the solver.
+            if response.status_code == 404 and self._vacancy_read(request):
+                self._skip_not_found()
+                return response  # Upstream raises ResourceNotFound or fails the test form for this vacancy only.
             if (response.status_code >= 400 and not self.captcha.rejected_answer(request, response)
                     and not permits_token_refresh(request, response)):
-                raise SystemExit(f"Stopped after HTTP {response.status_code}")
+                raise SystemExit(f"Stopped after HTTP {response.status_code} for {stop_target(request)}")
             return response
 
         if (self.current is None or self.current.get("relations")
@@ -765,7 +788,7 @@ class ApprovalGate:
                     "check HH manually before any retry"
                 )
             self.counts["http_success"] += 1
-            self.captcha_skips = 0
+            self.captcha_skips = self.not_found_skips = 0
             print(f"HH вернул HTTP {response.status_code} для вакансии {self.current['id']}", flush=True)
             return response
         raise SystemExit("No confirmed send result; check HH manually")
@@ -809,6 +832,36 @@ class ApprovalGate:
         if self.captcha_skips >= CAPTCHA_SKIP_LIMIT:
             raise SystemExit(f"HH повторно запросил капчу на {self.captcha_skips} вакансиях подряд. "
                              "Запуск остановлен, чтобы не раздражать антибот HH. Попробуй позже.")
+
+    def _vacancy_read(self, request):
+        """A GET of the current vacancy, its employer or its test form: a 404 there concerns one vacancy."""
+        if request.method != "GET" or self.current is None:
+            return False
+        try:
+            url = urlsplit(request.url)
+            port = url.port
+        except ValueError:
+            return False
+        if url.scheme != "https" or port is not None or url.username or url.password or url.fragment:
+            return False
+        vacancy = str(self.current.get("id") or "")
+        employer = str((self.current.get("employer") or {}).get("id") or "")
+        if url.hostname == "api.hh.ru":
+            return (url.path == "/vacancies/" + vacancy and bool(vacancy)) or (
+                url.path == "/employers/" + employer and bool(employer))
+        if url.hostname == "hh.ru" and url.path == "/applicant/vacancy_response":
+            return bool(vacancy) and parse_qs(url.query).get("vacancyId") == [vacancy]
+        return False
+
+    def _skip_not_found(self):
+        """The vacancy is gone from HH: skip it; a series of such vacancies stops the run."""
+        self.letter = None
+        self.counts["skipped"] += 1
+        self.not_found_skips += 1
+        self._notice("vacancy_not_found")
+        if self.not_found_skips >= NOT_FOUND_SKIP_LIMIT:
+            raise SystemExit(f"HH не нашёл {self.not_found_skips} вакансии подряд (HTTP 404). "
+                             "Запуск остановлен. Повтори позже; если ошибка повторится, отправь отчёт об ошибке.")
 
     def _resolved(self, kind):
         hook = type(self).on_send_resolved  # Read from the class: a plain function, not a method.
