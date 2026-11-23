@@ -903,6 +903,152 @@ class ConstructionChecks(unittest.TestCase):
         finally:
             root.destroy()
 
+    def make_logs(self, root):
+        """A state folder with the journal, run logs and files that must never leave it."""
+        import time as time_module
+        (root / "log").mkdir(parents=True)
+        (root / "run").mkdir()
+        (root / "chatmock").mkdir()
+        home = r"C:\Users\Иван"
+        (root / "log/gui.log.1").write_text("2026-11-20 10:00:00  старая строка\n", encoding="utf-8")
+        (root / "log/gui.log").write_text(
+            "2026-11-23 16:00:00  Запуск: автоотклики\n"
+            "2026-11-23 16:01:00  Отклонённое письмо: Привет, мой телеграм @ivan\n"
+            "2026-11-23 16:07:53  ChatMock diagnostic log preserved: " + home + r"\.local\state\run\x.log" + "\n",
+            encoding="utf-8")
+        chatmock = root / ("run/chatmock-" + "a" * 32 + ".err.log")
+        chatmock.write_text("POST /v1/chat/completions 200\nAuthorization: Bearer abcdefghijklmnop\n",
+                            encoding="utf-8")
+        chats = root / ("run/hh-chats-" + "b" * 32 + ".jsonl")
+        chats.write_text(json.dumps({"event": "run_started", "path": home + r"\x",
+                                     "access_token": "USERSECRETTOKEN"}) + "\n", encoding="utf-8")
+        for name in ("token.json", "config.toml", "run/notes.txt", "chatmock/auth.json",
+                     "run/chatmock-short.err.log"):
+            (root / name).write_text("SECRET-FILE", encoding="utf-8")
+        old = time_module.time() - 3600
+        os.utime(chatmock, (old, old))
+        return home
+
+    def test_log_bundle_takes_only_logs_and_hides_private_text(self):
+        import log_bundle
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = self.make_logs(root)
+            names = [name for name, _path in log_bundle.log_files(root)]
+            self.assertEqual(sorted(names), sorted([
+                "log/gui.log", "log/gui.log.1", "run/chatmock-" + "a" * 32 + ".err.log",
+                "run/hh-chats-" + "b" * 32 + ".jsonl"]))
+            self.assertEqual(names[-1], "run/chatmock-" + "a" * 32 + ".err.log")  # The oldest last.
+            target = root / "out" / "logs.zip"
+            target.parent.mkdir()
+            written, left_out = log_bundle.write_zip(target, "Отчёт " + home, root=root, home=home)
+            self.assertEqual((written, left_out), (4, []))
+            self.assertEqual(list(target.parent.iterdir()), [target])  # No .part file stays.
+            import zipfile
+            with zipfile.ZipFile(target) as archive:
+                self.assertEqual(sorted(archive.namelist()), sorted(["report.txt", *names]))
+                text = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist())
+            self.assertEqual(text.count("SECRET-FILE"), 0)
+            for private in ("Иван", "@ivan", "abcdefghijklmnop", "USERSECRETTOKEN"):
+                self.assertNotIn(private, text)
+            self.assertIn("Отчёт ~", text)
+            self.assertIn(r"~\.local\state\run\x.log", text)
+            self.assertIn("Отклонённое письмо: [скрыто]", text)
+            self.assertIn("Bearer [скрыто]", text)
+            self.assertIn("POST /v1/chat/completions 200", text)
+
+            copied = log_bundle.clipboard_text("Отчёт", root=root, home=home)
+            self.assertTrue(copied.startswith("Отчёт\n"))
+            self.assertLess(copied.index("===== log/gui.log"), copied.index("===== run/"))
+            self.assertIn("старая строка", copied)
+            self.assertNotIn("Иван", copied)
+            self.assertNotIn("SECRET-FILE", copied)
+            small = log_bundle.clipboard_text("Отчёт", root=root, home=home, limit=400)
+            self.assertLessEqual(len(small), 700)  # The limit plus the list of what did not fit.
+            self.assertIn("===== не поместились =====", small)
+            self.assertIn("Сохранить логи в файл", small)
+
+            with patch.object(log_bundle, "MAX_FILE", 20):
+                self.assertIn("[начало файла обрезано", log_bundle._read(root / "log/gui.log"))
+            with patch.object(log_bundle, "MAX_ZIP_TEXT", 100):
+                written, left_out = log_bundle.write_zip(target, "Отчёт", root=root, home=home)
+            self.assertLess(written, 4)
+            with zipfile.ZipFile(target) as archive:
+                self.assertIn("left-out.txt", archive.namelist())
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertEqual(log_bundle.log_files(Path(temp) / "missing"), [])
+
+    def test_real_tk_journal_copies_and_saves_every_log(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import zipfile
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                state = Path(temp) / ".local/state/hh-applicant-tool-gui"
+                self.make_logs(state)
+                app = gui.Application(root, tk, ttk, Mock())
+                app.stop_reason = "Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1"
+                import log_bundle
+
+                def run_now(work, done):
+                    try:
+                        done(work(), None)
+                    except Exception as error:
+                        done(None, error)
+                app.run_in_background = run_now
+                app.open_log()
+                # The ZIP itself goes on the clipboard through PowerShell; the path rides in the environment.
+                with patch("subprocess.run") as run:
+                    app.log_copy_button.invoke()
+                command, env = run.call_args.args[0], run.call_args.kwargs["env"]
+                self.assertEqual(command[:2], ["powershell.exe", "-NoProfile"])
+                self.assertEqual(command[-1], "Set-Clipboard -LiteralPath $env:HH_LOG_ZIP")
+                copied_zip = Path(env["HH_LOG_ZIP"])
+                self.assertEqual(copied_zip.parent, state / "reports")
+                with zipfile.ZipFile(copied_zip) as archive:
+                    self.assertIn("Причина: Stopped after HTTP 404", archive.read("report.txt").decode("utf-8"))
+                    self.assertIn("run/hh-chats-" + "b" * 32 + ".jsonl", archive.namelist())
+                self.assertEqual(str(app.log_copy_button["text"]), "Скопировано ✓")
+                self.assertIn("Архив со всеми логами скопирован", app.status.get())
+                # Only the newest copies stay.
+                for number in range(log_bundle.KEEP_COPIES + 2):
+                    with patch.object(log_bundle, "default_name", return_value=f"hh-logs-2026010{number}.zip"), \
+                            patch("subprocess.run"):
+                        app.copy_all_logs()
+                kept = sorted(path.name for path in (state / "reports").iterdir())
+                self.assertEqual(len(kept), log_bundle.KEEP_COPIES)
+                self.assertIn(copied_zip.name, kept)  # Today's name sorts after the January ones.
+                # Without the file clipboard the logs go as text.
+                with patch("subprocess.run", side_effect=OSError("no powershell")):
+                    app.copy_all_logs()
+                copied = root.clipboard_get()
+                self.assertIn("===== log/gui.log =====", copied)
+                self.assertIn("===== run/hh-chats-", copied)
+                self.assertIn("логи скопированы текстом", app.status.get())
+                target = Path(temp) / "Desktop" / "logs.zip"
+                target.parent.mkdir()
+                with patch.object(app, "ask_log_path", return_value=str(target)), \
+                        patch("subprocess.Popen") as popen:
+                    app.log_save_button.invoke()
+                with zipfile.ZipFile(target) as archive:
+                    self.assertIn("report.txt", archive.namelist())
+                    self.assertIn("log/gui.log", archive.namelist())
+                self.assertEqual(popen.call_args.args[0], ["explorer", "/select,", str(target)])
+                self.assertIn("Логи сохранены", app.status.get())
+                with patch.object(app, "ask_log_path", return_value=""), patch("subprocess.Popen") as popen:
+                    app.save_all_logs()  # Cancelled dialog: nothing happens.
+                popen.assert_not_called()
+                with patch.object(app, "ask_log_path", return_value=str(Path(temp) / "missing/x.zip")):
+                    app.save_all_logs()
+                self.assertIn("Не удалось сохранить логи", app.status.get())
+        finally:
+            root.destroy()
+
     def test_update_channel_option_accepts_only_known_channels(self):
         with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
             self.assertIsNone(gui_profile.read_option("update_channel"))
