@@ -1230,20 +1230,93 @@ class Application:
         """Put the error report on the clipboard; the button says so for two seconds."""
         self.root.clipboard_clear()
         self.root.clipboard_append(self.error_report())
-        button = button or getattr(self, "infobar_report", None)
-        if button is None:
+        self.flash(button or getattr(self, "infobar_report", None))
+
+    def flash(self, button, text="Скопировано ✓"):
+        """Say «done» on the button for two seconds."""
+        if button is None or button.cget("text") == text:
             return
-        text = button.cget("text")
-        if text == "Скопировано ✓":
-            return
-        button.configure(text="Скопировано ✓")
+        original = button.cget("text")
+        button.configure(text=text)
 
         def restore():
             try:
-                button.configure(text=text)
+                button.configure(text=original)
             except self.tk.TclError:
                 pass  # The window closed meanwhile.
         self.root.after(2000, restore)
+
+    def copy_all_logs(self, button=None):
+        """Every log as one ZIP file on the clipboard; Ctrl+V attaches it in a messenger or a mail.
+
+        Without the file clipboard the same logs go as text, cut to a size a message takes.
+        """
+        from pathlib import Path
+        import log_bundle
+        report, home = self.error_report(), Path.home()
+        if button is not None:
+            button.configure(state="disabled")
+
+        def work():
+            path = log_bundle.copy_zip(report, home=home)
+            log_bundle.copy_file_to_clipboard(path)
+            return path
+
+        def done(path, error):
+            if button is not None:
+                try:
+                    button.configure(state="normal")
+                except self.tk.TclError:
+                    pass  # The journal window closed meanwhile.
+            if error is None:
+                self.flash(button)
+                self.say(f"Архив со всеми логами скопирован в буфер обмена ({path.name}, "
+                         f"{max(1, path.stat().st_size // 1024)} КБ). Вставь его (Ctrl+V) в сообщение "
+                         "разработчику, в письмо или в папку.", "success")
+                self.append_log("Логи скопированы в буфер обмена как файл: " + str(path))
+                return
+            text = log_bundle.clipboard_text(report, home=home)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.flash(button)
+            self.say(f"Не удалось скопировать архив, поэтому логи скопированы текстом "
+                     f"({max(1, len(text.encode('utf-8')) // 1024)} КБ). Чтобы передать всё, "
+                     "сохрани логи в файл.", "warning")
+        self.run_in_background(work, done)
+
+    def ask_log_path(self):
+        """Where to save the log ZIP: the desktop by default."""
+        from pathlib import Path
+        from tkinter import filedialog
+        from log_bundle import default_name
+        desktop = Path.home() / "Desktop"
+        return filedialog.asksaveasfilename(
+            parent=getattr(self, "log_window", None) or self.root, title="Сохранить логи",
+            initialdir=str(desktop if desktop.is_dir() else Path.home()), initialfile=default_name(),
+            defaultextension=".zip", filetypes=[("ZIP-архив", "*.zip")])
+
+    def save_all_logs(self):
+        """Write the report and every log into one ZIP file the person can send."""
+        import subprocess
+        from pathlib import Path
+        from log_bundle import write_zip
+        target = self.ask_log_path()
+        if not target:
+            return
+        target = Path(target)
+        try:
+            written, left_out = write_zip(target, self.error_report(), home=Path.home())
+        except OSError:
+            self.say("Не удалось сохранить логи в " + str(target) + ". Выбери другую папку.", "warning")
+            return
+        note = f" Не вошли: {len(left_out)} (слишком много данных)." if left_out else ""
+        self.say(f"Логи сохранены: {target} (файлов логов: {written}).{note} Отправь этот файл разработчику "
+                 "или перетащи его в issue на GitHub.", "success")
+        self.append_log("Логи сохранены в файл: " + str(target))
+        try:
+            subprocess.Popen(["explorer", "/select,", str(target)])  # Show the file to drag it into a chat.
+        except OSError:
+            pass
 
     def report_issue(self):
         """Copy the report and open a GitHub issue with it; the person reviews it before sending."""
@@ -1267,7 +1340,7 @@ class Application:
             return
         window = self.log_window = tk.Toplevel(self.root, background=CARD)
         window.title("Журнал")
-        window.geometry("1000x500")
+        window.geometry("1000x560")
         window.transient(self.root)
         dark_title_bar(window)
         frame = ttk.Frame(window, padding=14)
@@ -1275,8 +1348,10 @@ class Application:
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
         ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой. "
-                  "«Копировать отчёт» берёт версию, ошибку и конец журнала без текста писем: "
-                  "отчёт можно вставить в issue или отправить разработчику.",
+                  "«Копировать отчёт» берёт версию, ошибку и конец журнала. «Копировать все логи» кладёт "
+                  "в буфер обмена ZIP-архив со всеми логами: вставь его (Ctrl+V) в сообщение или письмо. "
+                  "«Сохранить логи в файл…» сохраняет тот же архив на диск. Тексты писем, ключи и имя "
+                  "пользователя Windows в логах скрыты.",
                   style="Hint.TLabel", wraplength=960, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 6))
         box, view = self.text_box(frame, 18)
         box.grid(row=1, column=0, sticky="nsew")
@@ -1285,12 +1360,9 @@ class Application:
         view.see("end")
         self.log_view = view
         buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=0, sticky="w", pady=(10, 0))
-
-        def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append("\n".join(self.log_lines))
-            self.say("Журнал скопирован в буфер обмена.")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        logs = ttk.Frame(frame)
+        logs.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
         def folder():
             import os
@@ -1304,13 +1376,18 @@ class Application:
         def close():
             self.log_view = self.log_window = None
             window.destroy()
+        # Row 1: a short report for an issue. Row 2: every log, for the clipboard or as a file.
         report = ttk.Button(buttons, text="Копировать отчёт", style="Accent.TButton")
         report.configure(command=lambda: self.copy_report(report))
         report.pack(side="left")
         ttk.Button(buttons, text="Сообщить на GitHub", command=self.report_issue).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Скопировать всё", command=copy).pack(side="left", padx=(6, 0))
-        ttk.Button(buttons, text="Открыть папку с журналом", command=folder).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Закрыть", command=close).pack(side="left")
+        ttk.Button(buttons, text="Закрыть", command=close).pack(side="right")
+        every = self.log_copy_button = ttk.Button(logs, text="Копировать все логи")
+        every.configure(command=lambda: self.copy_all_logs(every))
+        every.pack(side="left")
+        self.log_save_button = ttk.Button(logs, text="Сохранить логи в файл…", command=self.save_all_logs)
+        self.log_save_button.pack(side="left", padx=(6, 0))
+        ttk.Button(logs, text="Открыть папку с журналом", command=folder).pack(side="left", padx=(6, 0))
         window.protocol("WM_DELETE_WINDOW", close)
 
     def set_busy(self, running):
