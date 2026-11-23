@@ -9,7 +9,7 @@
   #error OutputPath is required
 #endif
 #ifndef AppVersion
-  #define AppVersion "0.7.0-beta.1"
+  #define AppVersion "0.7.0-beta.2"
 #endif
 #ifndef AppNumericVersion
   #define AppNumericVersion "0.7.0"
