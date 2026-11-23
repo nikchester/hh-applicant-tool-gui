@@ -903,6 +903,79 @@ class ConstructionChecks(unittest.TestCase):
         finally:
             root.destroy()
 
+    def test_update_channel_option_accepts_only_known_channels(self):
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            self.assertIsNone(gui_profile.read_option("update_channel"))
+            gui_profile.save_option("no_letter", True)
+            gui_profile.save_option("update_channel", "beta")
+            self.assertEqual(gui_profile.read_option("update_channel"), "beta")
+            self.assertIs(gui_profile.read_option("no_letter"), True)  # Other settings stay.
+            for bad in ("nightly", True, None, ["beta"]):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    gui_profile.save_option("update_channel", bad)
+            gui_profile.options_path().write_text('{"update_channel": "nightly", "no_letter": "yes"}',
+                                                  encoding="utf-8")
+            self.assertIsNone(gui_profile.read_option("update_channel"))
+            self.assertIs(gui_profile.read_option("no_letter"), False)
+
+    def test_real_tk_update_channel_menu_saves_choice_and_checks_that_channel(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import updater
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                    patch.dict(os.environ, {"HH_APP_VERSION": "1.0.0-beta.1"}):
+                app = gui.Application(root, tk, ttk, Mock())
+                menu = app.update_menu
+                labels = [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)
+                          if menu.type(index) != "separator"]
+                self.assertEqual(labels, ["Стабильные версии", "Бета-версии", "Проверить обновления"])
+                self.assertEqual(app.update_channel.get(), "beta")  # A beta install without a saved choice.
+                calls, answers = [], {"stable": {"version": "1.0.0"}, "beta": None}
+
+                def check(channel=None):
+                    calls.append(channel)
+                    if isinstance(answers[channel], Exception):
+                        raise answers[channel]
+                    return answers[channel]
+
+                def run_now(work, done):
+                    try:
+                        done(work(), None)
+                    except Exception as error:
+                        done(None, error)
+                app.run_in_background = run_now
+                with patch.object(updater, "enabled", return_value=True), \
+                        patch.object(updater, "check", side_effect=check):
+                    menu.invoke(0)  # «Стабильные версии»
+                    self.assertEqual(gui_profile.read_option("update_channel"), "stable")
+                    self.assertEqual(calls, ["stable"])
+                    self.assertEqual(app.update_release["version"], "1.0.0")
+                    self.assertTrue(app.update_button.winfo_manager())
+                    self.assertIn("1.0.0-beta.1 останется", app.status.get())
+                    self.assertIn("Доступна версия 1.0.0", app.status.get())
+                    menu.invoke(1)  # «Бета-версии»: the stable release found before no longer applies.
+                    self.assertEqual(gui_profile.read_option("update_channel"), "beta")
+                    self.assertEqual(calls, ["stable", "beta"])
+                    self.assertIsNone(app.update_release)
+                    self.assertFalse(app.update_button.winfo_manager())
+                    self.assertIn("Обновлений нет", app.status.get())
+                    answers["beta"] = updater.UpdateError("Не удалось связаться с GitHub.")
+                    menu.invoke(3)  # «Проверить обновления»
+                    self.assertEqual(calls[-1], "beta")
+                    self.assertIn("Не удалось связаться с GitHub.", app.status.get())
+                    self.assertIn("Канал обновлений: Бета-версии.", "\n".join(app.log_lines))
+                with patch.object(updater, "enabled", return_value=False):
+                    menu.invoke(3)
+                    self.assertIn("только в установленной программе", app.status.get())
+        finally:
+            root.destroy()
+
     def test_real_tk_journal_window_file_and_infobar_link(self):
         import tkinter as tk
         from tkinter import ttk
