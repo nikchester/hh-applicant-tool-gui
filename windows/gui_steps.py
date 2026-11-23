@@ -139,9 +139,19 @@ def _reset_time(reason):
     return time.strftime("в %H:%M" if same_day else "%d.%m в %H:%M", moment)
 
 
+WEB_LOGIN_LOST = "HH web session is not logged in"
+
+
+def web_login_lost(reason):
+    """True when HH answered as to a guest: the site login is gone although the API token works."""
+    return isinstance(reason, str) and WEB_LOGIN_LOST in reason
+
+
 # Internal stop reasons (English, for the journal) -> what the person reads (#11).
 # Each pattern matches the text our own guards raise; the first match wins.
 _REASONS = (
+    (WEB_LOGIN_LOST, lambda m, r:
+        "Вход в HH на сайте истёк: HH считает тебя гостем. Нажми «Войти» и войди в HH заново."),
     (r"fallback list exhausted", lambda m, r: (
         "Модели из списка запасных закончились: у каждой кончился лимит или она недоступна."
         + (f" Ближайший сброс лимита {_reset_time(r)}." if _reset_time(r) else "")
@@ -209,3 +219,43 @@ def readable_reason(reason):
         if match := re.search(pattern, reason):
             return render(match, reason)
     return "Запуск остановлен защитой программы."
+
+
+# Error report: one click copies what a developer needs, ready for a GitHub issue or a message.
+ISSUES_URL = "https://github.com/nikchester/hh-applicant-tool-gui/issues/new"
+REPORT_LINES = 60
+# Browsers and GitHub reject very long URLs; a longer report goes through the clipboard only.
+ISSUE_URL_LIMIT = 7000
+
+
+def error_report(lines, *, version=None, system=None, status=None, reason=None, home=None):
+    """Plain text for an issue: version, system, the message on screen, the internal reason, the journal tail.
+
+    The report may go to a public issue: log_bundle.scrub hides the home folder and letter texts.
+    """
+    from log_bundle import scrub
+    tail = list(lines or [])[-REPORT_LINES:]
+    parts = [
+        "Автоотклики HH — отчёт об ошибке",
+        "Версия: " + (version or "из исходников"),
+        "Система: " + (system or "неизвестна"),
+    ]
+    if status:
+        parts.append("Сообщение: " + status)
+    if reason:
+        parts.append("Причина: " + reason)
+    parts += ["", f"Журнал (последние {len(tail)} строк):", *tail]
+    return scrub("\n".join(parts), home)
+
+
+def issue_url(report, title="Ошибка в приложении"):
+    """A GitHub «New issue» link with the report inside, or with a paste hint when the report is too long."""
+    from urllib.parse import urlencode
+    body = ("Что я делал(а):\n\n\n```\n" + report + "\n```\n\n"
+            "Все логи: «Журнал» → «Сохранить логи в файл…», затем перетащи ZIP-файл сюда.\n")
+    url = ISSUES_URL + "?" + urlencode({"title": title, "body": body})
+    if len(url) <= ISSUE_URL_LIMIT:
+        return url
+    return ISSUES_URL + "?" + urlencode({
+        "title": title,
+        "body": "Что я делал(а):\n\n\nОтчёт об ошибке (вставь из буфера обмена, Ctrl+V):\n\n"})

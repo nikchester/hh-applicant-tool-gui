@@ -912,6 +912,225 @@ class ConstructionChecks(unittest.TestCase):
         finally:
             root.destroy()
 
+    def make_logs(self, root):
+        """A state folder with the journal, run logs and files that must never leave it."""
+        import time as time_module
+        (root / "log").mkdir(parents=True)
+        (root / "run").mkdir()
+        (root / "chatmock").mkdir()
+        home = r"C:\Users\Иван"
+        (root / "log/gui.log.1").write_text("2026-11-20 10:00:00  старая строка\n", encoding="utf-8")
+        (root / "log/gui.log").write_text(
+            "2026-11-23 16:00:00  Запуск: автоотклики\n"
+            "2026-11-23 16:01:00  Отклонённое письмо: Привет, мой телеграм @ivan\n"
+            "2026-11-23 16:07:53  ChatMock diagnostic log preserved: " + home + r"\.local\state\run\x.log" + "\n",
+            encoding="utf-8")
+        chatmock = root / ("run/chatmock-" + "a" * 32 + ".err.log")
+        chatmock.write_text("POST /v1/chat/completions 200\nAuthorization: Bearer abcdefghijklmnop\n",
+                            encoding="utf-8")
+        chats = root / ("run/hh-chats-" + "b" * 32 + ".jsonl")
+        chats.write_text(json.dumps({"event": "run_started", "path": home + r"\x",
+                                     "access_token": "USERSECRETTOKEN"}) + "\n", encoding="utf-8")
+        for name in ("token.json", "config.toml", "run/notes.txt", "chatmock/auth.json",
+                     "run/chatmock-short.err.log"):
+            (root / name).write_text("SECRET-FILE", encoding="utf-8")
+        old = time_module.time() - 3600
+        os.utime(chatmock, (old, old))
+        return home
+
+    def test_log_bundle_takes_only_logs_and_hides_private_text(self):
+        import log_bundle
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            home = self.make_logs(root)
+            names = [name for name, _path in log_bundle.log_files(root)]
+            self.assertEqual(sorted(names), sorted([
+                "log/gui.log", "log/gui.log.1", "run/chatmock-" + "a" * 32 + ".err.log",
+                "run/hh-chats-" + "b" * 32 + ".jsonl"]))
+            self.assertEqual(names[-1], "run/chatmock-" + "a" * 32 + ".err.log")  # The oldest last.
+            target = root / "out" / "logs.zip"
+            target.parent.mkdir()
+            written, left_out = log_bundle.write_zip(target, "Отчёт " + home, root=root, home=home)
+            self.assertEqual((written, left_out), (4, []))
+            self.assertEqual(list(target.parent.iterdir()), [target])  # No .part file stays.
+            import zipfile
+            with zipfile.ZipFile(target) as archive:
+                self.assertEqual(sorted(archive.namelist()), sorted(["report.txt", *names]))
+                text = "\n".join(archive.read(name).decode("utf-8") for name in archive.namelist())
+            self.assertEqual(text.count("SECRET-FILE"), 0)
+            for private in ("Иван", "@ivan", "abcdefghijklmnop", "USERSECRETTOKEN"):
+                self.assertNotIn(private, text)
+            self.assertIn("Отчёт ~", text)
+            self.assertIn(r"~\.local\state\run\x.log", text)
+            self.assertIn("Отклонённое письмо: [скрыто]", text)
+            self.assertIn("Bearer [скрыто]", text)
+            self.assertIn("POST /v1/chat/completions 200", text)
+
+            copied = log_bundle.clipboard_text("Отчёт", root=root, home=home)
+            self.assertTrue(copied.startswith("Отчёт\n"))
+            self.assertLess(copied.index("===== log/gui.log"), copied.index("===== run/"))
+            self.assertIn("старая строка", copied)
+            self.assertNotIn("Иван", copied)
+            self.assertNotIn("SECRET-FILE", copied)
+            small = log_bundle.clipboard_text("Отчёт", root=root, home=home, limit=400)
+            self.assertLessEqual(len(small), 700)  # The limit plus the list of what did not fit.
+            self.assertIn("===== не поместились =====", small)
+            self.assertIn("Сохранить логи в файл", small)
+
+            with patch.object(log_bundle, "MAX_FILE", 20):
+                self.assertIn("[начало файла обрезано", log_bundle._read(root / "log/gui.log"))
+            with patch.object(log_bundle, "MAX_ZIP_TEXT", 100):
+                written, left_out = log_bundle.write_zip(target, "Отчёт", root=root, home=home)
+            self.assertLess(written, 4)
+            with zipfile.ZipFile(target) as archive:
+                self.assertIn("left-out.txt", archive.namelist())
+        with tempfile.TemporaryDirectory() as temp:
+            self.assertEqual(log_bundle.log_files(Path(temp) / "missing"), [])
+
+    def test_real_tk_journal_copies_and_saves_every_log(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import zipfile
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+                state = Path(temp) / ".local/state/hh-applicant-tool-gui"
+                self.make_logs(state)
+                app = gui.Application(root, tk, ttk, Mock())
+                app.stop_reason = "Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1"
+                import log_bundle
+
+                def run_now(work, done):
+                    try:
+                        done(work(), None)
+                    except Exception as error:
+                        done(None, error)
+                app.run_in_background = run_now
+                app.open_log()
+                # The ZIP itself goes on the clipboard through PowerShell; the path rides in the environment.
+                with patch("subprocess.run") as run:
+                    app.log_copy_button.invoke()
+                command, env = run.call_args.args[0], run.call_args.kwargs["env"]
+                self.assertEqual(command[:2], ["powershell.exe", "-NoProfile"])
+                self.assertEqual(command[-1], "Set-Clipboard -LiteralPath $env:HH_LOG_ZIP")
+                copied_zip = Path(env["HH_LOG_ZIP"])
+                self.assertEqual(copied_zip.parent, state / "reports")
+                with zipfile.ZipFile(copied_zip) as archive:
+                    self.assertIn("Причина: Stopped after HTTP 404", archive.read("report.txt").decode("utf-8"))
+                    self.assertIn("run/hh-chats-" + "b" * 32 + ".jsonl", archive.namelist())
+                self.assertEqual(str(app.log_copy_button["text"]), "Скопировано ✓")
+                self.assertIn("Архив со всеми логами скопирован", app.status.get())
+                # Only the newest copies stay.
+                for number in range(log_bundle.KEEP_COPIES + 2):
+                    with patch.object(log_bundle, "default_name", return_value=f"hh-logs-2026010{number}.zip"), \
+                            patch("subprocess.run"):
+                        app.copy_all_logs()
+                kept = sorted(path.name for path in (state / "reports").iterdir())
+                self.assertEqual(len(kept), log_bundle.KEEP_COPIES)
+                self.assertIn(copied_zip.name, kept)  # Today's name sorts after the January ones.
+                # Without the file clipboard the logs go as text.
+                with patch("subprocess.run", side_effect=OSError("no powershell")):
+                    app.copy_all_logs()
+                copied = root.clipboard_get()
+                self.assertIn("===== log/gui.log =====", copied)
+                self.assertIn("===== run/hh-chats-", copied)
+                self.assertIn("логи скопированы текстом", app.status.get())
+                target = Path(temp) / "Desktop" / "logs.zip"
+                target.parent.mkdir()
+                with patch.object(app, "ask_log_path", return_value=str(target)), \
+                        patch("subprocess.Popen") as popen:
+                    app.log_save_button.invoke()
+                with zipfile.ZipFile(target) as archive:
+                    self.assertIn("report.txt", archive.namelist())
+                    self.assertIn("log/gui.log", archive.namelist())
+                self.assertEqual(popen.call_args.args[0], ["explorer", "/select,", str(target)])
+                self.assertIn("Логи сохранены", app.status.get())
+                with patch.object(app, "ask_log_path", return_value=""), patch("subprocess.Popen") as popen:
+                    app.save_all_logs()  # Cancelled dialog: nothing happens.
+                popen.assert_not_called()
+                with patch.object(app, "ask_log_path", return_value=str(Path(temp) / "missing/x.zip")):
+                    app.save_all_logs()
+                self.assertIn("Не удалось сохранить логи", app.status.get())
+        finally:
+            root.destroy()
+
+    def test_update_channel_option_accepts_only_known_channels(self):
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            self.assertIsNone(gui_profile.read_option("update_channel"))
+            gui_profile.save_option("no_letter", True)
+            gui_profile.save_option("update_channel", "beta")
+            self.assertEqual(gui_profile.read_option("update_channel"), "beta")
+            self.assertIs(gui_profile.read_option("no_letter"), True)  # Other settings stay.
+            for bad in ("nightly", True, None, ["beta"]):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    gui_profile.save_option("update_channel", bad)
+            gui_profile.options_path().write_text('{"update_channel": "nightly", "no_letter": "yes"}',
+                                                  encoding="utf-8")
+            self.assertIsNone(gui_profile.read_option("update_channel"))
+            self.assertIs(gui_profile.read_option("no_letter"), False)
+
+    def test_real_tk_update_channel_menu_saves_choice_and_checks_that_channel(self):
+        import tkinter as tk
+        from tkinter import ttk
+        import updater
+        try:
+            root = tk.Tk()
+        except tk.TclError as error:
+            self.skipTest("Tk display unavailable: " + type(error).__name__)
+        root.withdraw()
+        try:
+            with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)), \
+                    patch.dict(os.environ, {"HH_APP_VERSION": "1.0.0-beta.1"}):
+                app = gui.Application(root, tk, ttk, Mock())
+                menu = app.update_menu
+                labels = [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)
+                          if menu.type(index) != "separator"]
+                self.assertEqual(labels, ["Стабильные версии", "Бета-версии", "Проверить обновления"])
+                self.assertEqual(app.update_channel.get(), "beta")  # A beta install without a saved choice.
+                calls, answers = [], {"stable": {"version": "1.0.0"}, "beta": None}
+
+                def check(channel=None):
+                    calls.append(channel)
+                    if isinstance(answers[channel], Exception):
+                        raise answers[channel]
+                    return answers[channel]
+
+                def run_now(work, done):
+                    try:
+                        done(work(), None)
+                    except Exception as error:
+                        done(None, error)
+                app.run_in_background = run_now
+                with patch.object(updater, "enabled", return_value=True), \
+                        patch.object(updater, "check", side_effect=check):
+                    menu.invoke(0)  # «Стабильные версии»
+                    self.assertEqual(gui_profile.read_option("update_channel"), "stable")
+                    self.assertEqual(calls, ["stable"])
+                    self.assertEqual(app.update_release["version"], "1.0.0")
+                    self.assertTrue(app.update_button.winfo_manager())
+                    self.assertIn("1.0.0-beta.1 останется", app.status.get())
+                    self.assertIn("Доступна версия 1.0.0", app.status.get())
+                    menu.invoke(1)  # «Бета-версии»: the stable release found before no longer applies.
+                    self.assertEqual(gui_profile.read_option("update_channel"), "beta")
+                    self.assertEqual(calls, ["stable", "beta"])
+                    self.assertIsNone(app.update_release)
+                    self.assertFalse(app.update_button.winfo_manager())
+                    self.assertIn("Обновлений нет", app.status.get())
+                    answers["beta"] = updater.UpdateError("Не удалось связаться с GitHub.")
+                    menu.invoke(3)  # «Проверить обновления»
+                    self.assertEqual(calls[-1], "beta")
+                    self.assertIn("Не удалось связаться с GitHub.", app.status.get())
+                    self.assertIn("Канал обновлений: Бета-версии.", "\n".join(app.log_lines))
+                with patch.object(updater, "enabled", return_value=False):
+                    menu.invoke(3)
+                    self.assertIn("только в установленной программе", app.status.get())
+        finally:
+            root.destroy()
+
     def test_real_tk_journal_window_file_and_infobar_link(self):
         import tkinter as tk
         from tkinter import ttk
@@ -929,8 +1148,23 @@ class ConstructionChecks(unittest.TestCase):
                 self.assertIn("Stopped after HTTP 403", app.log_path.read_text(encoding="utf-8"))
                 app.say("Ошибка", "error")
                 self.assertTrue(app.infobar_more.winfo_manager())  # «Подробнее» opens the journal.
+                self.assertTrue(app.infobar_report.winfo_manager())  # «Копировать отчёт» sits beside it.
+                app.stop_reason = "Stopped after HTTP 403"
+                with patch.dict(os.environ, {"HH_APP_VERSION": "9.9.9"}):
+                    app.infobar_report.invoke()
+                copied = root.clipboard_get()
+                self.assertIn("Версия: 9.9.9", copied)
+                self.assertIn("Сообщение: Ошибка", copied)
+                self.assertIn("Причина: Stopped after HTTP 403", copied)
+                self.assertIn("Причина остановки: Stopped after HTTP 403", copied)
+                self.assertNotIn(temp, copied)
+                self.assertEqual(str(app.infobar_report["text"]), "Скопировано ✓")
+                with patch("webbrowser.open") as browser:
+                    app.report_issue()
+                self.assertIn("Stopped+after+HTTP+403", browser.call_args.args[0])
                 app.say("Готово", "info")
                 self.assertFalse(app.infobar_more.winfo_manager())
+                self.assertFalse(app.infobar_report.winfo_manager())
                 app.infobar_more.invoke()
                 view = app.log_view
                 self.assertIn("Stopped after HTTP 403", view.get("1.0", "end"))
@@ -1286,6 +1520,11 @@ class StepChecks(unittest.TestCase):
             "Preview stopped: empty model response": "пустой ответ",
             "Preview stopped after HTTP 429": "HH ограничил частоту запросов",
             "Stopped after HTTP 403": "Проверь вход в HH",
+            "Stopped after HTTP 404 for GET https://api.hh.ru/resumes/mine": "HH вернул ошибку HTTP 404",
+            "HH не нашёл 3 вакансии подряд (HTTP 404). Запуск остановлен.": "HH не нашёл 3 вакансии подряд",
+            "HH web session is not logged in (HTTP 403 for GET https://hh.ru/applicant/my_resumes); "
+            "log in to HH again (GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry":
+                "Вход в HH на сайте истёк",
             "Send outcome uncertain; connection failed; check HH manually before any retry": "Неизвестно, дошёл ли отклик",
             "Send returned HTTP 409; json_errors=x; check HH manually before any retry": "HH не принял отклик (HTTP 409)",
             "Manual HH captcha failed or cancelled; check HH before retrying": "Капча не введена",
@@ -1301,6 +1540,39 @@ class StepChecks(unittest.TestCase):
                 self.assertIsNone(re.search(r"\b(?:Stopped|stopped|check|retry|failed)\b", text))
         self.assertIn("обновится завтра", readable_reason(
             "Stopped: openrouter.ai: daily limit of free model requests reached (HTTP 429); wait"))
+
+    def test_error_report_names_version_error_and_hides_private_text(self):
+        from gui_steps import ISSUE_URL_LIMIT, ISSUES_URL, REPORT_LINES, error_report, issue_url
+        home = r"C:\Users\Иван"
+        lines = [f"10:00:{n:02d}  строка {n}" for n in range(REPORT_LINES + 5)] + [
+            "15:59:25  Отклонённое письмо: Привет, мой телеграм @ivan",
+            r"15:59:25  ChatMock diagnostic log preserved: c:\users\иван\.local\state\run\x.log",
+            "15:59:26  Path C:/Users/Иван/.local/state",
+            "16:07:52  Причина остановки: Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1",
+        ]
+        report = error_report(lines, version="0.6.2-beta.1", system="Windows 11",
+                              status="Запуск остановлен. HH вернул ошибку HTTP 404.",
+                              reason="Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1", home=home)
+        self.assertIn("Версия: 0.6.2-beta.1", report)
+        self.assertIn("Система: Windows 11", report)
+        self.assertIn("Сообщение: Запуск остановлен. HH вернул ошибку HTTP 404.", report)
+        self.assertIn("Причина: Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1", report)
+        self.assertIn("Отклонённое письмо: [скрыто]", report)
+        self.assertNotIn("@ivan", report)
+        self.assertNotIn("Иван", report)
+        self.assertNotIn("иван", report)
+        self.assertIn(r"~\.local\state\run\x.log", report)
+        self.assertIn("~/.local/state", report)
+        self.assertNotIn("строка 0\n", report)  # Only the journal tail goes in.
+        self.assertEqual(report.count("\n10:00:"), REPORT_LINES - 4)
+        self.assertIn("Версия: из исходников", error_report([], home=None))
+        url = issue_url(report)
+        self.assertTrue(url.startswith(ISSUES_URL + "?"))
+        body = parse_qs(urlsplit(url).query)["body"][0]
+        self.assertIn(report, body)
+        long_url = issue_url("x" * ISSUE_URL_LIMIT)
+        self.assertLessEqual(len(long_url), ISSUE_URL_LIMIT)
+        self.assertIn("Ctrl+V", parse_qs(urlsplit(long_url).query)["body"][0])
 
     def test_rejected_letter_is_logged_with_vacancy_and_text(self):
         from gui_protocol import LETTER_LEVEL_REJECTED
@@ -1577,6 +1849,43 @@ class WizardChecks(unittest.TestCase):
         self.assertEqual(app.finish_action()[0], "Изменить ключ")
         app.stop_reason = "Stopped after HTTP 403"
         self.assertIsNone(app.finish_action())
+
+    def test_a_lost_hh_site_login_offers_to_log_in_again(self):
+        app = gui.Application.__new__(gui.Application)
+        app.sending = False
+        app.stop_reason = ("HH web session is not logged in (HTTP 403 for GET https://hh.ru/applicant/my_resumes); "
+                           "log in to HH again (GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry")
+        data = {"done": None, "success": False, "cancelled": False, "forced": False}
+        message = app.finish_message(data, "chats")
+        self.assertIn("Вход в HH на сайте истёк", message)
+        self.assertNotIn("защитой программы", message)
+        app.show_wizard = Mock()
+        label, command = app.finish_action()
+        self.assertEqual(label, "Войти")
+        command()
+        app.show_wizard.assert_called_once_with("hh", settings=True)
+
+        # The run marks the site login as lost; only a successful HH login clears the mark.
+        app.hh_web_lost = False
+        app.stop_chat_wait = app.close_device_window = app.append_log = app.set_busy = Mock()
+        app.say, app.root, app.next_hint = Mock(), Mock(), Mock(return_value="")
+        app.finish_message, app.finish_severity = Mock(return_value="m"), Mock(return_value="error")
+        with patch("gui.attention"):
+            app.finish_run(SimpleNamespace(action="chats"), data)
+        self.assertTrue(app.hh_web_lost)
+        self.assertEqual(app.say.call_args.kwargs["action"][0], "Войти")
+        app.stop_reason = None
+        with patch("gui_steps.hh_signed_in", return_value=True), patch("gui.attention"):
+            app.finish_run(SimpleNamespace(action="hh_login"), data)
+            self.assertTrue(app.hh_web_lost)
+            app.finish_run(SimpleNamespace(action="hh_login"), data | {"success": True})
+        self.assertFalse(app.hh_web_lost)
+        app.wizard_settings = True
+        app.page_done = Mock(return_value=True)
+        app.hh_web_lost = True
+        self.assertIn("Вход в HH на сайте истёк", app.page_hint("hh"))
+        app.hh_web_lost = False
+        self.assertEqual(app.page_hint("hh"), "Готово. Можно закрыть настройки.")
 
 
 class SearchAllChecks(unittest.TestCase):

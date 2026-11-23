@@ -23,6 +23,8 @@ RETRY_NOTICES = {
                               "Вакансия пропущена, отклик не отправлен."),
     "captcha_skip_api": ("HH принял текст капчи, но снова запросил капчу. "
                          "Вакансия пропущена, отклик не отправлен."),
+    "vacancy_not_found": ("HH не нашёл вакансию (HTTP 404): работодатель её снял или скрыл. "
+                          "Вакансия пропущена, отклик не отправлен."),
 }
 # Fixed reasons of the "letter_rejected" event: the GUI shows no other reason text.
 LETTER_LEVEL_REJECTED = "Письмо упоминает уровень джун/миддл для вакансии без Senior/Lead"

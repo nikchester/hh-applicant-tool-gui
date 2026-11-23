@@ -82,6 +82,7 @@ SEVERITY = {
     "warning": ("#433519", WARNING, "\ue7ba", "!"),
     "error": ("#442726", CRITICAL, "\uea39", "×"),
 }
+UPDATE_CHANNELS = {"stable": "Стабильные версии", "beta": "Бета-версии"}
 REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
 UNKNOWN_RESULT = " Результат последней отправки неизвестен. Проверь отклики на hh.ru, прежде чем запускать снова."
 
@@ -254,6 +255,8 @@ class Application:
         config = tomllib.loads(initialize().read_text(encoding="utf-8"))
         model = config["openai"]["default"]["model"]
         self.signed_hh, self.signed_chatgpt = hh_signed_in(), chatgpt_signed_in()
+        # The API token can outlive the site login that chats need; a run tells us it is gone.
+        self.hh_web_lost = False
         self.load_provider()
         self.model = tk.StringVar(value="" if model == "CHOOSE_AFTER_LOGIN" else model)
         self.search, self.resume = tk.StringVar(), tk.StringVar()
@@ -411,6 +414,8 @@ class Application:
         self.infobar_message = message
         # Errors and warnings link to the journal instead of opening it by themselves (#11).
         self.infobar_more = ttk.Button(self.infobar, text="Подробнее", command=self.open_log)
+        # One click copies a report for an issue or a message to the developer.
+        self.infobar_report = ttk.Button(self.infobar, text="Копировать отчёт", command=self.copy_report)
         # One action for a warning, e.g. «Войти» after a lost login (#5).
         self.infobar_action = ttk.Button(self.infobar)
         self.set_severity("info")
@@ -421,12 +426,13 @@ class Application:
             return
         _background, _icon, glyph, fallback = SEVERITY[level]
         infobar.configure(style=f"{level}.Info.TFrame")
-        more = getattr(self, "infobar_more", None)
-        if more is not None:
+        for button in (getattr(self, "infobar_more", None), getattr(self, "infobar_report", None)):
+            if button is None:
+                continue
             if level in ("error", "warning"):
-                more.pack(side="right", padx=(10, 0))
+                button.pack(side="right", padx=(10, 0))
             else:
-                more.pack_forget()
+                button.pack_forget()
         self.infobar_icon.configure(style=f"{level}.InfoIcon.TLabel", text=glyph if self.icon_font else fallback)
         self.infobar_message.configure(style=f"{level}.Info.TLabel")
 
@@ -658,6 +664,7 @@ class Application:
         )
         for label, command, _locked in self.settings_items:
             if label == "Пройти настройку заново":
+                self.build_update_menu(menu)
                 menu.add_separator()
             menu.add_command(label=label, command=command)
         self.settings_button = ttk.Button(header, text="Настройки ▾", command=self.post_settings_menu)
@@ -665,6 +672,46 @@ class Application:
         self.setup_status = ttk.Label(header, style="PageHint.TLabel", cursor="hand2")
         self.setup_status.pack(side="right", pady=(8, 0))
         self.setup_status.bind("<Button-1>", lambda _e: self.post_settings_menu())
+
+    def build_update_menu(self, menu):
+        """«Обновления ▸»: which releases self-update installs, stable or beta."""
+        self.update_channel = self.tk.StringVar(value=self.current_channel())
+        sub = self.update_menu = self.tk.Menu(menu, tearoff=0, background=CARD, foreground=TEXT,
+                                              activebackground=ACCENT, activeforeground=ON_ACCENT,
+                                              selectcolor=TEXT, borderwidth=0)
+        for channel, label in UPDATE_CHANNELS.items():
+            sub.add_radiobutton(label=label, value=channel, variable=self.update_channel,
+                                command=lambda: self.set_update_channel(self.update_channel.get()))
+        sub.add_separator()
+        sub.add_command(label="Проверить обновления", command=lambda: self.check_updates(manual=True))
+        menu.add_cascade(label="Обновления", menu=sub)
+
+    def current_channel(self):
+        """The saved channel, or the one of the running version: a beta install stays on betas."""
+        import os
+        from gui_profile import read_option
+        from updater import default_channel
+        return read_option("update_channel") or default_channel(os.environ.get("HH_APP_VERSION", ""))
+
+    def set_update_channel(self, channel):
+        import os
+        from gui_profile import save_option
+        from updater import prerelease
+        try:
+            save_option("update_channel", channel)
+        except (OSError, ValueError):
+            self.say("Не удалось сохранить канал обновлений.", "warning")
+            return
+        version = os.environ.get("HH_APP_VERSION", "")
+        note = UPDATE_CHANNELS[channel] + "."
+        if channel == "stable" and prerelease(version):
+            note += (f" Версия {version} останется, пока не выйдет стабильная версия новее: "
+                     "автообновление не откатывает программу назад.")
+        self.append_log("Канал обновлений: " + note)
+        # A release found on the other channel no longer applies.
+        self.update_release = None
+        self.update_button.pack_forget()
+        self.check_updates(manual=True, note="Канал обновлений: " + note)
 
     def post_settings_menu(self):
         button = self.settings_button
@@ -735,6 +782,8 @@ class Application:
         """The InfoBar line for a setup page: what to do on it, or that «Далее» is open."""
         if name == "done":
             return "Нажми «Перейти к откликам»."
+        if name == "hh" and getattr(self, "hh_web_lost", False):
+            return "Вход в HH на сайте истёк. Нажми «Войти в HH» и введи email или телефон, затем код."
         if self.page_done(name):
             return "Шаг выполнен. Нажми «Далее»." if not self.wizard_settings else "Готово. Можно закрыть настройки."
         return {"hh": "Нажми «Войти в HH» и введи email или телефон, затем код.",
@@ -1101,8 +1150,10 @@ class Application:
             return
         from gui_steps import blocker, parse_auto_settings
         progress = self.progress_state()
-        self.hh_state.configure(text="✓ вход выполнен" if progress.hh else "вход не выполнен",
-                                style="Done.TLabel" if progress.hh else "Hint.TLabel")
+        web_lost = progress.hh and getattr(self, "hh_web_lost", False)
+        self.hh_state.configure(text="вход на сайте истёк" if web_lost
+                                else "✓ вход выполнен" if progress.hh else "вход не выполнен",
+                                style="Done.TLabel" if progress.hh and not web_lost else "Hint.TLabel")
         chatmock = self.provider.kind == "chatmock"
         if chatmock:
             self.chatgpt_button.grid()
@@ -1183,6 +1234,123 @@ class Application:
             except self.tk.TclError:
                 self.log_view = None
 
+    def error_report(self):
+        """The report text: version, system, the InfoBar message, the stop reason and the journal tail."""
+        import os
+        import platform
+        from pathlib import Path
+        from gui_steps import error_report
+        status = getattr(self, "last_failure", None)
+        if not status and getattr(self, "status", None) is not None:
+            status = self.status.get()
+        return error_report(getattr(self, "log_lines", []), version=os.environ.get("HH_APP_VERSION"),
+                            system=f"{platform.system()} {platform.release()} ({platform.version()})",
+                            status=status, reason=getattr(self, "stop_reason", None), home=Path.home())
+
+    def copy_report(self, button=None):
+        """Put the error report on the clipboard; the button says so for two seconds."""
+        self.root.clipboard_clear()
+        self.root.clipboard_append(self.error_report())
+        self.flash(button or getattr(self, "infobar_report", None))
+
+    def flash(self, button, text="Скопировано ✓"):
+        """Say «done» on the button for two seconds."""
+        if button is None or button.cget("text") == text:
+            return
+        original = button.cget("text")
+        button.configure(text=text)
+
+        def restore():
+            try:
+                button.configure(text=original)
+            except self.tk.TclError:
+                pass  # The window closed meanwhile.
+        self.root.after(2000, restore)
+
+    def copy_all_logs(self, button=None):
+        """Every log as one ZIP file on the clipboard; Ctrl+V attaches it in a messenger or a mail.
+
+        Without the file clipboard the same logs go as text, cut to a size a message takes.
+        """
+        from pathlib import Path
+        import log_bundle
+        report, home = self.error_report(), Path.home()
+        if button is not None:
+            button.configure(state="disabled")
+
+        def work():
+            path = log_bundle.copy_zip(report, home=home)
+            log_bundle.copy_file_to_clipboard(path)
+            return path
+
+        def done(path, error):
+            if button is not None:
+                try:
+                    button.configure(state="normal")
+                except self.tk.TclError:
+                    pass  # The journal window closed meanwhile.
+            if error is None:
+                self.flash(button)
+                self.say(f"Архив со всеми логами скопирован в буфер обмена ({path.name}, "
+                         f"{max(1, path.stat().st_size // 1024)} КБ). Вставь его (Ctrl+V) в сообщение "
+                         "разработчику, в письмо или в папку.", "success")
+                self.append_log("Логи скопированы в буфер обмена как файл: " + str(path))
+                return
+            text = log_bundle.clipboard_text(report, home=home)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(text)
+            self.flash(button)
+            self.say(f"Не удалось скопировать архив, поэтому логи скопированы текстом "
+                     f"({max(1, len(text.encode('utf-8')) // 1024)} КБ). Чтобы передать всё, "
+                     "сохрани логи в файл.", "warning")
+        self.run_in_background(work, done)
+
+    def ask_log_path(self):
+        """Where to save the log ZIP: the desktop by default."""
+        from pathlib import Path
+        from tkinter import filedialog
+        from log_bundle import default_name
+        desktop = Path.home() / "Desktop"
+        return filedialog.asksaveasfilename(
+            parent=getattr(self, "log_window", None) or self.root, title="Сохранить логи",
+            initialdir=str(desktop if desktop.is_dir() else Path.home()), initialfile=default_name(),
+            defaultextension=".zip", filetypes=[("ZIP-архив", "*.zip")])
+
+    def save_all_logs(self):
+        """Write the report and every log into one ZIP file the person can send."""
+        import subprocess
+        from pathlib import Path
+        from log_bundle import write_zip
+        target = self.ask_log_path()
+        if not target:
+            return
+        target = Path(target)
+        try:
+            written, left_out = write_zip(target, self.error_report(), home=Path.home())
+        except OSError:
+            self.say("Не удалось сохранить логи в " + str(target) + ". Выбери другую папку.", "warning")
+            return
+        note = f" Не вошли: {len(left_out)} (слишком много данных)." if left_out else ""
+        self.say(f"Логи сохранены: {target} (файлов логов: {written}).{note} Отправь этот файл разработчику "
+                 "или перетащи его в issue на GitHub.", "success")
+        self.append_log("Логи сохранены в файл: " + str(target))
+        try:
+            subprocess.Popen(["explorer", "/select,", str(target)])  # Show the file to drag it into a chat.
+        except OSError:
+            pass
+
+    def report_issue(self):
+        """Copy the report and open a GitHub issue with it; the person reviews it before sending."""
+        import webbrowser
+        from gui_steps import issue_url
+        report = self.error_report()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(report)
+        try:
+            webbrowser.open(issue_url(report))
+        except Exception:  # No browser: the clipboard still holds the report.
+            self.say("Не удалось открыть браузер. Отчёт скопирован: вставь его в issue на GitHub.", "warning")
+
     def open_log(self):
         """The technical journal in its own window, away from the work view (#11)."""
         tk, ttk = self.tk, self.ttk
@@ -1193,15 +1361,19 @@ class Application:
             return
         window = self.log_window = tk.Toplevel(self.root, background=CARD)
         window.title("Журнал")
-        window.geometry("860x480")
+        window.geometry("1000x560")
         window.transient(self.root)
         dark_title_bar(window)
         frame = ttk.Frame(window, padding=14)
         frame.pack(fill="both", expand=True)
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
-        ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой.",
-                  style="Hint.TLabel").grid(row=0, column=0, sticky="w", pady=(0, 6))
+        ttk.Label(frame, text="Технические подробности запусков. Они нужны, чтобы разобрать сбой. "
+                  "«Копировать отчёт» берёт версию, ошибку и конец журнала. «Копировать все логи» кладёт "
+                  "в буфер обмена ZIP-архив со всеми логами: вставь его (Ctrl+V) в сообщение или письмо. "
+                  "«Сохранить логи в файл…» сохраняет тот же архив на диск. Тексты писем, ключи и имя "
+                  "пользователя Windows в логах скрыты.",
+                  style="Hint.TLabel", wraplength=960, justify="left").grid(row=0, column=0, sticky="w", pady=(0, 6))
         box, view = self.text_box(frame, 18)
         box.grid(row=1, column=0, sticky="nsew")
         view.configure(font=("Consolas", 9))
@@ -1209,12 +1381,9 @@ class Application:
         view.see("end")
         self.log_view = view
         buttons = ttk.Frame(frame)
-        buttons.grid(row=2, column=0, sticky="w", pady=(10, 0))
-
-        def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append("\n".join(self.log_lines))
-            self.say("Журнал скопирован в буфер обмена.")
+        buttons.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        logs = ttk.Frame(frame)
+        logs.grid(row=3, column=0, sticky="w", pady=(6, 0))
 
         def folder():
             import os
@@ -1228,9 +1397,18 @@ class Application:
         def close():
             self.log_view = self.log_window = None
             window.destroy()
-        ttk.Button(buttons, text="Скопировать всё", command=copy).pack(side="left")
-        ttk.Button(buttons, text="Открыть папку с журналом", command=folder).pack(side="left", padx=6)
-        ttk.Button(buttons, text="Закрыть", command=close).pack(side="left")
+        # Row 1: a short report for an issue. Row 2: every log, for the clipboard or as a file.
+        report = ttk.Button(buttons, text="Копировать отчёт", style="Accent.TButton")
+        report.configure(command=lambda: self.copy_report(report))
+        report.pack(side="left")
+        ttk.Button(buttons, text="Сообщить на GitHub", command=self.report_issue).pack(side="left", padx=(6, 0))
+        ttk.Button(buttons, text="Закрыть", command=close).pack(side="right")
+        every = self.log_copy_button = ttk.Button(logs, text="Копировать все логи")
+        every.configure(command=lambda: self.copy_all_logs(every))
+        every.pack(side="left")
+        self.log_save_button = ttk.Button(logs, text="Сохранить логи в файл…", command=self.save_all_logs)
+        self.log_save_button.pack(side="left", padx=(6, 0))
+        ttk.Button(logs, text="Открыть папку с журналом", command=folder).pack(side="left", padx=(6, 0))
         window.protocol("WM_DELETE_WINDOW", close)
 
     def set_busy(self, running):
@@ -1629,11 +1807,24 @@ class Application:
                 done(box.get("result"), box.get("error"))
         self.root.after(200, wait)
 
-    def check_updates(self):
+    def check_updates(self, manual=False, note=""):
+        """Look for a release on the chosen channel: by timer, or at once from the «Обновления» menu."""
         import updater
-        self.root.after(self.UPDATE_INTERVAL_MS, self.check_updates)
-        if not updater.enabled() or self.update_release is not None:
+        if not manual:
+            self.root.after(self.UPDATE_INTERVAL_MS, self.check_updates)
+        prefix = note + " " if note else ""
+        if not updater.enabled():
+            if manual:
+                self.say(prefix + "Автообновление работает только в установленной программе.", "info")
             return
+        if self.update_release is not None:
+            if manual:
+                self.say(prefix + "Доступна версия " + self.update_release["version"]
+                         + ". Нажми «Обновить» справа вверху.")
+            return
+        channel = self.current_channel()
+        if manual:
+            self.say(prefix + "Проверяю обновления…")
 
         def done(release, error):
             if error is None and release is not None:
@@ -1641,7 +1832,14 @@ class Application:
                 self.update_button.configure(text="Обновить до " + release["version"])
                 self.update_button.pack(side="right", padx=(0, 12))
                 self.append_log("Доступна версия " + release["version"] + ". Кнопка «Обновить» — справа вверху.")
-        self.run_in_background(updater.check, done)
+                if manual:
+                    self.say(prefix + "Доступна версия " + release["version"] + ". Нажми «Обновить» справа вверху.")
+            elif manual and error is not None:
+                message = str(error) if isinstance(error, updater.UpdateError) else "Проверка не удалась."
+                self.say(prefix + message, "warning")
+            elif manual:
+                self.say(prefix + "Обновлений нет: стоит последняя версия канала.", "success")
+        self.run_in_background(lambda: updater.check(channel=channel), done)
 
     def apply_update(self):
         import updater
@@ -2303,10 +2501,15 @@ class Application:
             self.root.after_cancel(job)
 
     def finish_action(self):
-        """One InfoBar button after a failed run: a provider that rejected the key leads to the key (#5)."""
+        """One InfoBar button after a failed run: a provider that rejected the key leads to the key (#5),
+        a lost HH site login leads to the HH login page."""
         import re
-        if re.search(r": HTTP 40[13]; check the API key", getattr(self, "stop_reason", None) or ""):
+        from gui_steps import web_login_lost
+        reason = getattr(self, "stop_reason", None) or ""
+        if re.search(r": HTTP 40[13]; check the API key", reason):
             return ("Изменить ключ", self.edit_provider)
+        if web_login_lost(reason):
+            return ("Войти", lambda: self.show_wizard("hh", settings=True))
         return None
 
     def finish_message(self, data, action=None):
@@ -2365,14 +2568,18 @@ class Application:
         return "error"
 
     def finish_run(self, session, data):
-        from gui_steps import chatgpt_signed_in, hh_signed_in
+        from gui_steps import chatgpt_signed_in, hh_signed_in, web_login_lost
         self.stop_chat_wait()
         self.close_device_window()
         if session.action == "hh_login":
             self.signed_hh = hh_signed_in()
+            if data["success"]:
+                self.hh_web_lost = False
         elif session.action == "chatgpt_login":
             self.signed_chatgpt = chatgpt_signed_in()
             self.load_provider()
+        if web_login_lost(getattr(self, "stop_reason", None)):
+            self.hh_web_lost = True
         message = self.finish_message(data, session.action)
         self.append_log(message)
         self.sending = False
@@ -2381,6 +2588,8 @@ class Application:
         if data["success"] and session.action not in REVIEW_ACTIONS:
             message += " Дальше: " + self.next_hint()
         severity = self.finish_severity(data, session.action)
+        # The report quotes this run's result even after the InfoBar shows something else.
+        self.last_failure = message if severity in ("error", "warning") else None
         self.say(message, severity, action=None if data["success"] else self.finish_action())
         if needs_attention(severity, session.action):
             attention(self.root, severity)

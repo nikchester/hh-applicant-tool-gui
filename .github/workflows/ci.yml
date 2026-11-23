@@ -55,7 +55,7 @@ jobs:
           if ($failed) { throw "Failed offline suites: $($failed -join ', ')" }
       - name: Run offline GUI boundary tests
         run: python windows/check_gui.py
-      - name: Run offline console-free launcher tests (disposable WSH fixtures)
+      - name: Run offline source launcher tests (disposable cmd.exe fixtures)
         run: python -B windows/check_launcher.py
       - name: Run offline exclusive ChatMock auth tests (synthetic fixtures only)
         run: python -B windows/check_gui_auth.py
