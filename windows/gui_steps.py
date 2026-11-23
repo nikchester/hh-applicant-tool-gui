@@ -219,3 +219,55 @@ def readable_reason(reason):
         if match := re.search(pattern, reason):
             return render(match, reason)
     return "Запуск остановлен защитой программы."
+
+
+# Error report: one click copies what a developer needs, ready for a GitHub issue or a message.
+ISSUES_URL = "https://github.com/nikchester/hh-applicant-tool-gui/issues/new"
+REPORT_LINES = 60
+# Browsers and GitHub reject very long URLs; a longer report goes through the clipboard only.
+ISSUE_URL_LIMIT = 7000
+_PRIVATE_LINES = ("Отклонённое письмо: ",)
+
+
+def error_report(lines, *, version=None, system=None, status=None, reason=None, home=None):
+    """Plain text for an issue: version, system, the message on screen, the internal reason, the journal tail.
+
+    The report may go to a public issue, so the home folder becomes ~ and letter texts are hidden.
+    """
+    import re
+    tail = []
+    for line in list(lines or [])[-REPORT_LINES:]:
+        for prefix in _PRIVATE_LINES:
+            at = line.find(prefix)
+            if at >= 0:
+                line = line[:at + len(prefix)] + "[скрыто]"
+        tail.append(line)
+    parts = [
+        "Автоотклики HH — отчёт об ошибке",
+        "Версия: " + (version or "из исходников"),
+        "Система: " + (system or "неизвестна"),
+    ]
+    if status:
+        parts.append("Сообщение: " + status)
+    if reason:
+        parts.append("Причина: " + reason)
+    parts += ["", f"Журнал (последние {len(tail)} строк):", *tail]
+    text = "\n".join(parts)
+    if home:
+        # Paths name the Windows user: show them as ~ in both slash styles.
+        for variant in {str(home), str(home).replace("\\", "/")}:
+            if len(variant) > 3:
+                text = re.sub(re.escape(variant), "~", text, flags=re.IGNORECASE)
+    return text
+
+
+def issue_url(report, title="Ошибка в приложении"):
+    """A GitHub «New issue» link with the report inside, or with a paste hint when the report is too long."""
+    from urllib.parse import urlencode
+    body = "Что я делал(а):\n\n\n```\n" + report + "\n```\n"
+    url = ISSUES_URL + "?" + urlencode({"title": title, "body": body})
+    if len(url) <= ISSUE_URL_LIMIT:
+        return url
+    return ISSUES_URL + "?" + urlencode({
+        "title": title,
+        "body": "Что я делал(а):\n\n\nОтчёт об ошибке (вставь из буфера обмена, Ctrl+V):\n\n"})

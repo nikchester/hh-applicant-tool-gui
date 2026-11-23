@@ -920,8 +920,23 @@ class ConstructionChecks(unittest.TestCase):
                 self.assertIn("Stopped after HTTP 403", app.log_path.read_text(encoding="utf-8"))
                 app.say("Ошибка", "error")
                 self.assertTrue(app.infobar_more.winfo_manager())  # «Подробнее» opens the journal.
+                self.assertTrue(app.infobar_report.winfo_manager())  # «Копировать отчёт» sits beside it.
+                app.stop_reason = "Stopped after HTTP 403"
+                with patch.dict(os.environ, {"HH_APP_VERSION": "9.9.9"}):
+                    app.infobar_report.invoke()
+                copied = root.clipboard_get()
+                self.assertIn("Версия: 9.9.9", copied)
+                self.assertIn("Сообщение: Ошибка", copied)
+                self.assertIn("Причина: Stopped after HTTP 403", copied)
+                self.assertIn("Причина остановки: Stopped after HTTP 403", copied)
+                self.assertNotIn(temp, copied)
+                self.assertEqual(str(app.infobar_report["text"]), "Скопировано ✓")
+                with patch("webbrowser.open") as browser:
+                    app.report_issue()
+                self.assertIn("Stopped+after+HTTP+403", browser.call_args.args[0])
                 app.say("Готово", "info")
                 self.assertFalse(app.infobar_more.winfo_manager())
+                self.assertFalse(app.infobar_report.winfo_manager())
                 app.infobar_more.invoke()
                 view = app.log_view
                 self.assertIn("Stopped after HTTP 403", view.get("1.0", "end"))
@@ -1176,6 +1191,8 @@ class StepChecks(unittest.TestCase):
             "Preview stopped: empty model response": "пустой ответ",
             "Preview stopped after HTTP 429": "HH ограничил частоту запросов",
             "Stopped after HTTP 403": "Проверь вход в HH",
+            "Stopped after HTTP 404 for GET https://api.hh.ru/resumes/mine": "HH вернул ошибку HTTP 404",
+            "HH не нашёл 3 вакансии подряд (HTTP 404). Запуск остановлен.": "HH не нашёл 3 вакансии подряд",
             "HH web session is not logged in (HTTP 403 for GET https://hh.ru/applicant/my_resumes); "
             "log in to HH again (GUI: Settings > HH account; CLI: windows/hh-authorize.ps1), then retry":
                 "Вход в HH на сайте истёк",
@@ -1194,6 +1211,39 @@ class StepChecks(unittest.TestCase):
                 self.assertIsNone(re.search(r"\b(?:Stopped|stopped|check|retry|failed)\b", text))
         self.assertIn("обновится завтра", readable_reason(
             "Stopped: openrouter.ai: daily limit of free model requests reached (HTTP 429); wait"))
+
+    def test_error_report_names_version_error_and_hides_private_text(self):
+        from gui_steps import ISSUE_URL_LIMIT, ISSUES_URL, REPORT_LINES, error_report, issue_url
+        home = r"C:\Users\Иван"
+        lines = [f"10:00:{n:02d}  строка {n}" for n in range(REPORT_LINES + 5)] + [
+            "15:59:25  Отклонённое письмо: Привет, мой телеграм @ivan",
+            r"15:59:25  ChatMock diagnostic log preserved: c:\users\иван\.local\state\run\x.log",
+            "15:59:26  Path C:/Users/Иван/.local/state",
+            "16:07:52  Причина остановки: Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1",
+        ]
+        report = error_report(lines, version="0.6.2-beta.1", system="Windows 11",
+                              status="Запуск остановлен. HH вернул ошибку HTTP 404.",
+                              reason="Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1", home=home)
+        self.assertIn("Версия: 0.6.2-beta.1", report)
+        self.assertIn("Система: Windows 11", report)
+        self.assertIn("Сообщение: Запуск остановлен. HH вернул ошибку HTTP 404.", report)
+        self.assertIn("Причина: Stopped after HTTP 404 for GET https://api.hh.ru/vacancies/1", report)
+        self.assertIn("Отклонённое письмо: [скрыто]", report)
+        self.assertNotIn("@ivan", report)
+        self.assertNotIn("Иван", report)
+        self.assertNotIn("иван", report)
+        self.assertIn(r"~\.local\state\run\x.log", report)
+        self.assertIn("~/.local/state", report)
+        self.assertNotIn("строка 0\n", report)  # Only the journal tail goes in.
+        self.assertEqual(report.count("\n10:00:"), REPORT_LINES - 4)
+        self.assertIn("Версия: из исходников", error_report([], home=None))
+        url = issue_url(report)
+        self.assertTrue(url.startswith(ISSUES_URL + "?"))
+        body = parse_qs(urlsplit(url).query)["body"][0]
+        self.assertIn(report, body)
+        long_url = issue_url("x" * ISSUE_URL_LIMIT)
+        self.assertLessEqual(len(long_url), ISSUE_URL_LIMIT)
+        self.assertIn("Ctrl+V", parse_qs(urlsplit(long_url).query)["body"][0])
 
     def test_rejected_letter_is_logged_with_vacancy_and_text(self):
         from gui_protocol import LETTER_LEVEL_REJECTED
