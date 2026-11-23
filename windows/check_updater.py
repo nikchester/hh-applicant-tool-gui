@@ -76,9 +76,14 @@ class Release:
                                "installer": describe("setup.exe", self.installer)}).encode()
         self.files["update.json"] = metadata
         self.files["update.json.sig"] = base64.b64encode(key.sign(metadata))
-        self.host, self.requests = host, []
+        self.host, self.requests, self.urls = host, [], []
+        # The GitHub release list for the beta channel: tag names, newest anywhere in the list.
+        self.listing, self.listing_host = [{"tag_name": "v" + version}], "api.github.com"
 
     def open(self, request, timeout):
+        self.urls.append(request.full_url)
+        if request.full_url == updater.RELEASES:
+            return FakeResponse(json.dumps(self.listing).encode(), f"https://{self.listing_host}/repos/x")
         name = request.full_url.rsplit("/", 1)[-1]
         self.requests.append(name)
         if name not in self.files:
@@ -114,14 +119,73 @@ class UpdaterChecks(unittest.TestCase):
                 self.assertIsNone(updater.VERSION.match(bad))
         beta = Release(self.key, version="9.9.9-beta.1")
         self.assertIsNone(updater.check(opener=beta.open, public_key=self.public))  # Running 1.0.0.
+        self.assertNotIn(updater.RELEASES, beta.urls)  # The stable channel reads only "latest".
         with patch.dict(os.environ, {"HH_APP_VERSION": "1.0.0-beta.1"}):
             self.assertEqual(updater.current(), ("1.0.0-beta.1", RUNTIME))  # A beta keeps self-update.
-            found = updater.check(opener=Release(self.key, version="1.0.0").open, public_key=self.public)
+            found = updater.check(opener=Release(self.key, version="1.0.0").open, public_key=self.public,
+                                  channel="stable")
             self.assertEqual(found["version"], "1.0.0")  # The release replaces its beta.
-            later = updater.check(opener=Release(self.key, version="1.0.0-beta.2").open, public_key=self.public)
-            self.assertEqual(later["version"], "1.0.0-beta.2")
+            # A beta install switched to stable gets no beta and no downgrade.
+            self.assertIsNone(updater.check(opener=Release(self.key, version="1.0.0-beta.2").open,
+                                            public_key=self.public, channel="stable"))
             self.assertIsNone(updater.check(opener=Release(self.key, version="0.9.9").open,
-                                            public_key=self.public))
+                                            public_key=self.public, channel="stable"))
+
+    def test_beta_channel_takes_the_newest_release_from_the_list(self):
+        release = Release(self.key, version="1.1.0-beta.1")
+        release.listing = [{"tag_name": "v1.0.0"}, {"tag_name": "v1.1.0-beta.1"},
+                           {"tag_name": "v2.0.0", "draft": True}, {"tag_name": "junk"},
+                           {"tag_name": "v1.1.0-rc.1"}, {"tag_name": 5}, "x", {"tag_name": "v0.9.0"}]
+        found = updater.check(opener=release.open, public_key=self.public, channel="beta")
+        self.assertEqual(found["version"], "1.1.0-beta.1")
+        base = updater.DOWNLOAD + "v1.1.0-beta.1/"
+        self.assertEqual(found["base"], base)
+        self.assertEqual(release.urls, [updater.RELEASES, base + "update.json", base + "update.json.sig"])
+        # The code comes from the same release, not from "latest".
+        with tempfile.TemporaryDirectory() as root:
+            updater.install_code(found, opener=release.open, root=root)
+        self.assertEqual(release.urls[-1], base + "app-code.zip")
+        # A stable release newer than the running one is offered on the beta channel too.
+        stable = Release(self.key, version="1.2.0")
+        stable.listing = [{"tag_name": "v1.1.0-beta.1"}, {"tag_name": "v1.2.0"}]
+        self.assertEqual(updater.check(opener=stable.open, public_key=self.public, channel="beta")["version"],
+                         "1.2.0")
+
+    def test_beta_channel_without_a_newer_release_downloads_nothing(self):
+        for listing in ([{"tag_name": "v1.0.0"}], [{"tag_name": "v1.0.0-beta.3"}], []):
+            with self.subTest(listing=listing):
+                release = Release(self.key)
+                release.listing = listing
+                self.assertIsNone(updater.check(opener=release.open, public_key=self.public, channel="beta"))
+                self.assertEqual(release.urls, [updater.RELEASES])
+
+    def test_beta_install_without_a_choice_follows_betas(self):
+        self.assertEqual(updater.default_channel("1.0.0-beta.1"), "beta")
+        self.assertEqual(updater.default_channel("1.0.0"), "stable")
+        with patch.dict(os.environ, {"HH_APP_VERSION": "1.0.0-beta.1"}):
+            release = Release(self.key, version="1.0.0-beta.2")
+            self.assertEqual(updater.check(opener=release.open, public_key=self.public)["version"],
+                             "1.0.0-beta.2")
+            self.assertEqual(release.urls[0], updater.RELEASES)
+
+    def test_beta_channel_rejects_a_list_that_disagrees_with_the_signed_text(self):
+        release = Release(self.key, version="9.9.9")
+        release.listing = [{"tag_name": "v5.0.0-beta.1"}]
+        with self.assertRaisesRegex(updater.UpdateError, "не совпало"):
+            updater.check(opener=release.open, public_key=self.public, channel="beta")
+        release.listing_host = "evil.example"
+        with self.assertRaisesRegex(updater.UpdateError, "не с GitHub"):
+            updater.check(opener=release.open, public_key=self.public, channel="beta")
+        release = Release(self.key)
+        release.listing = {"message": "rate limited"}
+        with self.assertRaisesRegex(updater.UpdateError, "повреждён"):
+            updater.check(opener=release.open, public_key=self.public, channel="beta")
+        with self.assertRaisesRegex(updater.UpdateError, "канал"):
+            updater.check(opener=release.open, public_key=self.public, channel="nightly")
+        metadata = updater.parse(release.files["update.json"]) | {"base": "https://github.com/other/repo/"}
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaisesRegex(updater.UpdateError, "Неверный адрес"):
+                updater.install_code(metadata, opener=release.open, root=root)
 
     def test_foreign_signature_is_rejected(self):
         release = Release(Ed25519PrivateKey.generate())
