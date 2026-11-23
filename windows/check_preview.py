@@ -1,7 +1,8 @@
 """Offline tests for the HH preview network and prompt boundaries."""
 
+import json
 import unittest
-from contextlib import nullcontext, redirect_stdout
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from io import StringIO
 import os
 from pathlib import Path
@@ -16,8 +17,34 @@ from hh_applicant_tool.operations.apply_vacancies import Operation
 from preview import arguments
 from preview_hh import (allowed_request, check_letter_language, check_letter_level,
                         enrich_prompt, letter_kwargs, run, vacancy_is_english)
+import vacancy_filters
+from vacancy_filters import DEFAULTS, Filters
 from vacancy_level import senior_title_reason
 from vacancy_salary import salary_rejection_reason
+
+# The arguments of the HH search before vacancy filters existed (#15): the defaults must repeat them.
+LEGACY_SEARCH_ARGUMENTS = [
+    "--work-format", "REMOTE", "--currency", "RUR", "--salary", "80000",
+    "--no-only-with-salary", "--search-field", "name", "--order-by", "publication_time",
+]
+LEGACY_PREVIEW_ARGUMENTS = [
+    "--config-dir", "config", "--profile-id", ".", "--no-handle-captcha",
+    "apply", "--dry-run", "--no-send-email", "--no-ai-filter", "--no-skip-tests",
+    "--per-page", "10", "--total-pages", "1", "--max-responses", "1",
+] + LEGACY_SEARCH_ARGUMENTS + ["--resume-id=resume", "--search=Linux"]
+
+
+@contextmanager
+def saved_filters(data=None, raw=None):
+    """A disposable filters.json chosen through the variable the GUI sets for its worker."""
+    with tempfile.TemporaryDirectory() as temp:
+        path = Path(temp) / "filters.json"
+        if raw is not None:
+            path.write_text(raw, encoding="utf-8")
+        elif data is not None:
+            path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+        with patch.dict(os.environ, {"HH_APPLICANT_TOOL_FILTERS_FILE": str(path)}):
+            yield path
 
 
 class PreviewTests(unittest.TestCase):
@@ -302,6 +329,251 @@ class PreviewTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "английском"):
             check_letter_language("Hi! Пишу по поводу вакансии. Let's discuss the role.", english)
         check_letter_language("Привет! Я работаю с Linux и автоматизацией.", russian)
+
+
+CARD = {"id": "1", "name": "DevOps-инженер", "employer": {"id": "1740", "name": "Пример-Софт"},
+        "experience": {"id": "between1And3", "name": "От 1 года до 3 лет"},
+        "salary": {"from": 100000, "currency": "RUR"}}
+
+
+class VacancyFilterChecks(unittest.TestCase):
+    """#15: the saved filters file, the HH search arguments and the local skip rules."""
+
+    def test_defaults_repeat_the_arguments_from_before_filters_existed(self):
+        self.assertEqual(vacancy_filters.search_arguments(DEFAULTS), LEGACY_SEARCH_ARGUMENTS)
+        with saved_filters():  # No file: defaults.
+            self.assertEqual(arguments("config", "resume", "Linux"), LEGACY_PREVIEW_ARGUMENTS)
+            self.assertEqual(arguments("config", "resume", ""), LEGACY_PREVIEW_ARGUMENTS[:-1])
+        with saved_filters(DEFAULTS.data()):  # A file with the defaults changes nothing either.
+            self.assertEqual(arguments("config", "resume", "Linux"), LEGACY_PREVIEW_ARGUMENTS)
+
+    def test_search_arguments_follow_the_saved_filters_and_parse_upstream(self):
+        from hh_applicant_tool.tool import HHApplicantTool
+        data = {"salary_minimum": 120000, "only_with_salary": True, "period": 7,
+                "not_from_agency": True, "accredited_it": True}
+        with saved_filters(data):
+            argv = arguments("config", "resume", "Linux")
+            filters = vacancy_filters.load()
+        self.assertEqual(argv[argv.index("--salary") + 1], "120000")
+        self.assertIn("--only-with-salary", argv)
+        self.assertEqual(argv[argv.index("--period") + 1], "7")
+        self.assertEqual(argv[argv.index("--label") + 1:argv.index("--label") + 3],
+                         ["not_from_agency", "accredited_it"])
+        args = HHApplicantTool._create_parser().parse_args(argv)
+        self.assertEqual((args.salary, args.only_with_salary, args.period, args.label),
+                         (120000, True, 7, ["not_from_agency", "accredited_it"]))
+        self.assertTrue(vacancy_filters.search_matches(args, filters))
+        # The same argv no longer matches once a filter changes.
+        self.assertFalse(vacancy_filters.search_matches(args, Filters(**{**filters.__dict__, "period": 3})))
+        self.assertFalse(vacancy_filters.search_matches(args, DEFAULTS))
+
+    def test_the_file_is_checked_strictly(self):
+        good = DEFAULTS.data()
+        bad = {
+            "unknown key": {"stop_word": []},
+            "minimum as text": {"salary_minimum": "80000"},
+            "minimum as boolean": {"salary_minimum": True},
+            "negative minimum": {"salary_minimum": -1},
+            "ceiling below minimum": {"salary_minimum": 100000, "salary_ceiling": 90000},
+            "flag as number": {"only_with_salary": 1},
+            "experience outside the dictionary": {"experience": ["noExperience", "senior"]},
+            "experience empty": {"experience": []},
+            "experience repeated": {"experience": ["noExperience", "noExperience"]},
+            "period outside the dictionary": {"period": 5},
+            "period as text": {"period": "7"},
+            "stop words as text": {"stop_words": "1С"},
+            "empty stop word": {"stop_words": ["  "]},
+            "stop word without letters": {"stop_words": ["..."]},
+            "stop words repeat": {"stop_words": ["1С", "1с"]},
+            "employer id not digits": {"hidden_employers": [{"id": "17a0", "name": ""}]},
+            "employer id a link": {"hidden_employers": [{"id": "hh.ru/employer/1740", "name": ""}]},
+            "employer id as number": {"hidden_employers": [{"id": 1740, "name": ""}]},
+            "employer extra field": {"hidden_employers": [{"id": "1740", "name": "", "x": 1}]},
+            "employers repeat": {"hidden_employers": [{"id": "1", "name": ""}, {"id": "1", "name": "x"}]},
+        }
+        for title, change in bad.items():
+            with self.subTest(title), saved_filters(good | change):
+                with self.assertRaisesRegex(SystemExit, "Фильтры вакансий.*Ничего не отправлено"):
+                    vacancy_filters.load()
+        for raw in ("{", "[]", "null", '{"salary_minimum": NaN}', "\xff"):
+            with self.subTest(raw=raw), saved_filters(raw=raw):
+                with self.assertRaisesRegex(SystemExit, "Фильтры вакансий.*Ничего не отправлено"):
+                    vacancy_filters.load()
+        with saved_filters(good | {"salary_ceiling": None, "period": 30, "experience": ["moreThan6"],
+                                   "hidden_employers": [{"id": "1740", "name": "Пример-Софт"}]}):
+            filters = vacancy_filters.load()
+        self.assertEqual((filters.salary_ceiling, filters.period, filters.experience),
+                         (None, 30, ("moreThan6",)))
+        # A partial file keeps the defaults for the missing keys.
+        with saved_filters({"stop_words": ["1С"]}):
+            self.assertEqual(vacancy_filters.load(), Filters(stop_words=("1С",)))
+
+    def test_a_damaged_file_stops_a_preview_before_any_request(self):
+        with saved_filters(raw="{"), patch("requests.sessions.Session.send", side_effect=AssertionError("No network")):
+            with self.assertRaisesRegex(SystemExit, "Фильтры вакансий"):
+                arguments("config", "resume", "Linux")
+
+    def test_saved_file_round_trips(self):
+        filters = Filters(salary_minimum=90000, salary_ceiling=None, only_with_salary=True,
+                          exclude_senior=False, experience=("noExperience", "between1And3"),
+                          stop_words=("1С", "дружный коллектив"), period=3, accredited_it=True,
+                          hidden_employers=({"id": "1740", "name": "Пример-Софт"},))
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            path = Path(temp) / "state" / "filters.json"
+            vacancy_filters.save(filters, path)
+            self.assertEqual(vacancy_filters.read(path), filters)
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")), filters.data())
+        self.assertEqual(vacancy_filters.parse(DEFAULTS.data()), DEFAULTS)
+
+    def test_stop_words_are_whole_words_and_phrases_without_case(self):
+        words = ("1С", "Bitrix", "дружный коллектив", "C++", "ёлка")
+        for text, found in (
+            ("Программист 1С", "1С"), ("программист 1с-разработчик", "1С"), ("BITRIX разработчик", "Bitrix"),
+            ("Ищем в Дружный  коллектив", "дружный коллектив"), ("C++ developer", "C++"),
+            ("Ёлка", "ёлка"), ("ЕЛКА", "ёлка"),
+        ):
+            with self.subTest(text):
+                self.assertEqual(vacancy_filters.stop_word_in(text, words), found)
+        for text in ("Инженер 1СО", "Bitrixa", "Недружный коллектив", "дружный  и коллектив",
+                     "C+", "", None):
+            with self.subTest(text):
+                self.assertIsNone(vacancy_filters.stop_word_in(text, words))
+        # No regular expressions: a dot or a star is an ordinary character.
+        self.assertIsNone(vacancy_filters.stop_word_in("Linux", ("L.nux",)))
+        self.assertIsNone(vacancy_filters.stop_word_in("Linux", (".*",)))
+        self.assertEqual(vacancy_filters.stop_word_in("Node.js", ("node.js",)), "node.js")
+
+    def test_each_local_rule_gives_its_reason(self):
+        def reason(vacancy=None, **filters):
+            return vacancy_filters.check(CARD | (vacancy or {}), Filters(**filters))
+
+        self.assertEqual(reason(), (None, []))
+        self.assertIn("уровень выше", reason({"name": "Senior DevOps"})[0])
+        self.assertIsNone(reason({"name": "Senior DevOps"}, exclude_senior=False)[0])
+        self.assertEqual(reason(hidden_employers=({"id": "1740", "name": ""},))[0], "компания скрыта")
+        self.assertIsNone(reason(hidden_employers=({"id": "17400", "name": ""},))[0])
+        self.assertIsNone(reason({"employer": {"name": "Без номера"}}, hidden_employers=({"id": "1", "name": ""},))[0])
+        self.assertEqual(reason({"name": "Программист 1С"}, stop_words=("1С",))[0],
+                         "стоп-слово «1С» в названии вакансии")
+        self.assertEqual(reason({"employer": {"id": "5", "name": "Битрикс Групп"}}, stop_words=("битрикс",))[0],
+                         "стоп-слово «битрикс» в названии компании")
+        self.assertEqual(reason({"experience": {"id": "moreThan6"}}, experience=("noExperience",))[0],
+                         "требуется опыт более 6 лет")
+        self.assertEqual(reason(experience=("noExperience",))[0], "требуется опыт 1–3 года")
+        self.assertIsNone(reason(experience=("noExperience", "between1And3"))[0])
+        self.assertIn("не достигает 100 000", reason({"salary": {"to": 90000, "currency": "RUR"}},
+                                                        salary_minimum=100000)[0])
+        self.assertIn("выше 150 000", reason({"salary": {"from": 160000, "currency": "RUR"}},
+                                              salary_ceiling=150000)[0])
+        self.assertIsNone(reason({"salary": {"from": 900000, "currency": "RUR"}}, salary_ceiling=None)[0])
+        self.assertIn("выше 300 000", reason({"salary": {"from": 900000, "currency": "RUR"}})[0])
+
+    def test_missing_experience_keeps_the_vacancy_with_a_note(self):
+        subset = Filters(experience=("noExperience",))
+        for card in ({"experience": None}, {"experience": {}}, {"experience": {"id": "newValue"}},
+                     {"experience": "between1And3"}):
+            with self.subTest(card):
+                reason, notes = vacancy_filters.check({k: v for k, v in CARD.items() if k != "experience"} | card, subset)
+                self.assertIsNone(reason)
+                self.assertEqual(len(notes), 1)
+                self.assertIn("проверка опыта пропущена", notes[0])
+        reason, notes = vacancy_filters.check({k: v for k, v in CARD.items() if k != "experience"}, subset)
+        self.assertEqual((reason, len(notes)), (None, 1))
+        # With every experience allowed there is nothing to check and nothing to note.
+        self.assertEqual(vacancy_filters.check({"name": "Linux"}, DEFAULTS), (None, []))
+
+    def test_employer_lines_and_summary(self):
+        for line, expected in (("1740", ("1740", "")), ("1740 Пример  Софт", ("1740", "Пример Софт")),
+                               ("https://hh.ru/employer/1740?hhtmFrom=vacancy", ("1740", "")),
+                               ("hh.ru/employer/1740/ Пример", ("1740", "Пример"))):
+            with self.subTest(line):
+                item = vacancy_filters.parse_employer_line(line)
+                self.assertEqual((item["id"], item["name"]), expected)
+        for line in ("abc", "Пример 1740", "employer/12x", "hh.ru/vacancy/1740", ""):
+            with self.subTest(line), self.assertRaises(ValueError):
+                vacancy_filters.parse_employer_line(line)
+        self.assertEqual(vacancy_filters.summary(DEFAULTS), "удалённо · от 80 000 ₽ · без Senior/Lead")
+        self.assertEqual(vacancy_filters.summary(Filters(
+            exclude_senior=True, stop_words=("а", "б", "в"), salary_ceiling=None)),
+            "удалённо · от 80 000 ₽ · без потолка · без Senior/Lead · стоп-слов: 3")
+
+    def preview(self, vacancies, **filters):
+        """Run a preview over these vacancies; return (output, letters asked of the model)."""
+        from hh_applicant_tool.ai.openai import OpenAIClient
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            profile = home / ".config/hh-applicant-tool-cli"
+            profile.mkdir(parents=True)
+            shutil.copyfile(Path(__file__).with_name("config.toml"), profile / "config.toml")
+            asked = []
+
+            def fake_main(_argv):
+                operation = SimpleNamespace(api_client=Mock(get=lambda path: {
+                    "id": path.rsplit("/", 1)[-1], "name": "DevOps",
+                    "salary": {"from": 100000, "currency": "RUR"}}))
+                for vacancy in Operation._get_vacancies(operation, resume_id="any"):
+                    asked.append(vacancy["id"])
+                    OpenAIClient.complete(Mock(), "Напиши письмо")
+                return 0
+
+            output = StringIO()
+            with saved_filters(DEFAULTS.data() | filters), \
+                 patch.dict(os.environ, {"CONFIG_DIR": str(profile), "HH_PROFILE_ID": "."}), \
+                 patch("preview_hh.Path.home", return_value=home), \
+                 patch("preview_hh.selected_resume_context", return_value=nullcontext()), \
+                 patch.object(Operation, "_get_vacancies", return_value=iter(vacancies)), \
+                 patch.object(OpenAIClient, "complete", Mock(return_value="Здравствуйте! Готов обсудить вакансию.")), \
+                 patch("preview_hh.main", side_effect=fake_main), redirect_stdout(output):
+                self.assertEqual(run(arguments(str(profile), "resume", "DevOps")), 0)
+        return output.getvalue(), asked
+
+    def test_preview_skips_by_local_rules_before_the_model(self):
+        cards = [CARD | {"id": "1", "name": "Инженер 1С"},
+                 CARD | {"id": "2", "employer": {"id": "999", "name": "Скрытая"}},
+                 CARD | {"id": "3", "experience": {"id": "moreThan6"}},
+                 CARD | {"id": "4", "employer": {"id": "5", "name": "Дружный Коллектив ООО"}},
+                 CARD | {"id": "5", "salary": {"to": 95000, "currency": "RUR"}},
+                 CARD | {"id": "6"}]
+        output, asked = self.preview(
+            cards, stop_words=["1с", "дружный коллектив"], hidden_employers=[{"id": "999", "name": ""}],
+            experience=["noExperience", "between1And3", "between3And6"], salary_minimum=96000,
+            salary_ceiling=150000)
+        self.assertEqual(asked, ["6"])
+        self.assertEqual(output.count("SKIPPED"), 5)
+        for reason in ("стоп-слово «1с» в названии вакансии", "компания скрыта", "требуется опыт более 6 лет",
+                       "стоп-слово «дружный коллектив» в названии компании", "не достигает 96 000"):
+            self.assertIn(reason, output)
+        self.assertIn('"vacancies": 6, "letters": 1', output)
+
+    def test_preview_notes_a_missing_experience_and_changes_nothing_by_default(self):
+        bare = {k: v for k, v in CARD.items() if k != "experience"}
+        output, asked = self.preview([bare], experience=["noExperience"])
+        self.assertEqual(asked, ["1"])
+        self.assertIn("Фильтры: в выдаче HH нет требуемого опыта", output)
+        output, asked = self.preview([bare, CARD | {"id": "2", "name": "Senior DevOps"}])
+        self.assertEqual(asked, ["1"])
+        self.assertNotIn("Фильтры:", output)
+
+    def test_preview_refuses_arguments_that_differ_from_the_saved_filters(self):
+        with tempfile.TemporaryDirectory() as temp:
+            home = Path(temp)
+            profile = home / ".config/hh-applicant-tool-cli"
+            profile.mkdir(parents=True)
+            shutil.copyfile(Path(__file__).with_name("config.toml"), profile / "config.toml")
+            with saved_filters({"period": 7}), \
+                 patch.dict(os.environ, {"CONFIG_DIR": str(profile), "HH_PROFILE_ID": "."}), \
+                 patch("preview_hh.Path.home", return_value=home), \
+                 patch("preview_hh.main", side_effect=AssertionError("Must not start")):
+                argv = arguments(str(profile), "resume", "DevOps")
+                for extra in (["--excluded-filter", "junior"], ["--excluded-employer-id", "1740"],
+                              ["--experience", "noExperience"], ["--ai-filter"]):
+                    with self.subTest(extra=extra), self.assertRaisesRegex(SystemExit, "Unsafe preview"):
+                        run(argv + extra)
+                changed = [arg for arg in argv if arg not in ("--period", "7")]
+                with self.assertRaisesRegex(SystemExit, "Unsafe preview"):
+                    run(changed)
+                with self.assertRaisesRegex(SystemExit, "Unsafe preview"):
+                    run(argv[:argv.index("--period") + 1] + ["30"] + argv[argv.index("--period") + 2:])
 
 
 if __name__ == "__main__":

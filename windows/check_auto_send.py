@@ -48,6 +48,23 @@ class AutoChecks(unittest.TestCase):
         self.assertEqual(self.sender.call_count, 2)
         self.assertEqual(self.gate.counts['attempts'], 2)
 
+    def test_saved_vacancy_filters_skip_before_a_letter_without_using_the_limit(self):
+        from vacancy_filters import Filters
+        self.gate.filters = Filters(stop_words=("1С",), hidden_employers=({"id": "7", "name": ""},))
+        self.gate.operation = SimpleNamespace(api_client=Mock())
+        stop = VACANCY | {"id": "1", "name": "Программист 1С"}
+        hidden = VACANCY | {"id": "2", "employer": {"id": "7", "name": "Скрытая"}}
+        plain = VACANCY | {"id": "3"}
+        self.gate.original_vacancies = lambda *_a, **_kw: iter([stop, hidden, plain])
+        self.gate.original_complete = Mock(side_effect=AssertionError("No model call"))
+        output = StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(list(self.gate.vacancies(self.gate.operation)), [plain])
+        self.assertIn("стоп-слово «1С» в названии вакансии", output.getvalue())
+        self.assertIn("компания скрыта", output.getvalue())
+        self.assertEqual(self.gate.counts["http_success"], 0)
+        self.sender.assert_not_called()
+
     def test_limit_counts_hh_accepted_responses_not_attempts(self):
         # #8: a POST rejected by an HH captcha is an attempt, not a response toward the limit.
         challenge = SimpleNamespace(status_code=403, json=lambda: {

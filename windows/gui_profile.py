@@ -114,6 +114,10 @@ def read_searches():
     return validate_searches(json.loads(path.read_text(encoding="utf-8")), allow_empty=True) if path.exists() else {}
 
 
+def filters_path():
+    return state_dir() / "filters.json"
+
+
 def save_search(resume_id, search):
     mapping = read_searches()
     mapping[resume_id] = search

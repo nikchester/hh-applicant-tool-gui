@@ -360,6 +360,7 @@ class Application:
         for name, colour in (("StepDone", SUCCESS), ("StepCurrent", ACCENT), ("StepLocked", MUTED)):
             style.configure(name + ".TLabel", foreground=colour, font=heavy(10))
         style.configure("Hint.TLabel", foreground=MUTED, font=(body, 9))
+        style.configure("Link.TLabel", foreground=ACCENT, font=(body, 9))
         style.configure("Done.TLabel", foreground=SUCCESS, font=(body, 9))
         style.configure("Locked.TLabel", foreground=DISABLED, font=(body, 9))
         style.configure("Error.TLabel", foreground=CRITICAL, font=(body, 9))
@@ -521,6 +522,11 @@ class Application:
         self.style_box = ttk.Combobox(resume, textvariable=self.style_name, state="readonly", width=30)
         self.style_box.grid(row=8, column=0, columnspan=2, sticky="ew")
         self.style_box.bind("<<ComboboxSelected>>", self.select_style)
+        ttk.Label(resume, text="Фильтры вакансий").grid(row=9, column=0, columnspan=2, sticky="w", pady=(8, 0))
+        self.filters_summary = ttk.Label(resume, wraplength=300, justify="left", cursor="hand2")
+        self.filters_summary.grid(row=10, column=0, columnspan=2, sticky="w")
+        self.filters_summary.bind("<Button-1>", lambda _event: self.edit_filters())
+        self.refresh_filters_summary()
 
         run = self.section(side, "Отклики")
         self.action_button(run, "Предпросмотр писем", "preview").grid(row=1, column=0, sticky="ew")
@@ -659,6 +665,7 @@ class Application:
             ("Аккаунт HH…", lambda: self.show_wizard("hh", settings=True), True),
             ("AI-провайдер…", lambda: self.show_wizard("ai", settings=True), True),
             ("Стили письма…", self.edit_letter_style, True),
+            ("Фильтры вакансий…", self.edit_filters, True),
             ("Журнал…", self.open_log, False),
             ("Пройти настройку заново", lambda: self.show_wizard("hh"), True),
         )
@@ -1603,6 +1610,7 @@ class Application:
                     raise ValueError("Подключи AI: «Настройки» → «AI-провайдер…» → «Проверить подключение».")
                 set_model(self.model.get())
             if action in {"preview", "apply", "auto"}:
+                self.check_filters()
                 resume, search = self.selected_id(), self.search_value()
                 if not self.save():
                     return
@@ -2244,6 +2252,222 @@ class Application:
         self.style_dialog = {"box": box, "chosen": chosen, "show": show, "create": create,
                              "duplicate": duplicate, "rename": rename, "delete": delete,
                              "rename_button": rename_button, "delete_button": delete_button, "note": note}
+
+    # ---- vacancy filters (#15) --------------------------------------------------
+
+    def refresh_filters_summary(self):
+        """The line under «Фильтры вакансий» on the main screen; a damaged file is shown as such."""
+        import vacancy_filters
+        from gui_profile import filters_path
+        label = getattr(self, "filters_summary", None)
+        if label is None:
+            return
+        try:
+            label.configure(text=vacancy_filters.summary(vacancy_filters.read(filters_path())),
+                            style="Link.TLabel")
+        except ValueError as problem:
+            label.configure(text=f"Файл фильтров не принят: {problem}. Нажми, чтобы открыть окно.",
+                            style="Error.TLabel")
+
+    def check_filters(self):
+        """A damaged filters file stops the start here, with the way out; the worker checks it again."""
+        import vacancy_filters
+        from gui_profile import filters_path
+        try:
+            vacancy_filters.read(filters_path())
+        except ValueError as problem:
+            raise ValueError(f"Файл фильтров вакансий не принят: {problem}.\n\nИсправь фильтры в «Настройки → "
+                             "Фильтры вакансий…»: окно предложит значения по умолчанию.") from None
+
+    def edit_filters(self):
+        """«Настройки → Фильтры вакансий…»: every stage 1 filter in one window. Unavailable during a run."""
+        import vacancy_filters as vf
+        from gui_profile import filters_path
+        tk, ttk = self.tk, self.ttk
+        if self.session is not None:
+            return
+        if getattr(self, "filters_window", None) is not None and self.filters_window.winfo_exists():
+            self.filters_window.lift()
+            return
+        try:
+            current = vf.read(filters_path())
+        except ValueError as problem:
+            if not self.dialogs.askyesno(
+                    "Фильтры вакансий", f"Файл фильтров не принят: {problem}.\n\n"
+                    "Открыть окно со значениями по умолчанию? Старый файл заменится, когда ты нажмёшь «Сохранить»."):
+                return
+            current = vf.DEFAULTS
+        window = self.filters_window = tk.Toplevel(self.root, background=CARD)
+        window.title("Фильтры вакансий")
+        window.transient(self.root)
+        window.resizable(False, False)
+        dark_title_bar(window)
+        frame = ttk.Frame(window, padding=18)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="Фильтры вакансий", style="Heading.TLabel").grid(
+            row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(frame, wraplength=760, justify="left", style="Hint.TLabel", text=(
+            "Одни фильтры для всех резюме. Срок, метки и зарплата идут в запрос к HH; остальное приложение проверяет "
+            "у себя до того, как писать письмо, и в аккаунте HH ничего не меняет. Пока ты ничего не меняешь, "
+            "выдача такая же, как раньше.")).grid(row=1, column=0, columnspan=2, sticky="w", pady=(4, 12))
+        left, right = ttk.Frame(frame), ttk.Frame(frame)
+        left.grid(row=2, column=0, sticky="nw", padx=(0, 24))
+        right.grid(row=2, column=1, sticky="nsew")
+        frame.columnconfigure(1, weight=1)
+        variables = {
+            "minimum": tk.StringVar(), "ceiling": tk.StringVar(), "no_ceiling": tk.BooleanVar(),
+            "only_with_salary": tk.BooleanVar(), "exclude_senior": tk.BooleanVar(),
+            "period": tk.StringVar(), "not_from_agency": tk.BooleanVar(), "accredited_it": tk.BooleanVar(),
+            **{"experience_" + key: tk.BooleanVar() for key in vf.EXPERIENCE},
+        }
+        periods = {"Любая": None, **{(f"{n} день" if n == 1 else f"{n} дня" if n < 5 else f"{n} дней"): n
+                                      for n in vf.PERIODS}}
+
+        ttk.Label(left, text="Зарплата", style="Subheading.TLabel").grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(left, text="Минимум на руки, ₽").grid(row=1, column=0, sticky="w", pady=(4, 0))
+        minimum = ttk.Spinbox(left, textvariable=variables["minimum"], from_=0, to=vf.MAX_SALARY,
+                              increment=5000, width=10)
+        minimum.grid(row=1, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Label(left, text="Потолок, ₽").grid(row=2, column=0, sticky="w", pady=(4, 0))
+        ceiling = ttk.Spinbox(left, textvariable=variables["ceiling"], from_=1, to=vf.MAX_SALARY,
+                              increment=5000, width=10)
+        ceiling.grid(row=2, column=1, sticky="w", padx=(8, 0), pady=(4, 0))
+        ttk.Checkbutton(left, text="Без потолка", variable=variables["no_ceiling"]).grid(
+            row=3, column=1, sticky="w", padx=(8, 0))
+        ttk.Checkbutton(left, text="Только вакансии с указанной зарплатой",
+                        variable=variables["only_with_salary"]).grid(row=4, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Checkbutton(left, text="Исключать Senior/Lead", variable=variables["exclude_senior"]).grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        ttk.Label(left, text="Требуемый опыт", style="Subheading.TLabel").grid(
+            row=6, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        for number, (key, (label, _reason)) in enumerate(vf.EXPERIENCE.items()):
+            ttk.Checkbutton(left, text=label, variable=variables["experience_" + key]).grid(
+                row=7 + number, column=0, columnspan=2, sticky="w")
+        ttk.Label(left, text="Свежесть вакансий", style="Subheading.TLabel").grid(
+            row=11, column=0, columnspan=2, sticky="w", pady=(12, 0))
+        period = ttk.Combobox(left, textvariable=variables["period"], state="readonly", width=12,
+                              values=list(periods))
+        period.grid(row=12, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        ttk.Checkbutton(left, text="Без кадровых агентств", variable=variables["not_from_agency"]).grid(
+            row=13, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        ttk.Checkbutton(left, text="Только аккредитованные ИТ-компании", variable=variables["accredited_it"]).grid(
+            row=14, column=0, columnspan=2, sticky="w")
+
+        right.columnconfigure(0, weight=1)
+        ttk.Label(right, text="Стоп-слова", style="Subheading.TLabel").grid(row=0, column=0, sticky="w")
+        words_frame, words = self.text_box(right, 7, readonly=False)
+        words_frame.grid(row=1, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(right, style="Hint.TLabel", wraplength=380, justify="left", text=(
+            "По одному слову или фразе в строке. Ищутся в названии вакансии и в названии компании, "
+            "без учёта регистра и только целым словом: «1С» найдёт «Программист 1С», но не «1СО». "
+            "Это не регулярные выражения: знаки в строке ищутся как есть.")).grid(
+            row=2, column=0, sticky="w", pady=(4, 10))
+        ttk.Label(right, text="Скрытые компании", style="Subheading.TLabel").grid(row=3, column=0, sticky="w")
+        employers_frame, employers = self.text_box(right, 6, readonly=False)
+        employers_frame.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        ttk.Label(right, style="Hint.TLabel", wraplength=380, justify="left", text=(
+            "По одной компании в строке: ссылка вида hh.ru/employer/1740 или номер, после него можно "
+            "написать название для памяти. Вакансии этих компаний пропускаются; чёрный список HH "
+            "не меняется.")).grid(row=5, column=0, sticky="w", pady=(4, 0))
+
+        error = ttk.Label(frame, style="Error.TLabel", wraplength=760, justify="left")
+        error.grid(row=3, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        buttons = ttk.Frame(frame)
+        buttons.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 0))
+
+        loading = []  # Fields change one by one while a set of filters is shown: check once at the end.
+
+        def show(filters):
+            loading.append(True)
+            variables["minimum"].set(str(filters.salary_minimum))
+            variables["ceiling"].set(str(filters.salary_ceiling or vf.DEFAULTS.salary_ceiling))
+            variables["no_ceiling"].set(filters.salary_ceiling is None)
+            variables["only_with_salary"].set(filters.only_with_salary)
+            variables["exclude_senior"].set(filters.exclude_senior)
+            for key in vf.EXPERIENCE:
+                variables["experience_" + key].set(key in filters.experience)
+            variables["period"].set(next(label for label, days in periods.items() if days == filters.period))
+            variables["not_from_agency"].set(filters.not_from_agency)
+            variables["accredited_it"].set(filters.accredited_it)
+            for widget, lines in ((words, filters.stop_words),
+                                  (employers, [vf.employer_line(item) for item in filters.hidden_employers])):
+                widget.delete("1.0", "end")
+                widget.insert("1.0", "\n".join(lines))
+                widget.edit_reset()
+            loading.clear()
+            check()
+
+        def number(name, title):
+            text = variables[name].get().replace(" ", "").replace("\u00a0", "")
+            if not text.isascii() or not text.isdecimal() or int(text) > vf.MAX_SALARY:
+                raise ValueError(f"{title}: введи число от 0 до {vf.money(vf.MAX_SALARY)}.")
+            return int(text)
+
+        def collect():
+            experience = [key for key in vf.EXPERIENCE if variables["experience_" + key].get()]
+            if not experience:
+                raise ValueError("Выбери хотя бы один вариант требуемого опыта: иначе подходящих вакансий не будет.")
+            def lines(widget):
+                return [line for line in widget.get("1.0", "end-1c").splitlines() if line.strip()]
+
+            return vf.parse({
+                "salary_minimum": number("minimum", "Минимум зарплаты"),
+                "salary_ceiling": None if variables["no_ceiling"].get() else number("ceiling", "Потолок зарплаты"),
+                "only_with_salary": variables["only_with_salary"].get(),
+                "exclude_senior": variables["exclude_senior"].get(),
+                "experience": experience,
+                "stop_words": lines(words),
+                "hidden_employers": [vf.parse_employer_line(line) for line in lines(employers)],
+                "period": periods[variables["period"].get()],
+                "not_from_agency": variables["not_from_agency"].get(),
+                "accredited_it": variables["accredited_it"].get(),
+            })
+
+        def check(*_args):
+            if loading:
+                return
+            ceiling.configure(state="disabled" if variables["no_ceiling"].get() else "normal")
+            try:
+                collect()
+                error.configure(text="")
+                save_button.configure(state="normal")
+            except ValueError as problem:
+                error.configure(text=str(problem))
+                save_button.configure(state="disabled")
+
+        def close():
+            self.filters_window = None
+            window.destroy()
+
+        def save():
+            try:
+                filters = collect()
+                vf.save(filters, filters_path())
+            except (OSError, ValueError) as problem:
+                error.configure(text=str(problem) or "Не удалось сохранить фильтры.")
+                return
+            self.append_log("Фильтры вакансий сохранены: " + vf.summary(filters))
+            self.refresh_filters_summary()
+            self.say("Фильтры вакансий сохранены. Они действуют на следующем предпросмотре и откликах.", "success")
+            close()
+
+        save_button = ttk.Button(buttons, text="Сохранить", style="Accent.TButton", command=save)
+        save_button.pack(side="left")
+        ttk.Button(buttons, text="Сбросить по умолчанию", command=lambda: show(vf.DEFAULTS)).pack(
+            side="left", padx=6)
+        ttk.Button(buttons, text="Закрыть", command=close).pack(side="left")
+        for variable in variables.values():
+            variable.trace_add("write", check)
+        for widget in (words, employers):
+            widget.bind("<KeyRelease>", check)
+            widget.bind("<<Edited>>", check)  # Menu paste and cut send no KeyRelease.
+        window.protocol("WM_DELETE_WINDOW", close)
+        window.bind("<Escape>", lambda _event: close())
+        show(current)
+        window.grab_set()  # No run can start while the filters change.
+        self.filters_dialog = {"variables": variables, "periods": periods, "words": words, "employers": employers,
+                               "error": error, "save": save, "save_button": save_button, "close": close,
+                               "show": show, "collect": collect}
 
     # ---- ChatGPT device login ---------------------------------------------------
 

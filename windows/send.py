@@ -24,8 +24,7 @@ from preview_hh import (LetterRejected, allowed_request, check_letter_language,
                         check_letter_level, enrich_prompt, letter_kwargs)
 from preview import arguments as preview_arguments  # noqa: E402
 from resume_context import selected_resume_context
-from vacancy_level import senior_title_reason
-from vacancy_salary import salary_rejection_reason
+import vacancy_filters
 from send_all import apply_round_robin, load_searches, single_round_vacancy
 from manual_captcha import (ManualCaptcha, captcha_url, form_captcha_error, form_captcha_state, hh_url,
                             permits_token_refresh)
@@ -237,11 +236,8 @@ def validate(argv, *, profile=None):
         and args.skip_tests is False and args.captcha_handling is False
         and args.total_pages == 100 and args.per_page == 20 and args.max_responses is None
         and args.resume_id and args.verbosity == 0
-        and args.work_format == ["REMOTE"] and args.currency == "RUR"
-        and args.salary == 80000 and args.only_with_salary is False
-        and args.order_by == "publication_time"
-        and args.search_field == ["name"] and isinstance(args.force_cover_letter, bool)
-        and args.use_ai is True and args.excluded_filter is None
+        and vacancy_filters.search_matches(args, vacancy_filters.load())
+        and isinstance(args.force_cover_letter, bool) and args.use_ai is True
     ):
         raise SystemExit("Unsafe send arguments; refusing to run")
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
@@ -310,6 +306,8 @@ class ApprovalGate:
         self.approve = approve
         self.review = review
         self.sleep = sleep
+        # The saved vacancy filters (#15): one set of local rules for every stage of a vacancy.
+        self.filters = vacancy_filters.load()
         self.current = None
         self.letter = None
         # What generated self.letter: an AI rewrite of the reviewed letter reuses it.
@@ -337,28 +335,35 @@ class ApprovalGate:
             self.letter = None
             self.letter_source, self.letter_feedback = None, []
             self.test_answers = []
-            reason = senior_title_reason(vacancy)
-            if not reason:
-                reason = salary_rejection_reason(vacancy, getattr(operation, "api_client", None)) or (
-                    "уже есть отклик или отказ в HH" if vacancy.get("relations") else
-                    "вакансия в архиве" if vacancy.get("archived") else
-                    "отклик ведёт на внешний сайт" if vacancy.get("response_url") else None
-                ) or self._no_letter_reason(vacancy)
+            # Local rules decide before any letter is generated; HH's own flags only explain a skip.
+            local, notes = vacancy_filters.check(vacancy, self.filters, getattr(operation, "api_client", None))
+            skip = local or self._no_letter_reason(vacancy)
+            reason = local or (
+                "уже есть отклик или отказ в HH" if vacancy.get("relations") else
+                "вакансия в архиве" if vacancy.get("archived") else
+                "отклик ведёт на внешний сайт" if vacancy.get("response_url") else None
+            ) or skip
             if reason:
                 print("\n" + "=" * 60, flush=True)
                 print("\n".join(vacancy_lines(vacancy, self.counts["vacancies"])), flush=True)
                 print(f"Статус: пропускаем — {reason}", flush=True)
-                if senior_title_reason(vacancy) or salary_rejection_reason(
-                        vacancy, getattr(operation, "api_client", None)) or self._no_letter_reason(vacancy):
+                if skip:
                     continue
             else:
                 company = (vacancy.get("employer") or {}).get("name") or "не указана"
                 print(f"\nНайдена вакансия {self.counts['vacancies']}: "
                       f"{vacancy.get('name') or 'не указана'} — {company}. "
                       "Готовим письмо для проверки...", flush=True)
+            for note in notes:
+                print(f"Фильтры: {note}", flush=True)
             if self.no_letter:
                 self.letter = ""  # Nothing to generate: the review shows "no letter".
             yield vacancy
+
+    def _local_reason(self):
+        """The filter rules again on the vacancy about to be sent: a skip can never be bypassed."""
+        return vacancy_filters.skip_reason(
+            self.current, self.filters, getattr(getattr(self, "operation", None), "api_client", None))
 
     def _no_letter_reason(self, vacancy):
         """Vacancies the no-letter mode cannot answer: HH needs a letter, or a test needs AI (#9)."""
@@ -380,7 +385,7 @@ class ApprovalGate:
         self.letter_source, self.letter_feedback = None, []
         try:
             vacancy = self.operation.api_client.get("/vacancies/" + self.current["id"])
-            if reason := salary_rejection_reason(vacancy, self.operation.api_client):
+            if reason := vacancy_filters.salary_reason(vacancy, self.filters, self.operation.api_client):
                 raise SystemExit(f"Vacancy salary changed: {reason}")
         except ResourceNotFound:
             raise  # send() has skipped the removed vacancy; upstream logs ApiError and moves on.
@@ -557,9 +562,7 @@ class ApprovalGate:
         if (self.current is None or self.no_letter or not self.current.get("has_test")
                 or self.current.get("relations")
                 or self.current.get("archived") or self.current.get("response_url")
-                or senior_title_reason(self.current)
-                or salary_rejection_reason(
-                    self.current, getattr(getattr(self, "operation", None), "api_client", None))
+                or self._local_reason()
                 or self.captcha_active):
             raise SystemExit("Cannot send this test application")
         if self.letter is None:
@@ -702,9 +705,7 @@ class ApprovalGate:
 
         if (self.current is None or self.current.get("relations")
                 or self.current.get("has_test") or self.current.get("archived")
-                 or self.current.get("response_url") or senior_title_reason(self.current)
-                  or salary_rejection_reason(
-                      self.current, getattr(getattr(self, "operation", None), "api_client", None))
+                 or self.current.get("response_url") or self._local_reason()
                  or self.captcha_active):
             raise SystemExit("Cannot send to a responded or test vacancy")
         if self.no_letter and (self.letter != "" or self.current.get("response_letter_required")):
