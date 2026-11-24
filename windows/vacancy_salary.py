@@ -35,14 +35,14 @@ def salary_rejection_reason(vacancy, api_client=None, *, minimum=MINIMUM_NET_RUB
     amounts = [salary.get(key) for key in ("from", "to")
                if is_amount(salary.get(key))]
     currency = salary.get("currency")
-    if amounts:
+    if amounts and ceiling is not None:
         rate = 1 if currency in ("RUR", "RUB") else (
             currency_rates(api_client).get(currency) if api_client is not None else None
         )
         if not is_amount(rate) or rate == 0:
             return "не удалось проверить лимит зарплаты: неизвестен курс валюты"
         # Compare without division or binary floating-point boundary errors.
-        if ceiling is not None and Decimal(str(max(amounts))) > ceiling * Decimal(str(rate)):
+        if Decimal(str(max(amounts))) > ceiling * Decimal(str(rate)):
             return f"указанная зарплата выше {ceiling:,} ₽ (по курсу HH)".replace(",", " ")
     top = salary.get("to")
     if salary.get("currency") != "RUR" or not isinstance(top, (int, float)):

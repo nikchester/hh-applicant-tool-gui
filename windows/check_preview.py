@@ -442,6 +442,11 @@ class VacancyFilterChecks(unittest.TestCase):
         self.assertIsNone(vacancy_filters.stop_word_in("Linux", ("L.nux",)))
         self.assertIsNone(vacancy_filters.stop_word_in("Linux", (".*",)))
         self.assertEqual(vacancy_filters.stop_word_in("Node.js", ("node.js",)), "node.js")
+        # A sign at the edge needs no word boundary; look-alike Cyrillic and Latin letters match.
+        self.assertEqual(vacancy_filters.stop_word_in("ASP.NET Developer", (".net",)), ".net")
+        self.assertEqual(vacancy_filters.stop_word_in("Программист 1C", ("1С",)), "1С")
+        self.assertEqual(vacancy_filters.stop_word_in("Программист 1С", ("1C",)), "1C")
+        self.assertIsNone(vacancy_filters.stop_word_in("Инженер 1CO", ("1С",)))
 
     def test_each_local_rule_gives_its_reason(self):
         def reason(vacancy=None, **filters):
@@ -466,6 +471,9 @@ class VacancyFilterChecks(unittest.TestCase):
         self.assertIn("выше 150 000", reason({"salary": {"from": 160000, "currency": "RUR"}},
                                               salary_ceiling=150000)[0])
         self.assertIsNone(reason({"salary": {"from": 900000, "currency": "RUR"}}, salary_ceiling=None)[0])
+        # No ceiling, nothing to compare: an unknown currency rate is not looked up at all.
+        self.assertIsNone(salary_rejection_reason(
+            {"salary": {"from": 5000, "currency": "KZT"}}, None, ceiling=None))
         self.assertIn("выше 300 000", reason({"salary": {"from": 900000, "currency": "RUR"}})[0])
 
     def test_missing_experience_keeps_the_vacancy_with_a_note(self):

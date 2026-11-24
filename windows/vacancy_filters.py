@@ -204,14 +204,22 @@ def search_matches(args, filters):
             and args.excluded_filter is None and args.ai_filter is False)
 
 
+# Cyrillic letters drawn like Latin ones: «1С» and «1C» are the same word to a reader.
+_LOOKALIKES = str.maketrans("авекмнорстух", "abekmhopctyx")
+
+
 def _fold(text):
-    return " ".join(text.casefold().replace("ё", "е").split())
+    return " ".join(text.casefold().replace("ё", "е").translate(_LOOKALIKES).split())
 
 
 @lru_cache(maxsize=512)
 def _stop_pattern(word):
-    tokens = [re.escape(token) for token in _fold(word).split()]
-    return re.compile(r"(?<!\w)" + r"\s+".join(tokens) + r"(?!\w)")
+    folded = _fold(word)
+    tokens = [re.escape(token) for token in folded.split()]
+    # A boundary only where the word starts or ends with a letter or digit: ".net" is found in "ASP.NET".
+    before = r"(?<!\w)" if folded[0].isalnum() or folded[0] == "_" else ""
+    after = r"(?!\w)" if folded[-1].isalnum() or folded[-1] == "_" else ""
+    return re.compile(before + r"\s+".join(tokens) + after)
 
 
 def stop_word_in(text, words):
