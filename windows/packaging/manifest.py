@@ -1,7 +1,7 @@
 """Closed source allowlist. Never walk the repository to assemble a release."""
 
 APP_NAME = "hh-applicant-tool-gui"
-APP_VERSION = "0.7.0-beta.3"
+APP_VERSION = "0.7.0-beta.5"
 APP_MODULES = (
     "gui", "gui_chatmock_auth", "gui_controller", "gui_owned_process", "gui_profile", "gui_protocol",
     "gui_recovery", "gui_runtime", "gui_steps", "gui_worker",
@@ -13,7 +13,7 @@ ENTRY_FILES = ("entrypoint.py", "smoke.py", "manifest.py")
 APPLICATION_PINS = {"hh-applicant-tool": "2.3.7", "chatmock": "1.40"}
 BUILD_PINS = {
     "pyinstaller": "6.16.0", "pyinstaller-hooks-contrib": "2025.9",
-    "packaging": "25.0", "altgraph": "0.17.4", "pefile": "2023.2.7",
+    "packaging": "25.0", "altgraph": "0.17.5", "pefile": "2023.2.7",
     "pywin32-ctypes": "0.2.3", "setuptools": "84.1.0",
 }
 PRIVATE_NAMES = frozenset({

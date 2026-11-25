@@ -1363,6 +1363,19 @@ class ConstructionChecks(unittest.TestCase):
             root.destroy()
 
 
+class RoundedImageChecks(unittest.TestCase):
+    def test_rounded_rows_keep_surface_corners_fill_and_outline(self):
+        rows = [row.strip("{}").split() for row in gui.rounded_rows(6, "#000000", "#efff55", "#ffffff", 1)
+                .split("} {")]
+        self.assertEqual((len(rows), {len(row) for row in rows}), (14, {14}))
+        self.assertEqual(rows[0][0], "#000000")  # The corner shows the surface under the card.
+        self.assertEqual(rows[7][7], "#efff55")  # The middle stretches with the fill colour.
+        self.assertEqual(rows[7][0], "#ffffff")  # The straight edge carries the outline.
+        plain = [row.strip("{}").split() for row in gui.rounded_rows(6, "#000000", "#141414").split("} {")]
+        self.assertEqual((plain[0][0], plain[13][13], plain[7][0]), ("#000000", "#000000", "#141414"))
+        self.assertNotIn("#ffffff", {pixel for row in plain for pixel in row})
+
+
 class AttentionChecks(unittest.TestCase):
     def test_alert_rule_covers_errors_and_long_runs_only(self):
         for action in ("resumes", "models", "hh_login", "auto", "apply", "chats", "preview"):
