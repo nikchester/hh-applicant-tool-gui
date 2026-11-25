@@ -80,6 +80,15 @@ jobs:
           $setup = Join-Path $installer[0].FullName "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
           windows/build/venv/Scripts/python.exe -I windows/packaging/update_bundle.py $app[0].FullName $setup $installer[0].FullName
           if ($LASTEXITCODE) { throw 'Self-update files were not signed' }
+      - name: Prepare stable installer copy and final checksums
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $installer = @(Get-ChildItem windows/dist/*/installer -Directory)
+          if ($installer.Count -ne 1) { throw 'Expected one installer directory' }
+          python -I windows/packaging/release_assets.py $installer[0].FullName $env:VERSION
+          if ($LASTEXITCODE) { throw 'Release assets were not prepared' }
       - name: Publish GitHub release
         shell: pwsh
         env:
@@ -90,15 +99,16 @@ jobs:
           if ($installer.Count -ne 1) { throw "Expected one installer directory, found $($installer.Count)" }
           $dir = $installer[0].FullName
           $setup = Join-Path $dir "hh-applicant-tool-gui-$env:VERSION-windows-x64-setup.exe"
+          $stable = Join-Path $dir 'hh-applicant-tool-gui-windows-x64-setup.exe'
           $sums = Join-Path $dir 'SHA256SUMS.txt'
           $code = Join-Path $dir "hh-applicant-tool-gui-$env:VERSION-code.zip"
           $update = Join-Path $dir 'update.json'
           $signature = Join-Path $dir 'update.json.sig'
-          foreach ($file in $setup, $sums, $code, $update, $signature) {
+          foreach ($file in $setup, $stable, $sums, $code, $update, $signature) {
             if (-not (Test-Path -LiteralPath $file -PathType Leaf)) { throw "Missing release file $file" }
           }
           # A beta (0.6.0-beta.1) is a pre-release and never "latest": self-update reads
           # releases/latest, so no installed copy is offered a beta.
           $channel = if ($env:VERSION -match '-') { @('--prerelease', '--latest=false') } else { @() }
-          gh release create $env:GITHUB_REF_NAME $setup $sums $code $update $signature --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag @channel
+          gh release create $env:GITHUB_REF_NAME $setup $stable $sums $code $update $signature --repo $env:GITHUB_REPOSITORY --title "Автоотклики HH $env:VERSION" --notes-file release-notes.md --verify-tag @channel
           if ($LASTEXITCODE) { throw 'GitHub release creation failed' }

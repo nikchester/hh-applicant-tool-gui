@@ -1,5 +1,6 @@
 """Desktop entrypoint of the HH auto-apply GUI. Packagers must route worker modes before Tk."""
 
+import functools
 import sys
 
 from gui_protocol import LETTER_REJECTIONS, LETTER_REVISION_FAILURES, RETRY_NOTICES
@@ -69,18 +70,21 @@ COUNT_TITLES = {
     "chats": "чатов", "inspected": "просмотрено", "drafts": "черновиков", "skipped": "пропущено",
     "failures": "ошибок",
 }
-# Windows 11 dark palette: dark page, raised cards, one accent colour.
-PAGE, CARD, BORDER, CONTROL_BORDER = "#202020", "#2b2b2b", "#3a3a3a", "#4a4a4a"
-CONTROL, CONTROL_HOVER, CONTROL_PRESSED, FIELD = "#373737", "#3f3f3f", "#323232", "#1f1f1f"
-TEXT, MUTED, DISABLED = "#ffffff", "#c5c5c5", "#787878"
-ACCENT, ACCENT_HOVER, ACCENT_PRESSED, ON_ACCENT = "#60cdff", "#5ab9e6", "#4fa3cc", "#000000"
-SUCCESS, WARNING, CRITICAL = "#6ccb5f", "#fce100", "#ff99a4"
+# Happai palette: black page, soft dark cards, pill buttons, one acid-lime accent with black text.
+PAGE, CARD, BORDER, CONTROL_BORDER = "#000000", "#141414", "#262626", "#333333"
+CONTROL, CONTROL_HOVER, CONTROL_PRESSED, FIELD = "#232323", "#2e2e2e", "#1b1b1b", "#0b0b0b"
+TEXT, MUTED, DISABLED = "#ffffff", "#a3a3a3", "#5e5e5e"
+ACCENT, ACCENT_HOVER, ACCENT_PRESSED, ON_ACCENT = "#efff55", "#f5ff8a", "#d6e64a", "#000000"
+SUCCESS, WARNING, CRITICAL = "#5fe06a", "#ffc533", "#ff6b4a"
+SCROLL, SCROLL_HOVER = "#3d3d3d", "#5a5a5a"
+# Corner radii of the rounded surfaces, in pixels.
+CARD_RADIUS, BUTTON_RADIUS, FIELD_RADIUS = 16, 14, 10
 # InfoBar severities: (background, icon colour, Segoe Fluent Icons glyph, fallback glyph).
 SEVERITY = {
-    "info": ("#2b3640", ACCENT, "\ue946", "i"),
-    "success": ("#393d1b", SUCCESS, "\ue930", "✓"),
-    "warning": ("#433519", WARNING, "\ue7ba", "!"),
-    "error": ("#442726", CRITICAL, "\uea39", "×"),
+    "info": ("#1d2008", ACCENT, "\ue946", "i"),
+    "success": ("#0f2412", SUCCESS, "\ue930", "✓"),
+    "warning": ("#2a2008", WARNING, "\ue7ba", "!"),
+    "error": ("#2e130d", CRITICAL, "\uea39", "×"),
 }
 UPDATE_CHANNELS = {"stable": "Стабильные версии", "beta": "Бета-версии"}
 REVIEW_ACTIONS = frozenset({"preview", "apply", "auto", "chats"})
@@ -149,6 +153,49 @@ def dark_title_bar(window):
                 break
     except (AttributeError, ImportError, OSError):
         pass
+
+
+@functools.lru_cache(maxsize=None)
+def rounded_rows(radius, surface, fill, outline=None, width=1):
+    """Pixel rows of a (2r+2)-square rounded rectangle for a 9-slice ttk image element.
+    Corners are antialiased against the surface colour: Tk has no rounded widgets of its own.
+    Only one corner is sampled and mirrored; the straight edges and the middle are exact."""
+    size, samples = 2 * radius + 2, 4
+
+    def rgb(colour):
+        return tuple(int(colour[i:i + 2], 16) for i in (1, 3, 5))
+
+    def coverage(x, y, inset):
+        """Share of corner pixel (x, y) inside the arc of radius r - inset around (r, r)."""
+        r, inside = radius - inset, 0
+        for i in range(samples):
+            for j in range(samples):
+                dx, dy = radius - (x + (i + 0.5) / samples), radius - (y + (j + 0.5) / samples)
+                inside += dx * dx + dy * dy <= r * r
+        return inside / samples ** 2
+
+    def mix(base, top, share):
+        return tuple(round(a + (b - a) * share) for a, b in zip(base, top))
+
+    back, body = rgb(surface), rgb(fill)
+    edge = rgb(outline) if outline else body
+    corner = [[mix(mix(back, edge, coverage(x, y, 0)), body, coverage(x, y, width) if outline else 0)
+               for x in range(radius)] for y in range(radius)]
+    rows = []
+    for y in range(size):
+        cy = y if y < radius else size - 1 - y if y >= size - radius else None
+        row = []
+        for x in range(size):
+            cx = x if x < radius else size - 1 - x if x >= size - radius else None
+            if cx is not None and cy is not None:
+                colour = corner[cy][cx]
+            elif min(x, y, size - 1 - x, size - 1 - y) < width and outline:
+                colour = edge
+            else:
+                colour = body
+            row.append("#%02x%02x%02x" % colour)
+        rows.append("{" + " ".join(row) + "}")
+    return " ".join(rows)
 
 
 def needs_attention(severity, action):
@@ -288,7 +335,7 @@ class Application:
         import os
         version = os.environ.get("HH_APP_VERSION")
         self.update_release = None
-        self.update_button = ttk.Button(header, text="Обновить", style="Accent.TButton", command=self.apply_update)
+        self.update_button = ttk.Button(header, text="Обновить", style="Page.Accent.TButton", command=self.apply_update)
         if version:
             ttk.Label(header, text="версия " + version, style="PageHint.TLabel").pack(side="right", pady=(8, 0))
         self.build_settings_menu(header)
@@ -308,7 +355,7 @@ class Application:
         self.build_main(main)
         self.load_styles()
         self.update_search_mode()
-        self.review_buttons = (self.yes, self.no, self.submit, self.edit, self.manual_button)
+        self.review_buttons = (self.yes, self.no, self.submit, self.edit)
         self.clear_review()
         for variable in (self.search, self.search_mode, self.limit, self.minimum, self.maximum):
             variable.trace_add("write", lambda *_a: self.refresh_steps())
@@ -323,7 +370,8 @@ class Application:
     # ---- layout -----------------------------------------------------------------
 
     def setup_style(self):
-        """Fluent-like light theme on the built-in clam engine: no extra dependency."""
+        """Happai-like dark theme on the built-in clam engine: no extra dependency.
+        Rounded cards, pill buttons and fields are 9-slice images, so any size keeps its corners."""
         from tkinter import font
         style = self.ttk.Style(self.root)
         style.theme_use("clam")
@@ -351,54 +399,126 @@ class Application:
             self.root.option_add(option, value)
         style.map(".", foreground=[("disabled", DISABLED)])
         style.configure("Page.TFrame", background=PAGE)
-        style.configure("Card.TFrame", background=CARD, relief="solid", borderwidth=1, bordercolor=BORDER)
-        style.configure("CurrentCard.TFrame", background=CARD, relief="solid", borderwidth=1, bordercolor=ACCENT)
-        style.configure("Title.TLabel", background=PAGE, font=heavy(17))
+        # Cards: rounded, no outline; the current one gets a lime edge.
+        self.rounded_layout(style, "Card.TFrame", "Frame", CARD_RADIUS, [(None, PAGE, CARD, None)])
+        self.rounded_layout(style, "CurrentCard.TFrame", "Frame", CARD_RADIUS, [(None, PAGE, CARD, ACCENT)])
+        # A card inside a card keeps its shape with a thin outline.
+        self.rounded_layout(style, "InnerCard.TFrame", "Frame", CARD_RADIUS, [(None, CARD, CARD, BORDER)])
+        for name in ("Card", "CurrentCard", "InnerCard"):
+            style.configure(name + ".TFrame", background=CARD)
+        style.configure("Title.TLabel", background=PAGE, font=heavy(20))
         style.configure("PageHint.TLabel", background=PAGE, foreground=MUTED, font=(body, 9))
-        style.configure("Heading.TLabel", font=heavy(14))
+        style.configure("Heading.TLabel", font=heavy(16))
         style.configure("Subheading.TLabel", font=heavy(10))
         for name, colour in (("StepDone", SUCCESS), ("StepCurrent", ACCENT), ("StepLocked", MUTED)):
-            style.configure(name + ".TLabel", foreground=colour, font=heavy(10))
+            style.configure(name + ".TLabel", foreground=colour, font=heavy(11))
         style.configure("Hint.TLabel", foreground=MUTED, font=(body, 9))
+        style.configure("Link.TLabel", foreground=ACCENT, font=(body, 9))
         style.configure("Done.TLabel", foreground=SUCCESS, font=(body, 9))
         style.configure("Locked.TLabel", foreground=DISABLED, font=(body, 9))
         style.configure("Error.TLabel", foreground=CRITICAL, font=(body, 9))
         style.configure("Warn.TLabel", foreground=WARNING, font=(body, 9))
-        style.configure("TButton", background=CONTROL, foreground=TEXT, bordercolor=CONTROL_BORDER,
-                        lightcolor=CONTROL, darkcolor=CONTROL, padding=(12, 5), relief="solid", borderwidth=1)
-        button_states = [("disabled", CARD), ("pressed", CONTROL_PRESSED), ("active", CONTROL_HOVER)]
-        style.map("TButton", background=button_states, lightcolor=button_states, darkcolor=button_states,
-                  bordercolor=[("disabled", BORDER), ("focus", ACCENT)])
-        style.configure("Accent.TButton", background=ACCENT, foreground=ON_ACCENT, bordercolor=ACCENT,
-                        lightcolor=ACCENT, darkcolor=ACCENT, font=heavy(10), padding=(14, 6))
-        accent_states = [("disabled", "#434343"), ("pressed", ACCENT_PRESSED), ("active", ACCENT_HOVER)]
-        style.map("Accent.TButton", background=accent_states, lightcolor=accent_states, darkcolor=accent_states,
-                  bordercolor=accent_states, foreground=[("disabled", DISABLED)])
-        style.configure("Expander.TButton", anchor="w", padding=(14, 9))
+        # Pill buttons: a dark one and a lime one per surface they sit on (card, page, InfoBar).
+        surfaces = {"": CARD, "Page.": PAGE}
+        surfaces.update({f"{level}.Info.": colours[0] for level, colours in SEVERITY.items()})
+        for prefix, surface in surfaces.items():
+            self.rounded_layout(style, prefix + "TButton", "Button", BUTTON_RADIUS, [
+                ("disabled", surface, CARD if surface != CARD else "#1c1c1c", BORDER),
+                ("pressed", surface, CONTROL_PRESSED, None),
+                ("active focus", surface, CONTROL_HOVER, ACCENT),
+                ("active", surface, CONTROL_HOVER, None),
+                ("focus", surface, CONTROL, ACCENT),
+                (None, surface, CONTROL, None)])
+            self.rounded_layout(style, prefix + "Accent.TButton", "Button", BUTTON_RADIUS, [
+                ("disabled", surface, "#2a2a2a", None),
+                ("pressed", surface, ACCENT_PRESSED, None),
+                ("active focus", surface, ACCENT_HOVER, TEXT),
+                ("active", surface, ACCENT_HOVER, None),
+                ("focus", surface, ACCENT, TEXT),
+                (None, surface, ACCENT, None)])
+            style.configure(prefix + "TButton", background=surface, foreground=TEXT, padding=(14, 6))
+            style.configure(prefix + "Accent.TButton", background=surface, foreground=ON_ACCENT,
+                            font=heavy(10), padding=(16, 7))
+            style.map(prefix + "Accent.TButton", foreground=[("disabled", DISABLED)])
+        style.configure("Expander.TButton", anchor="w", padding=(16, 10))
+        self.rounded_layout(style, "Expander.TButton", "Button", BUTTON_RADIUS, [
+            ("pressed", PAGE, CONTROL_PRESSED, None), ("active focus", PAGE, CONTROL_HOVER, ACCENT),
+            ("active", PAGE, CONTROL_HOVER, None), ("focus", PAGE, CARD, ACCENT), (None, PAGE, CARD, None)])
+        # Fields: rounded wells with a lime ring while focused; arrows sit inside the well.
+        field_states = [("disabled", CARD, CARD, BORDER), ("focus", CARD, FIELD, ACCENT),
+                        (None, CARD, FIELD, CONTROL_BORDER)]
         for widget in ("TEntry", "TCombobox", "TSpinbox"):
-            style.configure(widget, fieldbackground=FIELD, bordercolor=CONTROL_BORDER, lightcolor=FIELD,
-                            darkcolor=FIELD, padding=5, arrowcolor=MUTED, background=CONTROL, foreground=TEXT)
-            style.map(widget, bordercolor=[("focus", ACCENT)], lightcolor=[("focus", ACCENT)],
-                      fieldbackground=[("disabled", CARD), ("readonly", FIELD)],
-                      background=[("active", CONTROL_HOVER)],
+            self.rounded_layout(style, widget, widget[1:], FIELD_RADIUS, field_states)
+            style.configure(widget, fieldbackground=FIELD, bordercolor=FIELD, lightcolor=FIELD,
+                            darkcolor=FIELD, padding=(6, 4), arrowcolor=MUTED, background=FIELD,
+                            foreground=TEXT, arrowsize=12)
+            style.map(widget, fieldbackground=[("disabled", CARD)], background=[("disabled", CARD)],
+                      bordercolor=[("disabled", CARD)], lightcolor=[("disabled", CARD)],
+                      darkcolor=[("disabled", CARD)], arrowcolor=[("active", ACCENT), ("disabled", DISABLED)],
                       selectbackground=[("readonly !focus", FIELD)], selectforeground=[("readonly !focus", TEXT)])
-        style.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT)
-        style.configure("TRadiobutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT)
+        style.configure("TCheckbutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT,
+                        upperbordercolor=CONTROL_BORDER, lowerbordercolor=CONTROL_BORDER)
+        style.configure("TRadiobutton", indicatorbackground=FIELD, indicatorforeground=ON_ACCENT,
+                        upperbordercolor=CONTROL_BORDER, lowerbordercolor=CONTROL_BORDER)
         style.map("TRadiobutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
         style.map("TCheckbutton", indicatorbackground=[("selected", ACCENT)], background=[("active", CARD)])
-        style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=BORDER,
-                        bordercolor=BORDER, lightcolor=ACCENT, darkcolor=ACCENT, thickness=4)
-        # Thin neutral scrollbars, as in Windows 11 lists.
-        style.configure("Vertical.TScrollbar", background="#5a5a5a", troughcolor=CARD, bordercolor=CARD,
-                        arrowcolor=MUTED, lightcolor="#5a5a5a", darkcolor="#5a5a5a", arrowsize=11, gripcount=0)
-        style.map("Vertical.TScrollbar", background=[("active", "#7a7a7a")])
+        style.configure("Accent.Horizontal.TProgressbar", background=ACCENT, troughcolor=CONTROL,
+                        bordercolor=CONTROL, lightcolor=ACCENT, darkcolor=ACCENT, thickness=6)
+        # Thin neutral scrollbars that fade into their surface.
+        style.configure("Vertical.TScrollbar", background=SCROLL, troughcolor=CARD, bordercolor=CARD,
+                        arrowcolor=MUTED, lightcolor=SCROLL, darkcolor=SCROLL, arrowsize=11, gripcount=0)
+        style.map("Vertical.TScrollbar", background=[("active", SCROLL_HOVER)],
+                  lightcolor=[("active", SCROLL_HOVER)], darkcolor=[("active", SCROLL_HOVER)])
         style.configure("Page.Vertical.TScrollbar", troughcolor=PAGE, bordercolor=PAGE)
         for level, (background, icon, _glyph, _fallback) in SEVERITY.items():
-            style.configure(f"{level}.Info.TFrame", background=background, relief="solid", borderwidth=1,
-                            bordercolor=background)
+            self.rounded_layout(style, f"{level}.Info.TFrame", "Frame", BUTTON_RADIUS,
+                                [(None, PAGE, background, None)])
+            style.configure(f"{level}.Info.TFrame", background=background)
             style.configure(f"{level}.Info.TLabel", background=background, foreground=TEXT, font=(body, 10))
             style.configure(f"{level}.InfoIcon.TLabel", background=background, foreground=icon,
                             font=(self.icon_font, 12) if self.icon_font else (body, 11, "bold"))
+
+    def rounded_layout(self, style, name, kind, radius, states):
+        """Give the style a rounded image element in place of its flat border or field.
+        states: (state spec or None for the default, surface, fill, outline or None), first match wins."""
+        tk = self.tk
+        # Radii follow the display scaling, like the fonts do.
+        radius = max(4, round(radius * self.root.winfo_fpixels("1i") / 96))
+        images = self.root.__dict__.setdefault("rounded_images", {})  # Tk drops unreferenced images.
+        element = "Round." + name.replace(".", "_")
+        specs = []
+        for spec, surface, fill, outline in states:
+            key = (radius, surface, fill, outline)
+            if key not in images:
+                image = tk.PhotoImage(master=self.root, width=2 * radius + 2, height=2 * radius + 2)
+                image.put(rounded_rows(radius, surface, fill, outline, width=max(1, radius // 8)))
+                images[key] = image
+            specs.append((spec, images[key]))
+        default = next(image for spec, image in specs if spec is None)
+        if element not in style.element_names():
+            # Fields keep their arrows off the corners; other shapes only need a little room.
+            padding = (radius // 2 + 1, radius // 3 + 1) if kind in ("Combobox", "Spinbox") else (radius // 3, 2)
+            style.element_create(element, "image", default,
+                                 *[(spec, image) for spec, image in specs if spec is not None],
+                                 border=radius, padding=padding, sticky="nsew")
+        if kind == "Frame":
+            style.layout(name, [(element, {"sticky": "nsew"})])
+        elif kind == "Button":
+            style.layout(name, [(element, {"sticky": "nsew", "children": [
+                ("Button.padding", {"sticky": "nsew", "children": [("Button.label", {"sticky": "nsew"})]})]})])
+        elif kind == "Entry":
+            style.layout(name, [(element, {"sticky": "nsew", "children": [
+                ("Entry.padding", {"sticky": "nsew", "children": [("Entry.textarea", {"sticky": "nsew"})]})]})])
+        elif kind == "Combobox":
+            style.layout(name, [(element, {"sticky": "nsew", "children": [
+                ("Combobox.downarrow", {"side": "right", "sticky": "ns"}),
+                ("Combobox.padding", {"sticky": "nsew", "children": [("Combobox.textarea", {"sticky": "nsew"})]})]})])
+        elif kind == "Spinbox":
+            style.layout(name, [(element, {"side": "top", "sticky": "we", "children": [
+                ("null", {"side": "right", "sticky": "", "children": [
+                    ("Spinbox.uparrow", {"side": "top", "sticky": "e"}),
+                    ("Spinbox.downarrow", {"side": "bottom", "sticky": "e"})]}),
+                ("Spinbox.padding", {"sticky": "nsew", "children": [("Spinbox.textarea", {"sticky": "nsew"})]})]})])
 
     def build_infobar(self, parent):
         """Fluent InfoBar: one status line whose colour and icon state its severity."""
@@ -426,9 +546,12 @@ class Application:
             return
         _background, _icon, glyph, fallback = SEVERITY[level]
         infobar.configure(style=f"{level}.Info.TFrame")
+        if getattr(self, "infobar_action", None) is not None:
+            self.infobar_action.configure(style=f"{level}.Info.TButton")
         for button in (getattr(self, "infobar_more", None), getattr(self, "infobar_report", None)):
             if button is None:
                 continue
+            button.configure(style=f"{level}.Info.TButton")
             if level in ("error", "warning"):
                 button.pack(side="right", padx=(10, 0))
             else:
@@ -464,7 +587,7 @@ class Application:
         return button
 
     def card(self, parent, style="Card.TFrame"):
-        """White card on the page background (Windows 11 settings-card pattern)."""
+        """Rounded dark card on the black page (Happai pattern)."""
         card = self.ttk.Frame(parent, style=style, padding=(16, 12, 16, 14))
         card.columnconfigure(0, weight=1)
         return card
@@ -667,7 +790,8 @@ class Application:
                 self.build_update_menu(menu)
                 menu.add_separator()
             menu.add_command(label=label, command=command)
-        self.settings_button = ttk.Button(header, text="Настройки ▾", command=self.post_settings_menu)
+        self.settings_button = ttk.Button(header, text="Настройки ▾", style="Page.TButton",
+                                          command=self.post_settings_menu)
         self.settings_button.pack(side="right", padx=(12, 0))
         self.setup_status = ttk.Label(header, style="PageHint.TLabel", cursor="hand2")
         self.setup_status.pack(side="right", pady=(8, 0))
@@ -912,6 +1036,7 @@ class Application:
         menu = self.tk.Menu(text, tearoff=0)
         menu.add_command(label="Копировать", command=copy)
         menu.add_command(label="Выделить всё", command=select_all)
+        text.clipboard_keys, text.context_menu = control_key, menu
         text.bind("<Button-1>", lambda _e: text.focus_set(), add="+")
         text.bind("<Control-KeyPress>", control_key)
         text.bind("<Button-3>", lambda e: menu.tk_popup(e.x_root, e.y_root))
@@ -950,8 +1075,28 @@ class Application:
         menu.add_separator()
         menu.add_command(label="Выделить всё", command=select_all)
         text.clipboard_keys = control_key  # Tests call it: a hidden window gets no key events.
+        text.context_menu = menu
         text.bind("<Control-KeyPress>", control_key)
         text.bind("<Button-3>", lambda e: (text.focus_set(), menu.tk_popup(e.x_root, e.y_root)))
+
+    def make_reviewable(self, text):
+        """A copyable Text that a review can unlock for editing (#17): while its state is
+        normal it gets the editing keys and menu, otherwise the copy-only ones."""
+        read_keys, read_menu = text.clipboard_keys, text.context_menu
+        self.make_editable(text)
+        edit_keys, edit_menu = text.clipboard_keys, text.context_menu
+        text.configure(undo=True)
+
+        def editable():
+            return str(text["state"]) == "normal"
+
+        def control_key(event):
+            return (edit_keys if editable() else read_keys)(event)
+
+        text.clipboard_keys = control_key
+        text.bind("<Control-KeyPress>", control_key)
+        text.bind("<Button-3>", lambda e: (text.focus_set(), (edit_menu if editable() else read_menu)
+                                           .tk_popup(e.x_root, e.y_root)))
 
     def build_main(self, main):
         ttk = self.ttk
@@ -1015,20 +1160,22 @@ class Application:
         frame.grid(row=1, column=0, sticky="nsew")
         self.letter_label = ttk.Label(work, text="Сопроводительное письмо")
         self.letter_label.grid(row=2, column=0, sticky="w")
+        # The reviewed text is edited in place (#17): read-only until a review allows it.
         frame, self.letter = self.text_box(work, 7)
+        self.make_reviewable(self.letter)
         frame.grid(row=3, column=0, sticky="nsew", pady=(2, 6))
 
         self.decision = decision = ttk.Frame(work)
         decision.grid(row=4, column=0, sticky="ew")
         self.yes = ttk.Button(decision, text="Отправить письмо", style="Accent.TButton",
-                              command=lambda: self.respond("yes"))
+                              command=self.approve)
         self.no = ttk.Button(decision, text="Пропустить", command=lambda: self.respond("no"))
         self.yes.pack(side="left")
         self.no.pack(side="left", padx=6)
-        ttk.Label(decision, text="Текст уйдёт без изменений.",
-                  style="Hint.TLabel").pack(side="left", padx=6)
+        self.decision_hint = ttk.Label(decision, style="Hint.TLabel")
+        self.decision_hint.pack(side="left", padx=6)
 
-        self.chat_frame = self.card(work)
+        self.chat_frame = self.card(work, style="InnerCard.TFrame")
         self.chat_frame.grid(row=5, column=0, sticky="ew", pady=(12, 0))
         self.refine_label = ttk.Label(self.chat_frame, style="Subheading.TLabel")
         self.refine_label.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 4))
@@ -1037,19 +1184,14 @@ class Application:
         self.instruction.bind("<Return>", lambda _e: self.refine())
         self.edit = ttk.Button(self.chat_frame, text="Переписать", command=self.refine)
         self.edit.grid(row=1, column=1, sticky="ew", padx=(6, 0))
-        self.manual_label = ttk.Label(self.chat_frame)
-        self.manual_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
-        self.manual = self.tk.Text(self.chat_frame, height=2, wrap="word", font=self.text_font,
-                                   relief="flat", borderwidth=0, padx=10, pady=8, background=CONTROL,
-                                   foreground=TEXT, selectbackground=ACCENT, selectforeground=ON_ACCENT, highlightthickness=1, highlightbackground=CONTROL_BORDER,
-                                   highlightcolor=ACCENT, insertbackground=TEXT)
-        self.manual.grid(row=3, column=0, sticky="ew")
-        self.manual_button = ttk.Button(self.chat_frame, text="Взять мой текст", command=self.manual_edit)
-        self.manual_button.grid(row=3, column=1, sticky="new", padx=(6, 0))
+        # A chat with buttons accepts only one of them: the choice goes into the field above.
+        self.option_label = ttk.Label(self.chat_frame, text="Или выбери другой вариант ответа:")
+        self.option_label.grid(row=2, column=0, columnspan=2, sticky="w", pady=(8, 0))
         self.option = ttk.Combobox(self.chat_frame, state="readonly")
-        self.option.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        self.option.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        self.option.bind("<<ComboboxSelected>>", self.select_option)
         self.edit_hint = ttk.Label(self.chat_frame, style="Hint.TLabel")
-        self.edit_hint.grid(row=5, column=0, columnspan=2, sticky="w", pady=(4, 0))
+        self.edit_hint.grid(row=4, column=0, columnspan=2, sticky="w", pady=(4, 0))
 
         work.rowconfigure(1, weight=1, minsize=110)
         work.rowconfigure(3, weight=2, minsize=130)
@@ -1191,6 +1333,9 @@ class Application:
         widget.configure(state="normal")
         widget.delete("1.0", "end")
         widget.insert("1.0", text)
+        # Undo must not bring back an earlier letter, and only a person's change counts as an edit.
+        widget.edit_reset()
+        widget.edit_modified(False)
         widget.configure(state="disabled")
 
     def append_log(self, text):
@@ -1418,12 +1563,13 @@ class Application:
             self.next_button.configure(state="disabled")
 
     def clear_review(self):
-        self.review_kind = None
+        self.review_kind = self.review_shown = None
+        self.review_options = []
         for button in self.review_buttons:
             button.configure(state="disabled")
+        self.set_letter_editable(False)  # Keeps the text: after «Отправить» it shows what went.
         self.credential.delete(0, "end")
         self.instruction.delete(0, "end")
-        self.manual.delete("1.0", "end")
         self.option.configure(values=())
         self.option.set("")
         # Show only the controls the current decision needs.
@@ -1431,6 +1577,12 @@ class Application:
                       getattr(self, "decision", None)):
             if frame is not None:
                 frame.grid_remove()
+
+    def set_letter_editable(self, editable):
+        """Unlock the big field for a review (#17); the field colour shows whether it can be edited."""
+        self.letter.configure(state="normal" if editable else "disabled",
+                              background=CONTROL if editable else FIELD)
+        self.letter.edit_reset()
 
     def selected_id(self):
         index = self.resume_box.current()
@@ -1626,7 +1778,7 @@ class Application:
     def prepare_run_view(self, action, limit):
         self.run_counts = {"vacancies": 0, "sent": 0, "captcha": 0, "unconfirmed": 0,
                            "limit": limit if action == "auto" else None}
-        self.review_note = None
+        self.review_note = self.review_follow = None
         self.stop_reason = None
         self.letter_model, self.model_switched = None, False
         if getattr(self, "heading", None) is None:
@@ -1665,30 +1817,68 @@ class Application:
         text = " · ".join(parts)
         counter.configure(text=text[:1].upper() + text[1:])
 
-    def respond(self, action, text=""):
+    def respond(self, action, text="", message=None):
         from gui_protocol import ProtocolError
         if self.session is None:
-            return
+            return False
         try:
             self.session.respond(action, text)
             self.clear_review()  # Edits consume this review; next one has a fresh ID.
-            self.say("Правка принята. Новый вариант придёт на проверку и сам не отправится."
-                            if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг.")
+            self.say(message or ("Правка принята. Новый вариант придёт на проверку и сам не отправится."
+                                 if action in {"edit", "manual"} else "Решение принято. Жду следующий шаг."))
+            return True
         except ProtocolError:
             self.stop()
+            return False
 
     def submit_credential(self):
         if str(self.submit["state"]) == "normal" and self.credential.get().strip():
             self.respond("submit", self.credential.get())
 
+    def approve(self):
+        if str(self.yes["state"]) == "normal":
+            self.answer_with_field("yes")
+
     def refine(self):
         if str(self.edit["state"]) == "normal" and self.instruction.get().strip():
-            self.respond("edit", self.instruction.get())
+            self.answer_with_field("edit", self.instruction.get())
 
-    def manual_edit(self):
-        text = self.option.get() if self.option["values"] else self.manual.get("1.0", "end-1c")
-        if text.strip():
-            self.respond("manual", text)
+    def edited_text(self):
+        """The big field if the person changed it during this review (#17), else None."""
+        if self.review_shown is None or not self.letter.edit_modified():
+            return None
+        text = self.letter.get("1.0", "end-1c")
+        return None if text == self.review_shown[2] else text
+
+    def answer_with_field(self, action, text=""):
+        """Answer the review with `action` for the text now in the big field (#17).
+
+        An unchanged field answers at once. A changed one goes first as «manual»: the worker
+        shows that exact text again, and handle_frame answers that identical review with
+        `action` itself, so the person decides once and the protocol stays as it was.
+        """
+        edited = self.edited_text()
+        if edited is None or self.session is None:
+            return self.respond(action, text)
+        if not edited.strip():
+            self.say("Поле пустое. Напиши текст или нажми «Пропустить».", "warning")
+            return False
+        if self.review_options and edited not in self.review_options:
+            self.say("Здесь можно отправить только один из вариантов в списке.", "warning")
+            return False
+        follow = (self.session.run, *self.review_shown[:2], edited, action, text)
+        if not self.respond("manual", edited, "Отправляю твой текст." if action == "yes"
+                            else "Твой текст принят, AI перепишет его. Новый вариант придёт на проверку."):
+            return False
+        self.review_follow = follow
+        return True
+
+    def select_option(self, _event=None):
+        """A chat with buttons: the chosen answer replaces the read-only field and goes on «Отправить»."""
+        index = self.option.current()
+        if self.review_shown is not None and 0 <= index < len(self.review_options):
+            self.replace_text(self.letter, self.review_options[index])
+            self.letter.edit_modified(True)
 
     def stop(self):
         if self.session is not None:
@@ -2239,6 +2429,8 @@ class Application:
                     or not all(isinstance(item, str) for item in payload["options"])):
                 raise ProtocolError("Invalid review payload")
             self.clear_review()
+            # One-shot (#17): only the review right after the person's own text may be answered for them.
+            follow, self.review_follow = getattr(self, "review_follow", None), None
             self.review_kind = payload["kind"]
             if self.review_kind == "credential":
                 self.credential_label.configure(text=payload["context"] or "Введи данные для входа")
@@ -2251,8 +2443,14 @@ class Application:
             self.show_work()
             self.replace_text(self.context, payload["context"])
             self.replace_text(self.letter, payload["text"])
+            if follow is not None and follow[:4] == (session.run, payload["kind"], payload["context"],
+                                                     payload["text"]):
+                self.respond(*follow[4:])  # The person's own text, shown back unchanged: already decided.
+                return
             chat = self.review_kind == "chat"
             bare = not chat and payload["text"] == ""  # #9: an application without a letter.
+            options = self.review_options = list(payload["options"])
+            self.review_shown = (payload["kind"], payload["context"], payload["text"])
             written = getattr(self, "letter_model", None)
             self.letter_label.configure(text=("Ответ в чат. Его получит работодатель." if chat else
                                               "Отклик без сопроводительного письма: работодатель увидит только резюме."
@@ -2262,28 +2460,32 @@ class Application:
             self.decision.grid()
             self.yes.configure(state="normal")
             self.no.configure(state="normal")
-            # Both an answer in a chat and a letter can be rewritten by AI or replaced by own text.
+            # The text is edited right in the big field (#17); a chat with buttons takes only a button.
+            self.set_letter_editable(not bare and not options)
+            self.decision_hint.configure(text="Отклик уйдёт без письма." if bare else
+                                         "Уйдёт вариант из поля выше." if options else
+                                         "Можно исправить прямо в поле: уйдёт то, что в нём написано.")
             what = "ответ" if chat else "письмо"
             self.refine_label.configure(text=f"Попроси AI переписать {what} (работодатель не увидит просьбу):")
-            self.manual_label.configure(text="Или напиши ответ сам:" if chat else
-                                        "Или исправь письмо сам и нажми «Взять мой текст»:")
-            self.edit_hint.configure(text=f"После правки {what} снова придёт на проверку и сам не отправится.")
+            self.edit_hint.configure(text=f"После просьбы к AI {what} снова придёт на проверку и сам не отправится.")
             if not bare:  # Nothing to rewrite when no letter is sent.
                 self.chat_frame.grid()
                 self.edit.configure(state="normal")
-                self.manual_button.configure(state="normal")
-            self.manual.configure(height=2 if chat else 5)
-            if not chat:
-                self.manual.insert("1.0", payload["text"])  # Fix a word without retyping the letter.
-            self.option.configure(values=payload["options"])
-            if payload["options"]:
+            self.option.configure(values=options)
+            if options:
+                self.option_label.grid()
                 self.option.grid()
-                self.option.current(0)
+                if payload["text"] in options:
+                    self.option.current(options.index(payload["text"]))
             else:
+                self.option_label.grid_remove()
                 self.option.grid_remove()
             note, self.review_note = getattr(self, "review_note", None), None
-            self.say((note + " " if note else "") + "Прочитай текст. Нажми «" + str(self.yes["text"])
-                     + "», «Пропустить» или исправь его ниже.", "warning" if note else "info")
+            self.say((note + " " if note else "")
+                     + ("Нажми «Отправить отклик» или «Пропустить»." if bare else
+                        "Прочитай ответ. Нажми «Отправить ответ», «Пропустить» или выбери другой вариант ниже."
+                        if options else "Прочитай текст и при необходимости исправь его прямо в поле. Нажми «"
+                        + str(self.yes["text"]) + "» или «Пропустить»."), "warning" if note else "info")
             return
         payload = data["payload"]
         name, value = payload.get("name"), payload.get("data")

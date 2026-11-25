@@ -61,6 +61,8 @@ jobs:
         run: python -B windows/check_gui_auth.py
       - name: Run offline packaging boundary tests
         run: python windows/check_packaging.py
+      - name: Run offline release asset contract tests
+        run: python windows/check_release_assets.py
       - name: Run fresh-process offline source and guarded gateway smoke
         run: python -B windows/packaging/check_source_smoke.py
   installer:
