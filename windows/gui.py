@@ -399,11 +399,12 @@ class Application:
             self.root.option_add(option, value)
         style.map(".", foreground=[("disabled", DISABLED)])
         style.configure("Page.TFrame", background=PAGE)
-        # Cards: rounded, no outline; the current one gets a lime edge.
-        self.rounded_layout(style, "Card.TFrame", "Frame", CARD_RADIUS, [(None, PAGE, CARD, None)])
-        self.rounded_layout(style, "CurrentCard.TFrame", "Frame", CARD_RADIUS, [(None, PAGE, CARD, ACCENT)])
-        # A card inside a card keeps its shape with a thin outline.
-        self.rounded_layout(style, "InnerCard.TFrame", "Frame", CARD_RADIUS, [(None, CARD, CARD, BORDER)])
+        # Cards are flat: a ttk image element redraws a big widget tile by tile and made the window crawl.
+        # The current card keeps its lime edge, an inner card a thin neutral one.
+        style.configure("Card.TFrame", borderwidth=0)
+        for name, edge in (("CurrentCard", ACCENT), ("InnerCard", BORDER)):
+            style.configure(name + ".TFrame", borderwidth=1, relief="solid", bordercolor=edge,
+                            lightcolor=edge, darkcolor=edge)
         for name in ("Card", "CurrentCard", "InnerCard"):
             style.configure(name + ".TFrame", background=CARD)
         style.configure("Title.TLabel", background=PAGE, font=heavy(20))
@@ -587,7 +588,7 @@ class Application:
         return button
 
     def card(self, parent, style="Card.TFrame"):
-        """Rounded dark card on the black page (Happai pattern)."""
+        """Dark card on the black page (Happai pattern)."""
         card = self.ttk.Frame(parent, style=style, padding=(16, 12, 16, 14))
         card.columnconfigure(0, weight=1)
         return card
