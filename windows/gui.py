@@ -482,6 +482,9 @@ class Application:
     def rounded_layout(self, style, name, kind, radius, states):
         """Give the style a rounded image element in place of its flat border or field.
         states: (state spec or None for the default, surface, fill, outline or None), first match wins."""
+        import os
+        if os.environ.get("HH_GUI_FLAT") == "1":
+            return  # Diagnostic switch: stock flat ttk elements, no rounded images.
         tk = self.tk
         # Radii follow the display scaling, like the fonts do.
         radius = max(4, round(radius * self.root.winfo_fpixels("1i") / 96))
