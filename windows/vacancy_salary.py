@@ -29,30 +29,31 @@ def is_amount(value):
     return (type(value) in (int, float) and math.isfinite(value) and value >= 0)
 
 
-def salary_rejection_reason(vacancy, api_client=None):
+def salary_rejection_reason(vacancy, api_client=None, *, minimum=MINIMUM_NET_RUB, ceiling=MAXIMUM_RUB):
+    """The limits are the saved vacancy filters (#15); ceiling None means no upper limit."""
     salary = vacancy.get("salary") or {}
     amounts = [salary.get(key) for key in ("from", "to")
                if is_amount(salary.get(key))]
     currency = salary.get("currency")
-    if amounts:
+    if amounts and ceiling is not None:
         rate = 1 if currency in ("RUR", "RUB") else (
             currency_rates(api_client).get(currency) if api_client is not None else None
         )
         if not is_amount(rate) or rate == 0:
             return "не удалось проверить лимит зарплаты: неизвестен курс валюты"
         # Compare without division or binary floating-point boundary errors.
-        if Decimal(str(max(amounts))) > MAXIMUM_RUB * Decimal(str(rate)):
-            return "указанная зарплата выше 300 000 ₽ (по курсу HH)"
-    ceiling = salary.get("to")
-    if salary.get("currency") != "RUR" or not isinstance(ceiling, (int, float)):
+        if Decimal(str(max(amounts))) > ceiling * Decimal(str(rate)):
+            return f"указанная зарплата выше {ceiling:,} ₽ (по курсу HH)".replace(",", " ")
+    top = salary.get("to")
+    if salary.get("currency") != "RUR" or not isinstance(top, (int, float)):
         return None
     # For a gross salary, 13% is the lowest applicable income-tax rate here.
     # Higher rates only lower the take-home amount further. An unspecified tax
     # basis is treated as net, so borderline offers are left for human review.
     if salary.get("gross") is True:
-        below_minimum = ceiling * 87 < MINIMUM_NET_RUB * 100
+        below_minimum = top * 87 < minimum * 100
     else:
-        below_minimum = ceiling < MINIMUM_NET_RUB
+        below_minimum = top < minimum
     if below_minimum:
-        return f"потолок зарплаты не достигает {MINIMUM_NET_RUB:,} ₽ на руки".replace(",", " ")
+        return f"потолок зарплаты не достигает {minimum:,} ₽ на руки".replace(",", " ")
     return None

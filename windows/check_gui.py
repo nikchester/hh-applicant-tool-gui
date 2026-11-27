@@ -1834,8 +1834,8 @@ class WizardChecks(unittest.TestCase):
             menu = app.settings_menu
             labels = [menu.entrycget(index, "label") for index in range(menu.index("end") + 1)
                       if menu.type(index) == "command"]
-            self.assertEqual(labels, ["Аккаунт HH…", "AI-провайдер…", "Стили письма…", "Журнал…",
-                                      "Пройти настройку заново"])
+            self.assertEqual(labels, ["Аккаунт HH…", "AI-провайдер…", "Стили письма…", "Фильтры вакансий…",
+                                      "Журнал…", "Пройти настройку заново"])
             menu.invoke("AI-провайдер…")
             self.assertEqual((app.wizard_page, app.wizard_settings), ("ai", True))
             app.wizard_next.invoke()
@@ -1845,6 +1845,7 @@ class WizardChecks(unittest.TestCase):
             self.assertIsNotNone(app.log_view)
             app.set_busy(True)
             self.assertEqual(menu.entrycget("Аккаунт HH…", "state"), "disabled")
+            self.assertEqual(menu.entrycget("Фильтры вакансий…", "state"), "disabled")
             self.assertEqual(menu.entrycget("Журнал…", "state"), "normal")
             app.set_busy(False)
             self.assertEqual(menu.entrycget("Аккаунт HH…", "state"), "normal")
@@ -1852,6 +1853,136 @@ class WizardChecks(unittest.TestCase):
             self.assertEqual((app.wizard_page, app.wizard_settings), ("hh", False))
             self.assertEqual(app.wizard_close.winfo_manager(), "")
         self.run_app(test, prepare=self.complete_profile)
+
+    def filters_file(self):
+        return gui_profile.filters_path()
+
+    def test_filters_window_saves_the_filters_and_the_summary_follows(self):
+        import vacancy_filters as vf
+
+        def test(app, root):
+            self.assertEqual(app.filters_summary.cget("text"), "удалённо · от 80 000 ₽ · без Senior/Lead")
+            app.settings_menu.invoke("Фильтры вакансий…")
+            dialog = app.filters_dialog
+            variables = dialog["variables"]
+            self.assertTrue(app.filters_window.winfo_exists())
+            self.assertEqual(variables["minimum"].get(), "80000")
+            self.assertTrue(variables["exclude_senior"].get())
+            self.assertEqual([key for key in vf.EXPERIENCE if variables["experience_" + key].get()], list(vf.EXPERIENCE))
+            self.assertEqual(variables["period"].get(), "Любая")
+            self.assertEqual(str(dialog["save_button"]["state"]), "normal")
+            variables["minimum"].set("100 000")
+            variables["no_ceiling"].set(True)
+            variables["experience_moreThan6"].set(False)
+            variables["period"].set("7 дней")
+            variables["not_from_agency"].set(True)
+            dialog["words"].insert("1.0", "1С\n  Bitrix  \n\n")
+            dialog["employers"].insert("1.0", "https://hh.ru/employer/1740 Пример-Софт\n2748\n")
+            root.update()
+            dialog["save"]()
+            self.assertFalse(app.filters_window)
+            saved = json.loads(self.filters_file().read_text(encoding="utf-8"))
+            self.assertEqual(saved, vf.Filters(
+                salary_minimum=100000, salary_ceiling=None, experience=("noExperience", "between1And3", "between3And6"),
+                stop_words=("1С", "Bitrix"), period=7, not_from_agency=True,
+                hidden_employers=({"id": "1740", "name": "Пример-Софт"}, {"id": "2748", "name": ""})).data())
+            self.assertEqual(app.filters_summary.cget("text"), (
+                "удалённо · от 100 000 ₽ · без потолка · без Senior/Lead · опыт: нет опыта, 1–3 года, 3–6 лет"
+                " · стоп-слов: 2 · скрыто компаний: 2 · за 7 дн. · без агентств"))
+            # Opened again, the window shows the saved values; «Сбросить по умолчанию» fills the defaults.
+            app.edit_filters()
+            dialog = app.filters_dialog
+            self.assertEqual(dialog["variables"]["minimum"].get(), "100000")
+            self.assertTrue(dialog["variables"]["no_ceiling"].get())
+            self.assertEqual(dialog["words"].get("1.0", "end-1c"), "1С\nBitrix")
+            self.assertEqual(dialog["employers"].get("1.0", "end-1c"), "1740 Пример-Софт\n2748")
+            dialog["show"](vf.DEFAULTS)
+            self.assertEqual(dialog["collect"](), vf.DEFAULTS)
+            self.assertEqual(dialog["words"].get("1.0", "end-1c"), "")
+            dialog["close"]()
+            self.assertEqual(vf.read(self.filters_file()).stop_words, ("1С", "Bitrix"))  # Reset is not saved on its own.
+        self.run_app(test, prepare=self.complete_profile)
+
+    def test_filters_window_refuses_values_the_next_run_would_refuse(self):
+        def test(app, root):
+            app.edit_filters()
+            dialog = app.filters_dialog
+            variables = dialog["variables"]
+            for title, change, message in (
+                ("minimum is not a number", lambda: variables["minimum"].set("много"), "Минимум зарплаты"),
+                ("minimum too large", lambda: variables["minimum"].set("99999999999"), "Минимум зарплаты"),
+                ("ceiling below minimum", lambda: variables["ceiling"].set("50000"), "потолок зарплаты ниже минимума"),
+                ("no experience", lambda: [variables["experience_" + key].set(False) for key in (
+                    "noExperience", "between1And3", "between3And6", "moreThan6")], "хотя бы один вариант"),
+                ("stop word without letters", lambda: dialog["words"].insert("1.0", "***"), "буквами или цифрами"),
+                ("repeated stop word", lambda: dialog["words"].insert("1.0", "1С\n1с"), "повторяются"),
+                ("employer is not a number", lambda: dialog["employers"].insert("1.0", "Яндекс"), "нужен id компании"),
+            ):
+                with self.subTest(title):
+                    dialog["show"](__import__("vacancy_filters").DEFAULTS)
+                    change()
+                    app.filters_window.update()
+                    dialog["words"].event_generate("<<Edited>>")
+                    dialog["employers"].event_generate("<<Edited>>")
+                    self.assertIn(message, dialog["error"].cget("text"))
+                    self.assertEqual(str(dialog["save_button"]["state"]), "disabled")
+                    dialog["save"]()
+                    self.assertFalse(self.filters_file().exists())
+            dialog["close"]()
+        self.run_app(test, prepare=self.complete_profile)
+
+    def test_filters_are_unavailable_during_a_run_and_a_damaged_file_stops_the_start(self):
+        def test(app, root):
+            app.session = gui_controller.Session("preview", {})
+            app.set_busy(True)
+            app.edit_filters()
+            app.filters_summary.event_generate("<Button-1>")
+            self.assertFalse(getattr(app, "filters_window", None))
+            app.session = None
+            app.set_busy(False)
+            self.filters_file().write_text('{"period": 5}', encoding="utf-8")
+            app.refresh_filters_summary()
+            self.assertIn("Файл фильтров не принят", app.filters_summary.cget("text"))
+            self.assertEqual(str(app.filters_summary.cget("style")), "Error.TLabel")
+            with patch("gui_controller.Session") as session:
+                app.launch("preview")
+                app.launch("auto")
+                session.assert_not_called()
+            self.assertIn("Файл фильтров вакансий не принят", app.dialogs.showerror.call_args.args[1])
+            # The window offers the defaults instead of opening on a file nobody can read.
+            app.dialogs.askyesno.return_value = False
+            app.edit_filters()
+            self.assertFalse(getattr(app, "filters_window", None))
+            app.dialogs.askyesno.return_value = True
+            app.edit_filters()
+            self.assertEqual(app.filters_dialog["collect"](), __import__("vacancy_filters").DEFAULTS)
+            app.filters_dialog["save"]()
+            self.assertEqual(json.loads(self.filters_file().read_text(encoding="utf-8")),
+                             __import__("vacancy_filters").DEFAULTS.data())
+            self.assertEqual(app.filters_summary.cget("text"), "удалённо · от 80 000 ₽ · без Senior/Lead")
+        self.run_app(test, prepare=self.complete_profile)
+
+    def test_worker_builds_the_search_from_the_saved_filters(self):
+        import preview
+        import send
+        import vacancy_filters as vf
+        self.assertEqual(gui_worker.environment()["HH_APPLICANT_TOOL_FILTERS_FILE"], str(gui_profile.filters_path()))
+        with tempfile.TemporaryDirectory() as temp, patch("pathlib.Path.home", return_value=Path(temp)):
+            gui_profile.initialize()
+            gui_profile.save_search("r", "Python")
+            vf.save(vf.Filters(salary_minimum=95000, period=3, accredited_it=True, stop_words=("1С",)),
+                    gui_profile.filters_path())
+            with patch.dict(os.environ, gui_worker.environment()):
+                for action, module in (("preview", preview), ("apply", send)):
+                    with self.subTest(action), patch.object(module, "run", return_value=0) as run:
+                        gui_worker.dispatch(action, gui_controller.action_settings(
+                            action, resume="r", search="Python", all_resumes=False, no_letter=False), FakeChannel())
+                    argv = run.call_args.args[0]
+                    self.assertEqual(argv[argv.index("--salary") + 1], "95000")
+                    self.assertEqual(argv[argv.index("--period") + 1], "3")
+                    self.assertEqual(argv[argv.index("--label") + 1], "accredited_it")
+                    self.assertNotIn("--excluded-filter", argv)
+                    self.assertNotIn("--excluded-employer-id", argv)
 
     def test_a_rejected_provider_key_offers_to_change_it(self):
         app = gui.Application.__new__(gui.Application)

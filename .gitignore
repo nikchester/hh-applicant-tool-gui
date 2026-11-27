@@ -17,3 +17,6 @@ candidate-facts.json
 # Generated Windows frozen runtimes, installer output and build-only venvs.
 /windows/build/
 /windows/dist/
+
+# Personal vacancy filters of the command-line scripts (the GUI keeps its own in the profile).
+/windows/filters.json

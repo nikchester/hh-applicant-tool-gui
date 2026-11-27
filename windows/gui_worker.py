@@ -9,13 +9,14 @@ import tomllib
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from gui_profile import initialize, profile_dir, search_path, state_dir
+from gui_profile import filters_path, initialize, profile_dir, search_path, state_dir
 from gui_protocol import ACTIONS, Cancelled, ProtocolError, ReviewAdapter, WorkerChannel, decode
 
 
 def environment():
     return {"CONFIG_DIR": str(profile_dir()), "HH_PROFILE_ID": ".",
             "HH_APPLICANT_TOOL_SEARCH_FILE": str(search_path()),
+            "HH_APPLICANT_TOOL_FILTERS_FILE": str(filters_path()),
             "CHATGPT_LOCAL_HOME": str(state_dir() / "chatmock"),
             "CODEX_HOME": str(state_dir() / "chatmock")}
 

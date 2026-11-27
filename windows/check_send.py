@@ -25,6 +25,8 @@ sys.path.insert(0, str(ROOT / "windows"))
 from send import (ApprovalGate, SkippedTest, StopReview, URL_TASK_ANSWER,  # noqa: E402
                   all_resume_arguments, arguments, run, salary_text, validate)
 from send_all import apply_round_robin, load_searches  # noqa: E402
+from check_preview import CARD, LEGACY_SEARCH_ARGUMENTS, saved_filters  # noqa: E402
+from vacancy_filters import DEFAULTS, Filters  # noqa: E402
 from gui_protocol import LETTER_REVISION_FAILED  # noqa: E402
 
 
@@ -1683,6 +1685,179 @@ class SendChecks(unittest.TestCase):
         operation = SimpleNamespace(tool=tool)
         with self.assertRaisesRegex(SystemExit, "missing a SearchText"):
             apply_round_robin(operation, RESUME, load_searches(), None)
+
+
+class VacancyFilterSendChecks(unittest.TestCase):
+    """#15: saved filters in the send arguments and in the gate, before a letter exists."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.home = Path(self.temp.name)
+        self.profile = self.home / ".config/hh-applicant-tool-cli"
+        self.profile.mkdir(parents=True)
+        shutil.copyfile(ROOT / "windows/config.toml", self.profile / "config.toml")
+
+    def validate(self, argv):
+        with patch.dict(os.environ, {"CONFIG_DIR": str(self.profile), "HH_PROFILE_ID": "."}), \
+             patch("send.Path.home", return_value=self.home), \
+             patch("requests.sessions.Session.send", side_effect=AssertionError("No network")):
+            return validate(argv)
+
+    def test_without_a_filters_file_the_send_arguments_are_the_old_ones_byte_for_byte(self):
+        config = str(self.profile)
+        legacy = ["--config-dir", config, "--profile-id", ".", "--no-handle-captcha",
+                  "apply", "--no-dry-run", "--no-send-email", "--no-ai-filter", "--no-skip-tests",
+                  "--per-page", "20", "--total-pages", "100"] + LEGACY_SEARCH_ARGUMENTS + [
+                  f"--resume-id={RESUME}", "--search=Linux"]
+        with saved_filters():
+            argv = arguments(config, RESUME, "Linux")
+            self.assertEqual(argv, legacy)
+            self.assertEqual(arguments(config, RESUME, "Linux", no_letter=True),
+                             legacy + ["--no-force-cover-letter"])
+            self.assertEqual(arguments(config, RESUME, "")[-1], f"--resume-id={RESUME}")
+            self.assertEqual(self.validate(argv).salary, 80000)
+
+    def test_validate_takes_its_reference_from_the_saved_filters(self):
+        data = {"salary_minimum": 100000, "only_with_salary": True, "period": 3,
+                "not_from_agency": True, "accredited_it": True}
+        with saved_filters(data) as path:
+            argv = arguments(str(self.profile), RESUME, "Linux")
+            args = self.validate(argv)
+            self.assertEqual((args.salary, args.only_with_salary, args.period, args.label),
+                             (100000, True, 3, ["not_from_agency", "accredited_it"]))
+            # Arguments that no longer match the saved filters are refused.
+            path.write_text(json.dumps(data | {"period": 7}), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.validate(argv)
+            path.write_text(json.dumps(DEFAULTS.data()), encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                self.validate(argv)
+            path.write_text(json.dumps(data), encoding="utf-8")
+            self.validate(argv)
+            for title, changed in (
+                ("label outside the dictionary", argv[:argv.index("--label") + 1] + ["premium"]
+                 + argv[argv.index("--label") + 3:]),
+                ("one label dropped", argv[:argv.index("--label") + 2] + argv[argv.index("--label") + 3:]),
+                ("period outside the dictionary", [("5" if arg == "3" else arg) for arg in argv]),
+                ("salary changed", [("90000" if arg == "100000" else arg) for arg in argv]),
+            ):
+                with self.subTest(title), self.assertRaises(SystemExit):
+                    self.validate(changed)
+
+    def test_validate_refuses_anything_that_writes_to_the_hh_account_or_hides_by_request(self):
+        with saved_filters(None):
+            argv = arguments(str(self.profile), RESUME, "Linux")
+            for extra in (["--ai-filter"], ["--excluded-filter", "junior|стажёр"],
+                          ["--excluded-filter", "1С"], ["--excluded-employer-id", "1740"],
+                          ["--excluded-employer-id", "abc"], ["--experience", "noExperience"],
+                          ["--employer-id", "1740"]):
+                with self.subTest(extra=extra), self.assertRaises(SystemExit):
+                    self.validate(argv + extra)
+
+    def test_a_filters_file_with_a_bad_value_stops_before_any_argument_is_built(self):
+        for data in ({"period": 5}, {"hidden_employers": [{"id": "17x", "name": ""}]},
+                     {"experience": ["senior"]}, {"salary_minimum": "80000"}):
+            with self.subTest(data), saved_filters(data):
+                with self.assertRaisesRegex(SystemExit, "Фильтры вакансий"):
+                    arguments(str(self.profile), RESUME, "Linux")
+                with self.assertRaisesRegex(SystemExit, "Фильтры вакансий"):
+                    ApprovalGate(RESUME, Mock(), approve=Mock(), sleep=Mock())
+        with saved_filters():
+            argv = arguments(str(self.profile), RESUME, "Linux")
+        with saved_filters(raw="{"), self.assertRaisesRegex(SystemExit, "Фильтры вакансий"):
+            self.validate(argv)
+
+    def gate(self, **filters):
+        gate = ApprovalGate(RESUME, Mock(), approve=Mock(side_effect=AssertionError("No approval")), sleep=Mock())
+        gate.filters = Filters(**filters)
+        gate.original_complete = Mock(side_effect=AssertionError("No model call"))
+        gate.operation = SimpleNamespace(api_client=Mock(get=Mock(side_effect=AssertionError("No card read"))))
+        return gate
+
+    def shown(self, gate, cards):
+        gate.original_vacancies = lambda *_a, **_kw: iter(cards)
+        output = StringIO()
+        with redirect_stdout(output):
+            return list(gate.vacancies(gate.operation)), output.getvalue()
+
+    def test_every_local_rule_skips_before_a_letter_is_generated(self):
+        good = CARD | {"id": "9", "salary": {"from": 95000, "currency": "RUR"}, "experience": {"id": "noExperience"},
+                       "employer": {"id": "7", "name": "Рога и копыта"}}
+        cases = (
+            ({"exclude_senior": True}, {"name": "Ведущий DevOps"}, "уровень выше текущего опыта"),
+            ({"stop_words": ("1С",)}, {"name": "Администратор 1С"}, "стоп-слово «1С» в названии вакансии"),
+            ({"stop_words": ("пример",)}, {"employer": {"id": "5", "name": "ООО Пример"}},
+             "стоп-слово «пример» в названии компании"),
+            ({"hidden_employers": ({"id": "1740", "name": ""},)}, {}, "компания скрыта"),
+            ({"experience": ("noExperience",)}, {}, "требуется опыт 1–3 года"),
+            ({"salary_minimum": 120000}, {"salary": {"to": 100000, "currency": "RUR"}}, "не достигает 120 000"),
+            ({"salary_ceiling": 98000}, {"salary": {"from": 100000, "currency": "RUR"}}, "выше 98 000"),
+        )
+        for filters, change, reason in cases:
+            with self.subTest(reason):
+                gate = self.gate(**filters)
+                bad = CARD | {"id": "1"} | change
+                shown, output = self.shown(gate, [bad, good])
+                self.assertEqual(shown, [good])
+                self.assertEqual(output.count("Статус: пропускаем"), 1)
+                self.assertRegex(output, "Статус: пропускаем — .*" + reason)
+                self.assertEqual(gate.counts["vacancies"], 2)
+                gate.original_complete.assert_not_called()
+                gate.sender.assert_not_called()
+                # The same rules stop a send that somehow reaches the gate.
+                gate.current, gate.letter = bad, LETTER
+                with self.assertRaisesRegex(SystemExit, "Cannot send"):
+                    gate.send(None, negotiation("1"))
+                gate.current, gate.letter = bad | {"has_test": True}, LETTER
+                with self.assertRaisesRegex(SystemExit, "Cannot send"):
+                    gate.send(None, test_response("1"))
+                gate.sender.assert_not_called()
+
+    def test_default_filters_skip_exactly_what_was_skipped_before(self):
+        gate = self.gate()
+        cards = [CARD | {"id": "1", "name": "Senior DevOps"},
+                 CARD | {"id": "2", "name": "Инженер 1С", "employer": {"id": "1740", "name": "Битрикс"}},
+                 CARD | {"id": "3", "experience": {"id": "moreThan6"}},
+                 CARD | {"id": "4", "salary": {"from": 400000, "currency": "RUR"}},
+                 CARD | {"id": "5", "salary": {"to": 70000, "currency": "RUR"}},
+                 CARD | {"id": "6", "relations": ["got_response"]},
+                 CARD | {"id": "7"}]
+        shown, output = self.shown(gate, cards)
+        self.assertEqual([card["id"] for card in shown], ["2", "3", "6", "7"])
+        self.assertEqual(output.count("Статус: пропускаем"), 4)
+        self.assertNotIn("Фильтры:", output)
+
+    def test_a_vacancy_without_an_experience_field_stays_with_a_journal_note(self):
+        gate = self.gate(experience=("noExperience", "between1And3"))
+        bare = {key: value for key, value in CARD.items() if key != "experience"} | {"id": "3"}
+        shown, output = self.shown(gate, [bare])
+        self.assertEqual(shown, [bare])
+        self.assertIn("Фильтры: в выдаче HH нет требуемого опыта у этой вакансии, проверка опыта пропущена", output)
+
+    def test_the_full_card_uses_the_saved_salary_limits(self):
+        gate = self.gate(salary_minimum=120000, salary_ceiling=None)
+        gate.operation = SimpleNamespace(api_client=SimpleNamespace(get=lambda _: CARD | {
+            "salary": {"to": 100000, "currency": "RUR"}}))
+        gate.current = CARD.copy()
+        with self.assertRaisesRegex(SystemExit, "Vacancy salary changed: потолок зарплаты не достигает 120 000"):
+            gate.complete(None, "prompt")
+        gate.original_complete.assert_not_called()
+        # No ceiling: a salary above the old 300 000 limit is acceptable.
+        gate.filters = Filters(salary_ceiling=None)
+        gate.operation = SimpleNamespace(api_client=SimpleNamespace(get=lambda _: CARD | {
+            "salary": {"from": 500000, "currency": "RUR"}}))
+        gate.original_complete = Mock(return_value=LETTER)
+        self.assertEqual(gate.complete(None, "prompt"), LETTER)
+
+    def test_the_gate_reads_the_saved_file(self):
+        with saved_filters({"stop_words": ["1С"], "hidden_employers": [{"id": "1740", "name": "Пример"}]}):
+            gate = ApprovalGate(RESUME, Mock(), approve=Mock(), sleep=Mock())
+        self.assertEqual(gate.filters.stop_words, ("1С",))
+        gate.original_vacancies = lambda *_a, **_kw: iter([CARD, CARD | {"id": "2", "name": "1С разработчик"}])
+        gate.operation = SimpleNamespace(api_client=Mock())
+        with redirect_stdout(StringIO()):
+            self.assertEqual(list(gate.vacancies(gate.operation)), [])
 
 
 if __name__ == "__main__":

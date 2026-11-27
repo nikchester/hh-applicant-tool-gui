@@ -19,7 +19,7 @@ from hh_applicant_tool.operations.apply_vacancies import Operation
 from hh_applicant_tool.tool import HHApplicantTool
 from resume_context import selected_resume_context
 from vacancy_level import senior_title_reason
-from vacancy_salary import salary_rejection_reason
+import vacancy_filters
 from manual_captcha import ManualCaptcha, permits_token_refresh, token_refresh_request
 from gui_protocol import LETTER_LANGUAGE_REJECTED, LETTER_LEVEL_REJECTED
 
@@ -181,14 +181,13 @@ def run(argv, *, profile=None, observer=None):
     expected = expected_profile(profile)
     if os.environ.get("CONFIG_DIR") != str(expected) or os.environ.get("HH_PROFILE_ID") != ".":
         raise SystemExit("Dedicated profile environment is required")
+    filters = vacancy_filters.load()
     if not (
         args.dry_run and not args.send_email and not args.ai_filter
         and args.skip_tests is False and not args.captcha_handling
         and args.total_pages == 1 and args.per_page <= PREVIEW_VACANCIES
         and args.resume_id and args.verbosity == 0
-        and args.work_format == ["REMOTE"] and args.currency == "RUR"
-        and args.salary == 80000 and args.only_with_salary is False
-        and args.order_by == "publication_time"
+        and vacancy_filters.search_matches(args, filters)
     ):
         raise SystemExit("Unsafe preview arguments; refusing to run")
     config = tomllib.loads((expected / "config.toml").read_text(encoding="utf-8"))
@@ -231,8 +230,9 @@ def run(argv, *, profile=None, observer=None):
                 "has_test": vacancy.get("has_test"),
                 "already_responded": bool(vacancy.get("relations")),
             }, ensure_ascii=False), flush=True)
-            reason = senior_title_reason(vacancy) or salary_rejection_reason(
-                vacancy, getattr(operation, "api_client", None))
+            reason, notes = vacancy_filters.check(vacancy, filters, getattr(operation, "api_client", None))
+            for note in notes:
+                print(f"Фильтры: {note}", flush=True)
             if not reason and observer is not None:
                 # GUI cannot scrape upstream terminal-only skip explanations.
                 # Keep the CLI path unchanged; these vacancies cannot be applied
@@ -260,7 +260,7 @@ def run(argv, *, profile=None, observer=None):
             vacancy = context["operation"].api_client.get(
                 "/vacancies/" + context["vacancy"]["id"]
             )
-            if reason := salary_rejection_reason(vacancy, context["operation"].api_client):
+            if reason := vacancy_filters.salary_reason(vacancy, filters, context["operation"].api_client):
                 raise SystemExit(f"Vacancy salary changed: {reason}")
             letter = complete(client, enrich_prompt(a[0], vacancy), *a[1:],
                               **letter_kwargs(kw, vacancy))
